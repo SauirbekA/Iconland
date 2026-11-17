@@ -1,0 +1,1184 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Iconland · Woods</title>
+<!--
+  Iconland · Woods theme (top-down storybook forest, gouache / cartoon style; pure WebGL2, one full-screen pass)
+  - Clearing field (CPU, only when icons change): gaussian metaballs + noise warp -> signed distance s (<0 = clearing).
+    The same field texture also carries the distance to winding dirt paths that link neighbouring clearings.
+  - Trees: round layered crowns on a jittered grid, sized by the field (smaller near the clearing edge, gone inside it),
+    each with a soft drop shadow; swayed by wind on the CPU, binned into a small cell texture the shader looks up.
+  - Life: a flock of birds crossing over the canopy now and then, butterflies over the clearings, a fox that rarely
+    trots across a clearing, and a deer, a hare and a hedgehog strolling along the dirt paths between clearings
+    (all drawn as tiny SDFs from a handful of uniforms).
+-->
+<style>
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #2c4a2a; }
+  #art { position: fixed; inset: 0; width: 100vw; height: 100vh; display: block; }
+  /* preview mode (?preview=1, settings window): translucent boxes show where the real icons are */
+  #ghosts { position: fixed; inset: 0; pointer-events: none; display: none; }
+  body.preview #ghosts { display: block; }
+  .ghost { position: absolute; }
+  .ghost i { position: absolute; left: 50%; top: 4px; width: 48px; height: 48px; margin-left: -24px; border-radius: 9px;
+    background: rgba(255,255,255,.55); box-shadow: 0 1px 3px rgba(0,0,0,.25); }
+  .ghost b { position: absolute; left: 14%; right: 14%; top: 60px; height: 10px; border-radius: 5px; background: rgba(255,255,255,.75); }
+  #nogl { position: fixed; inset: 0; display: none; place-items: center; color: #fff; font: 16px system-ui, sans-serif; }
+</style>
+</head>
+<body>
+<canvas id="art"></canvas>
+<div id="nogl">WebGL2 is not available.</div>
+<script>
+'use strict';
+
+/* ======================================================================
+   Parameters
+   ====================================================================== */
+const CELL_W = 76, CELL_H = 100, GRID_X0 = 4, GRID_Y0 = 6, TASKBAR = 0;
+const STEP = 5;
+const MORPH_MS = 1800;
+const WARP = 40;                         // how much the clearing outline is bent by noise (px)
+
+const QS = new URLSearchParams(location.search);
+const WALL = QS.has('wallpaper');        // real desktop: messages from the host
+const PREVIEW = QS.has('preview');       // settings window preview (iframe): messages from the parent page
+// Defaults must match themes.json
+const P = {
+  sigma: 70, density: 1, wind: 1, autumn: 0.12, life: 1,
+  quality: 2, cap30: true,
+};
+const DEFAULTS = Object.assign({}, P);
+const KEYS = { sigma: [40, 200], density: [0.5, 1.6], wind: [0, 3], autumn: [0, 1], life: [0, 1] };
+
+/* ======================================================================
+   Random / noise helpers (CPU)
+   ====================================================================== */
+let seed = (Math.random() * 1e6) | 0;
+function hash2(x, y, k = 0) {
+  let h = Math.imul(x | 0, 374761393) ^ Math.imul(y | 0, 668265263) ^ Math.imul(seed + k, 2246822519);
+  h = Math.imul(h ^ (h >>> 13), 1274126177);
+  return ((h ^ (h >>> 16)) >>> 0) / 4294967296;
+}
+function vnoise(x, y, k = 0) {
+  const ix = Math.floor(x), iy = Math.floor(y), fx = x - ix, fy = y - iy;
+  const ux = fx * fx * (3 - 2 * fx), uy = fy * fy * (3 - 2 * fy);
+  const a = hash2(ix, iy, k), b = hash2(ix + 1, iy, k), c = hash2(ix, iy + 1, k), d = hash2(ix + 1, iy + 1, k);
+  return a + (b - a) * ux + (c - a) * uy + (a - b - c + d) * ux * uy;
+}
+function fbm(x, y, k = 0) {
+  let a = 0.5, s = 0;
+  for (let i = 0; i < 4; i++) { s += a * vnoise(x, y, k + i * 7); x = x * 2.03 + 17.1; y = y * 2.03 + 17.1; a *= 0.5; }
+  return s;
+}
+// Tileable noise texture (fixed, does not depend on the seed): 4 channels of fbm at different scales
+function tileNoise(x, y, px, py, k) {
+  const ix = Math.floor(x), iy = Math.floor(y), fx = x - ix, fy = y - iy;
+  const ux = fx * fx * (3 - 2 * fx), uy = fy * fy * (3 - 2 * fy);
+  const m = (v, p) => ((v % p) + p) % p;
+  const x0 = m(ix, px), x1 = m(ix + 1, px), y0 = m(iy, py), y1 = m(iy + 1, py);
+  const h = (a, b) => { let v = Math.imul(a, 374761393) ^ Math.imul(b, 668265263) ^ Math.imul(k, 2246822519); v = Math.imul(v ^ (v >>> 13), 1274126177); return ((v ^ (v >>> 16)) >>> 0) / 4294967296; };
+  const a = h(x0, y0), b = h(x1, y0), c = h(x0, y1), d = h(x1, y1);
+  return a + (b - a) * ux + (c - a) * uy + (a - b - c + d) * ux * uy;
+}
+function makeNoiseImage() {
+  const S = 256, d = new Uint8Array(S * S * 4);
+  const chans = [[8, 16, 32, 64], [8, 16, 32, 64], [4, 8, 16, 32], [16, 32, 64, 128]];
+  for (let y = 0; y < S; y++) for (let x = 0; x < S; x++) {
+    const u = x / S, v = y / S, i = (y * S + x) * 4;
+    for (let c = 0; c < 4; c++) {
+      let s = 0, w = 0.5, tw = 0;
+      for (let j = 0; j < chans[c].length; j++) { const p = chans[c][j]; s += w * tileNoise(u * p, v * p, p, p, 100 + c * 50 + j * 13); tw += w; w *= 0.5; }
+      d[i + c] = Math.min(Math.max((s / tw - 0.5) * 1.9 + 0.5, 0), 1) * 255;
+    }
+  }
+  return { S, d };
+}
+const sstep = (a, b, x) => { const t = Math.min(Math.max((x - a) / (b - a), 0), 1); return t * t * (3 - 2 * t); };
+
+/* ======================================================================
+   Clearing field (CPU): s = signed distance to the forest edge (<0 clearing), pd = distance to a dirt path
+   ====================================================================== */
+const PATH_MAX = 60;
+let W = innerWidth, H = innerHeight, Gw = 1, Gh = 1, NZ = null;
+function buildNoise() {
+  const N = Gw * Gh;
+  NZ = { wx: new Float32Array(N), wy: new Float32Array(N) };
+  for (let gy = 0; gy < Gh; gy++) for (let gx = 0; gx < Gw; gx++) {
+    const i = gy * Gw + gx, x = gx * STEP, y = gy * STEP;
+    NZ.wx[i] = fbm(x * 0.0028, y * 0.0028, 1) - 0.47;
+    NZ.wy[i] = fbm(x * 0.0028, y * 0.0028, 2) - 0.47;
+  }
+}
+let fieldMs = 0;
+function computeField(rects) {
+  const t0 = performance.now();
+  const N = Gw * Gh, f1 = new Float32Array(N);
+  const sig = P.sigma, is1 = 1 / (sig * sig);
+  const wa = WARP * 2.2, wmax = wa * 0.5;
+  for (const r of rects) {
+    const R = 5.5 * sig + Math.max(r.hw, r.hh) * 0.5 + wmax;
+    const gx0 = Math.max(0, Math.floor((r.cx - R) / STEP)), gx1 = Math.min(Gw - 1, Math.ceil((r.cx + R) / STEP));
+    const gy0 = Math.max(0, Math.floor((r.cy - R) / STEP)), gy1 = Math.min(Gh - 1, Math.ceil((r.cy + R) / STEP));
+    const chw = r.hw * 0.5, chh = r.hh * 0.5;
+    for (let gy = gy0; gy <= gy1; gy++) for (let gx = gx0; gx <= gx1; gx++) {
+      const i = gy * Gw + gx;
+      const qx = gx * STEP + NZ.wx[i] * wa, qy = gy * STEP + NZ.wy[i] * wa;
+      let dx = Math.abs(qx - r.cx) - chw, dy = Math.abs(qy - r.cy) - chh;
+      if (dx < 0) dx = 0; if (dy < 0) dy = 0;
+      f1[i] += Math.exp(-(dx * dx + dy * dy) * is1);
+    }
+  }
+  const c0 = Math.sqrt(-Math.log(0.35)), s = new Float32Array(N), fMin = Math.exp(-30);
+  for (let i = 0; i < N; i++) {
+    const g = Math.log(Math.max(f1[i], fMin));
+    // clamped deep in the forest so old and new clearings cross-fade evenly during a transition
+    s[i] = Math.min(90, sig * (Math.sqrt(Math.max(-g, 0)) - c0) - sig * 0.6 * Math.max(g, 0));
+  }
+  const pd = computePaths(rects, s);
+  fieldMs = performance.now() - t0;
+  return { s, pd };
+}
+function sampleArr(a, x, y) {
+  const fx = Math.min(Math.max(x / STEP, 0), Gw - 1.001), fy = Math.min(Math.max(y / STEP, 0), Gh - 1.001);
+  const ix = Math.floor(fx), iy = Math.floor(fy), tx = fx - ix, ty = fy - iy, i = iy * Gw + ix;
+  return (a[i] * (1 - tx) + a[i + 1] * tx) * (1 - ty) + (a[i + Gw] * (1 - tx) + a[i + Gw + 1] * tx) * ty;
+}
+// Dirt paths: icons whose clearings are separate get linked by a minimum spanning tree of short winding paths
+let lastLinks = [];        // polylines of the paths just computed (the animals walk along them)
+function computePaths(rects, s) {
+  lastLinks = [];
+  const pd = new Float32Array(Gw * Gh).fill(PATH_MAX);
+  const n = rects.length;
+  if (n < 2) return pd;
+  const sAt = (x, y) => sampleArr(s, x, y);
+  // group icons that share a clearing (the straight line between them stays inside the clearing)
+  const par = rects.map((_, i) => i), find = i => par[i] === i ? i : (par[i] = find(par[i]));
+  const edges = [];
+  for (let i = 0; i < n; i++) for (let j = i + 1; j < n; j++) {
+    const a = rects[i], b = rects[j], d = Math.hypot(a.cx - b.cx, a.cy - b.cy);
+    if (d > 700) continue;
+    let open = true;
+    for (let k = 1; k < 8 && open; k++) { const t = k / 8; if (sAt(a.cx + (b.cx - a.cx) * t, a.cy + (b.cy - a.cy) * t) > -4) open = false; }
+    if (open) par[find(i)] = find(j);
+    else edges.push([d, i, j]);
+  }
+  edges.sort((a, b) => a[0] - b[0]);
+  const links = [];
+  for (const [d, i, j] of edges) {
+    const ri = find(i), rj = find(j);
+    if (ri === rj) continue;
+    par[ri] = rj; links.push([rects[i], rects[j], d, i, j]);
+  }
+  lastLinks = [];
+  // stamp each winding path into the grid (distance to the nearest sample point, within PATH_MAX)
+  const RP = PATH_MAX, RG = Math.ceil(RP / STEP);
+  for (const [a, b, d, ia, ib] of links) {
+    const pts = [];
+    const nx = -(b.cy - a.cy) / d, ny = (b.cx - a.cx) / d;
+    const k1 = hash2(Math.round(a.cx), Math.round(b.cy), 31), k2 = hash2(Math.round(b.cx), Math.round(a.cy), 37);
+    const amp = Math.min(55, d * 0.12) * (k1 < 0.5 ? -1 : 1), waves = 1 + Math.floor(k2 * 2), ph = k2 * 6.283;
+    const cnt = Math.ceil(d / 5);
+    for (let k = 0; k <= cnt; k++) {
+      const t = k / cnt, env = Math.sin(t * Math.PI);
+      const o = amp * env * Math.sin(t * Math.PI * waves + ph * 0.3) + 10 * env * Math.sin(t * 17 + ph);
+      const px = a.cx + (b.cx - a.cx) * t + nx * o, py = a.cy + (b.cy - a.cy) * t + ny * o;
+      pts.push(px, py);
+      const gx = Math.round(px / STEP), gy = Math.round(py / STEP);
+      for (let yy = Math.max(0, gy - RG); yy <= Math.min(Gh - 1, gy + RG); yy++)
+        for (let xx = Math.max(0, gx - RG); xx <= Math.min(Gw - 1, gx + RG); xx++) {
+          const i = yy * Gw + xx, dd = Math.hypot(xx * STEP - px, yy * STEP - py);
+          if (dd < pd[i]) pd[i] = dd;
+        }
+    }
+    lastLinks.push({ a: ia, b: ib, ra: a, rb: b, pts });
+  }
+  return pd;
+}
+
+/* ======================================================================
+   Shaders
+   ====================================================================== */
+const VS = `#version 300 es
+void main() {
+  vec2 p = vec2(float((gl_VertexID << 1) & 2), float(gl_VertexID & 2));
+  gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);
+}`;
+
+const FS = `#version 300 es
+precision highp float;
+uniform sampler2D uNoise, uFA, uFB;
+uniform highp sampler2D uTree;   // tree crowns binned per cell: TK per cell, (x, y, radius, palette + height)
+uniform vec2 uRes, uGrid, uTGrid;
+uniform float uScale, uSeed, uStep, uMix, uTime, uCellG, uWind;
+uniform vec4 uBird[6];           // x, y, heading, wing flap (-1..1); radius 0 = none
+uniform float uBirdN;
+uniform vec4 uFly[3];            // butterflies: x, y, flap phase, colour (0 = none, 1..3)
+uniform vec4 uFox;               // x, y, heading, gait phase
+uniform float uFoxOn;
+uniform vec4 uWk[3];             // path walkers: x, y, heading, gait phase
+uniform vec4 uWk2[3];            // species (0 none, 1 deer, 2 hare, 3 hedgehog), alpha, head down, alert
+out vec4 o;
+
+const int TK = 24;
+const vec3 FLOOR = vec3(0.13, 0.22, 0.14), FLOOR2 = vec3(0.20, 0.27, 0.13);  // forest floor between crowns
+const vec3 G_SUN = vec3(0.60, 0.74, 0.33), G_MID = vec3(0.48, 0.65, 0.29), G_DEEP = vec3(0.39, 0.57, 0.27);  // clearing grass
+const vec3 DIRT = vec3(0.66, 0.50, 0.32), DIRT_D = vec3(0.50, 0.36, 0.22);
+const vec3 SHADE = vec3(0.50, 0.55, 0.70);       // multiply colour for cast shadows (cool)
+const vec2 LIGHT = vec2(-0.6, -0.8);             // sun from the upper left
+const vec2 SHDIR = vec2(0.58, 0.81);             // shadows fall to the lower right
+
+float hash2(vec2 p) {
+  vec3 p3 = fract(vec3(p.xyx) * 0.1031);
+  p3 += dot(p3, p3.yzx + 33.33);
+  return fract((p3.x + p3.y) * p3.z);
+}
+float ss(float a, float b, float x) { float t = clamp((x - a) / (b - a), 0.0, 1.0); return t * t * (3.0 - 2.0 * t); }
+vec4 N(vec2 p, float scale) { return texture(uNoise, p / scale + uSeed * 0.013); }
+vec2 field(vec2 p) {
+  vec2 uv = (p / uStep + 0.5) / uGrid;
+  return mix(texture(uFA, uv).rg, texture(uFB, uv).rg, uMix);
+}
+float segD(vec2 p, vec2 a, vec2 b) { vec2 pa = p - a, ba = b - a; return length(pa - ba * clamp(dot(pa, ba) / dot(ba, ba), 0.0, 1.0)); }
+float ellD(vec2 p, vec2 r) { return (length(p / r) - 1.0) * min(r.x, r.y); }   // rough ellipse distance (fine for tiny shapes)
+mat2 rot(float a) { float c = cos(a), s = sin(a); return mat2(c, s, -s, c); }
+
+vec3 pal(int i) {
+  if (i == 0) return vec3(0.30, 0.53, 0.25);    // leafy green
+  if (i == 1) return vec3(0.21, 0.44, 0.24);    // deep green
+  if (i == 2) return vec3(0.47, 0.60, 0.23);    // yellow-green
+  if (i == 3) return vec3(0.15, 0.36, 0.31);    // pine (blue-green)
+  if (i == 4) return vec3(0.88, 0.55, 0.17);    // autumn orange
+  if (i == 5) return vec3(0.92, 0.74, 0.24);    // autumn gold
+  return vec3(0.76, 0.30, 0.18);                // autumn red
+}
+// crown outline radius factor at angle a (leafy scallops or spiky pine)
+float edgeF(int idx, float a, float h) {
+  float rust = uWind * 0.03 * sin(uTime * 0.6 + h * 37.0);
+  if (idx == 3) { float t = fract((a + rust) * 11.0 / 6.2832 + h * 3.0); return 1.0 + 0.11 * (abs(t - 0.5) * 2.0 - 0.5); }
+  float n = 6.0 + floor(h * 4.0);
+  return 1.0 + 0.045 * sin(a * n + h * 40.0 + rust) + 0.025 * sin(a * (n * 2.0 + 1.0) + h * 13.0);
+}
+// signed distance (px) to a crown outline
+float crownD(vec4 c, vec2 p) {
+  vec2 d = p - c.xy;
+  int idx = int(c.w); float h = fract(c.w);
+  return length(d) - c.z * edgeF(idx, atan(d.y, d.x), h);
+}
+// gouache crown: dark shade side, base layer, light layer toward the sun, a highlight dab, brushy texture
+vec3 crownCol(vec4 c, vec2 p, float shade) {
+  int idx = int(c.w); float h = fract(c.w);
+  vec3 base = pal(idx);
+  base *= 0.92 + 0.16 * fract(h * 7.31 + 0.13);                 // every tree its own tint (stable: from the tree id, not its swaying position)
+  vec3 dark = base * vec3(0.52, 0.58, 0.70);
+  vec3 lite = mix(base, vec3(1.0, 0.96, 0.62), 0.24);
+  vec3 hi = mix(base, vec3(1.0, 0.97, 0.70), 0.42);
+  vec2 q = (p - c.xy) / c.z;
+  float a = atan(q.y, q.x), r = c.z;
+  float aa = 1.2 / (r * uScale);
+  vec3 col = dark;
+  if (idx == 3) {
+    // pine: stacked stars of needles, lighter toward the sunny top
+    float t1 = abs(fract(a * 9.0 / 6.2832 + h * 5.0) - 0.5) * 2.0;
+    float t2 = abs(fract(a * 7.0 / 6.2832 + h * 2.0 + 0.25) - 0.5) * 2.0;
+    float t3 = abs(fract(a * 5.0 / 6.2832 + h * 7.0) - 0.5) * 2.0;
+    col = mix(col, base, ss(aa, -aa, length(q - LIGHT * 0.10) - 0.82 + 0.20 * t1));
+    col = mix(col, lite, ss(aa, -aa, length(q - LIGHT * 0.20) - 0.56 + 0.18 * t2));
+    col = mix(col, hi, ss(aa, -aa, length(q - LIGHT * 0.26) - 0.28 + 0.12 * t3) * 0.8);
+  } else {
+    float e1 = 0.05 * sin(a * 7.0 + h * 29.0) + 0.02 * sin(a * 13.0 + h * 7.0);
+    float e2 = 0.07 * sin(a * 4.0 + h * 17.0) + 0.03 * sin(a * 9.0 + h * 5.0);
+    col = mix(col, base, ss(aa, -aa, length(q - LIGHT * 0.14) - 0.80 - e1));
+    col = mix(col, lite, ss(aa, -aa, length(q - LIGHT * 0.33) - 0.50 - e2));
+    // a small sunlit dab of leaves
+    vec2 hq = q - LIGHT * 0.48;
+    float ha = atan(hq.y, hq.x);
+    col = mix(col, hi, ss(aa, -aa, length(hq) - 0.15 - 0.035 * sin(ha * 3.0 + h * 9.0)) * 0.6);
+    // two or three dark leaf-clump notches on the shade side
+    for (int i = 0; i < 3; i++) {
+      float ang = 0.3 + float(i) * 0.9 + h * 2.0;
+      vec2 cc = vec2(cos(ang), sin(ang)) * 0.55;
+      float dd = abs(length(q - cc) - 0.26);
+      col = mix(col, col * 0.84, (1.0 - ss(0.0, 0.035, dd)) * ss(0.0, 0.3, dot(q, -LIGHT)) * step(length(q), 0.78));
+    }
+  }
+  // brush texture and paper grain
+  vec4 nz = N(p - c.xy + h * 977.0, 70.0);                   // texture follows the crown, so it doesn't crawl as the tree sways
+  col *= 0.90 + 0.20 * nz.r;
+  col = mix(col, col * 0.85, ss(0.55, 0.8, nz.a) * 0.5);
+  return mix(col, col * SHADE, shade);
+}
+
+float grassInk(vec2 p) {
+  const vec2 G = vec2(9.0, 6.0);
+  vec2 c0 = floor(p / G);
+  float ink = 0.0;
+  for (int j = -1; j <= 1; j++) {
+    vec2 c = c0 + vec2(0.0, float(j));
+    vec2 cp = (c + 0.5) * G;
+    float h = hash2(c + 3.1);
+    float dens = 0.6 * ss(0.38, 0.7, N(cp, 700.0).r) + 0.06;
+    if (h > dens) continue;
+    float ang = -1.25 + (N(cp, 1100.0).g - 0.5) * 0.6 + (hash2(c + 7.7) - 0.5) * 0.5;   // mostly upright blades
+    float len = 1.8 + 2.2 * hash2(c + 1.9);
+    vec2 ctr = cp + (vec2(hash2(c + 4.3), hash2(c + 5.9)) - 0.5) * vec2(5.0, 3.0);
+    vec2 dir = vec2(cos(ang), sin(ang)) * len;
+    float d = segD(p, ctr - dir, ctr + dir);
+    ink = max(ink, (1.0 - ss(0.25, 0.9, d)) * (0.35 + 0.45 * hash2(c + 9.1)));
+  }
+  return ink;
+}
+// small flowers dotted over the grass
+vec4 flower(vec2 p) {
+  const float G = 15.0;
+  vec2 c = floor(p / G);
+  float h = hash2(c + 11.3);
+  float dens = 0.04 + 0.22 * ss(0.4, 0.75, N(c * G, 500.0).b);
+  if (h > dens) return vec4(0.0);
+  vec2 ctr = (c + 0.2 + 0.6 * vec2(hash2(c + 2.2), hash2(c + 6.1))) * G;
+  vec2 q = p - ctr;
+  float k = hash2(c + 8.8);
+  vec3 pc = k < 0.45 ? vec3(0.98, 0.97, 0.92) : k < 0.75 ? vec3(0.99, 0.84, 0.25) : k < 0.9 ? vec3(0.95, 0.58, 0.70) : vec3(0.62, 0.66, 0.96);
+  float a = atan(q.y, q.x), r = length(q);
+  float pet = 2.1 + 0.9 * cos(a * 5.0 + k * 30.0);
+  float m = ss(0.6, -0.4, r - pet);
+  vec3 col = mix(pc, vec3(0.98, 0.72, 0.18), ss(1.1, 0.6, r));
+  return vec4(col, m);
+}
+
+// birds over the canopy (V shapes, flapping)
+float birdD(vec2 p, vec4 b) {
+  vec2 q = rot(-b.z) * (p - b.xy);            // forward = +x
+  q.y = abs(q.y);
+  float f = b.w;                              // -1..1 flap
+  vec2 el = vec2(-2.0, 5.0 + 1.5 * f), tip = vec2(-5.5 - 1.5 * f, 10.0 + 1.0 * f);
+  float d = min(segD(q, vec2(1.5, 0.0), el), segD(q, el, tip));
+  d = min(d, ellD(q - vec2(0.5, 0.0), vec2(4.0, 1.4)));
+  return d - 0.9 + 0.5 * ss(4.0, 10.0, q.y);
+}
+// fox seen from above (forward = +x)
+vec4 foxCol(vec2 p) {
+  vec2 q = rot(-uFox.z) * (p - uFox.xy) / 1.3;   // drawn 1.3x larger than the units below
+  float g = uFox.w;
+  vec3 col = vec3(0.0); float a = 0.0;
+  vec3 OR = vec3(0.86, 0.44, 0.13), DK = vec3(0.22, 0.12, 0.08), WH = vec3(0.98, 0.95, 0.88);
+  // legs: four dark dots stepping
+  for (int i = 0; i < 4; i++) {
+    float sx = i < 2 ? 6.0 : -6.0, sy = (i == 0 || i == 2) ? 3.6 : -3.6;
+    float st = sin(g + (i == 0 || i == 3 ? 0.0 : 3.14)) * 2.4;
+    float d = length(q - vec2(sx + st, sy)) - 1.5;
+    float m = ss(0.6, -0.6, d); col = mix(col, DK, m); a = max(a, m);
+  }
+  // tail with a white tip, swinging
+  float sw = sin(g * 0.5) * 0.25;
+  vec2 tq = rot(sw) * (q + vec2(9.0, 0.0));
+  float dt = ellD(tq + vec2(7.0, 0.0), vec2(8.0, 3.3));
+  float m = ss(0.6, -0.6, dt); col = mix(col, OR * 0.92, m); a = max(a, m);
+  m = ss(0.6, -0.6, ellD(tq + vec2(13.0, 0.0), vec2(2.6, 2.3)) ) * m; col = mix(col, WH, m);
+  // body
+  float db = ellD(q, vec2(10.5, 4.6));
+  m = ss(0.6, -0.6, db); col = mix(col, OR, m); a = max(a, m);
+  col = mix(col, OR * 1.12, ss(0.6, -0.6, ellD(q - vec2(1.0, -1.2), vec2(7.0, 2.0))) * 0.7);   // sunlit back
+  // head, ears, white snout, nose
+  vec2 hq = q - vec2(11.0, 0.0);
+  hq = rot(sin(g * 0.25) * 0.2) * hq;
+  for (int s = -1; s <= 1; s += 2) {
+    float de = length(hq - vec2(-1.2, float(s) * 2.9)) - 1.7;
+    m = ss(0.6, -0.6, de); col = mix(col, DK, m); a = max(a, m);
+  }
+  m = ss(0.6, -0.6, length(hq) - 3.6); col = mix(col, OR, m); a = max(a, m);
+  m = ss(0.6, -0.6, ellD(hq - vec2(3.6, 0.0), vec2(2.6, 1.7))); col = mix(col, WH, m); a = max(a, m);
+  m = ss(0.5, -0.5, length(hq - vec2(6.0, 0.0)) - 0.9); col = mix(col, DK, m);
+  return vec4(col, a);
+}
+float foxShadow(vec2 p) {
+  vec2 q = rot(-uFox.z) * (p - uFox.xy - SHDIR * 3.0) / 1.3;
+  return ss(2.0, -2.0, min(ellD(q, vec2(11.0, 5.0)), ellD(q - vec2(11.0, 0.0), vec2(4.0, 4.0))));
+}
+
+// ---- path walkers, seen from above (forward = +x) ----
+void lay(inout vec3 col, inout float a, float d, vec3 c) { float m = ss(0.5, -0.5, d); col = mix(col, c, m); a = max(a, m); }
+vec4 deerCol(vec2 q, float g, float head) {
+  q /= 1.3;
+  vec3 col = vec3(0.0); float a = 0.0;
+  vec3 BR = vec3(0.68, 0.44, 0.24), DK = vec3(0.26, 0.17, 0.11), CR = vec3(0.97, 0.92, 0.80);
+  for (int i = 0; i < 4; i++) {                                   // slim legs stepping
+    float sx = i < 2 ? 7.0 : -7.0, sy = (i == 0 || i == 2) ? 3.0 : -3.0;
+    float st = sin(g + (i == 0 || i == 3 ? 0.0 : 3.14)) * 2.6;
+    lay(col, a, length(q - vec2(sx + st, sy)) - 1.1, DK);
+  }
+  lay(col, a, ellD(q + vec2(10.5, 0.0), vec2(2.6, 3.2)), CR);    // white rump
+  lay(col, a, length(q + vec2(12.2, 0.0)) - 1.1, DK);              // tail
+  lay(col, a, ellD(q, vec2(11.0, 4.6)), BR);                       // body
+  float sun = ss(0.5, -0.5, ellD(q - vec2(0.5, -1.3), vec2(7.5, 2.0))) * 0.6;
+  col = mix(col, BR * 1.14, sun);
+  for (int i = 0; i < 6; i++) {                                    // dappled spots along the back
+    vec2 sp = vec2(-6.0 + float(i) * 2.4, (i % 2 == 0 ? 1.7 : -1.7));
+    col = mix(col, CR, ss(0.5, -0.5, length(q - sp) - 0.65) * 0.85);
+  }
+  // neck and head; grazing pushes the head forward and down (seen from above: further out, a little smaller)
+  vec2 nq = q - vec2(10.0 + head * 1.5, 0.0);
+  lay(col, a, ellD(nq, vec2(4.2 + head * 1.0, 2.3)), BR * 0.96);
+  vec2 hq = q - vec2(14.5 + head * 3.2, 0.0);
+  hq.y -= sin(g * 0.5) * 0.35 * (1.0 - head);
+  for (int s = -1; s <= 1; s += 2) {                               // ears, angled back
+    vec2 eq = rot(float(s) * 0.55) * (hq - vec2(-1.8, float(s) * 2.6));
+    lay(col, a, ellD(eq, vec2(2.3, 1.1)), BR * 0.85);
+    col = mix(col, vec3(0.93, 0.78, 0.68), ss(0.4, -0.4, ellD(eq, vec2(1.3, 0.5))) * 0.8);
+  }
+  lay(col, a, ellD(hq, vec2(3.8 - head * 0.4, 2.4)), BR * 1.04);
+  lay(col, a, length(hq - vec2(3.4 - head * 0.4, 0.0)) - 1.15, DK);   // muzzle
+  return vec4(col, a);
+}
+vec4 hareCol(vec2 q, float g, float alert) {
+  q /= 1.15;
+  float hop = max(0.0, sin(g));
+  q.x /= 1.0 + 0.22 * hop;                                          // stretches out mid-hop
+  vec3 col = vec3(0.0); float a = 0.0;
+  vec3 GB = vec3(0.63, 0.55, 0.45), DK = vec3(0.28, 0.23, 0.19), WH = vec3(0.97, 0.96, 0.93);
+  for (int s = -1; s <= 1; s += 2) {
+    lay(col, a, ellD(q - vec2(-4.5 - hop * 1.5, float(s) * 3.0), vec2(3.0, 1.1)), GB * 0.8);   // big hind feet
+    lay(col, a, length(q - vec2(3.5 + hop * 2.0, float(s) * 1.6)) - 0.8, GB * 0.85);          // front paws
+  }
+  lay(col, a, ellD(q + vec2(0.5, 0.0), vec2(6.6, 4.1)), GB);
+  col = mix(col, GB * 1.15, ss(0.5, -0.5, ellD(q - vec2(0.0, -1.0), vec2(4.2, 1.6))) * 0.6);
+  lay(col, a, length(q + vec2(6.8, 0.0)) - 1.7, WH);                // cotton tail
+  vec2 hq = q - vec2(6.2, 0.0);
+  for (int s = -1; s <= 1; s += 2) {                                 // long ears laid back; raised when sitting up
+    float L = mix(4.6, 2.6, alert);
+    vec2 eq = rot(float(s) * (0.12 + 0.25 * alert)) * (hq - vec2(-L * 0.75, float(s) * 1.3));
+    lay(col, a, ellD(eq, vec2(L, 1.1)), GB * 0.95);
+    col = mix(col, DK, ss(0.4, -0.4, ellD(eq + vec2(L * 0.8, 0.0), vec2(0.9, 1.0))) * 0.9);
+    col = mix(col, vec3(0.90, 0.74, 0.68), ss(0.4, -0.4, ellD(eq, vec2(L * 0.7, 0.4))) * 0.6);
+  }
+  lay(col, a, length(hq) - 2.8, GB * 1.03);
+  lay(col, a, length(hq - vec2(2.7, 0.0)) - 0.6, vec3(0.75, 0.48, 0.45));
+  return vec4(col, a);
+}
+vec4 hogCol(vec2 q, float g) {
+  q = rot(sin(g) * 0.06) * q;                                        // waddle
+  vec3 col = vec3(0.0); float a = 0.0;
+  vec3 SP = vec3(0.30, 0.24, 0.18), TIP = vec3(0.74, 0.66, 0.53), FACE = vec3(0.80, 0.66, 0.50), DK = vec3(0.13, 0.10, 0.08);
+  for (int i = 0; i < 4; i++) {
+    float sx = i < 2 ? 3.5 : -3.5, sy = (i == 0 || i == 2) ? 4.6 : -4.6;
+    float st = sin(g + (i == 0 || i == 3 ? 0.0 : 3.14)) * 1.2;
+    lay(col, a, length(q - vec2(sx + st, sy)) - 0.9, FACE * 0.8);
+  }
+  lay(col, a, ellD(q - vec2(5.6, 0.0), vec2(3.2, 2.4)), FACE);      // pointed face
+  lay(col, a, length(q - vec2(8.6, 0.0)) - 0.8, DK);                 // nose
+  float an = atan(q.y, q.x);
+  float spikes = 0.7 * abs(sin(an * 11.0)) * ss(0.2, -0.6, cos(an) - 0.6);   // spiny fringe, none over the face
+  float db = ellD(q + vec2(0.8, 0.0), vec2(6.3, 4.8)) - spikes;
+  lay(col, a, db, SP);
+  float quills = 0.5 + 0.5 * sin((q.x * 0.9 + abs(q.y) * 1.6) * 2.2) * sin(q.y * 2.6 + q.x);
+  col = mix(col, mix(SP, TIP, quills * 0.7), ss(0.5, -0.5, db) * ss(-3.5, -0.3, db) * 0.8 + ss(0.5, -0.5, db) * 0.25 * quills);
+  return vec4(col, a);
+}
+vec4 walkerCol(vec2 p, vec4 w, vec4 k) {
+  vec2 q = rot(-w.z) * (p - w.xy);
+  vec4 c = k.x < 1.5 ? deerCol(q, w.w, k.z) : k.x < 2.5 ? hareCol(q, w.w, k.w) : hogCol(q, w.w);
+  return vec4(c.rgb, c.a * k.y);
+}
+float walkerShadow(vec2 p, vec4 w, vec4 k) {
+  vec2 q = rot(-w.z) * (p - w.xy - SHDIR * 3.0);
+  float d = k.x < 1.5 ? min(ellD(q, vec2(15.0, 6.5)), ellD(q - vec2(19.0, 0.0), vec2(5.0, 3.5)))
+          : k.x < 2.5 ? ellD(q, vec2(9.0, 4.8)) : ellD(q, vec2(8.0, 5.8));
+  return ss(2.0, -2.0, d) * k.y;
+}
+// butterfly: two pairs of wings that open and close
+vec4 flyCol(vec2 p, vec4 b) {
+  vec2 q = p - b.xy;
+  float open = 0.25 + 0.75 * abs(sin(b.z));
+  q.x /= open;
+  q.x = abs(q.x);
+  float d = min(length(q - vec2(2.6, -1.4)) - 2.4, length(q - vec2(2.0, 1.8)) - 1.7);
+  vec3 c = b.w < 1.5 ? vec3(0.99, 0.95, 0.80) : b.w < 2.5 ? vec3(0.99, 0.80, 0.20) : vec3(0.40, 0.62, 0.98);
+  float m = ss(0.6 / open, -0.6 / open, d);
+  m = max(m, ss(0.6, -0.4, ellD(p - b.xy, vec2(0.7, 2.6))));
+  c = mix(c, vec3(0.15), ss(0.6, -0.4, ellD(p - b.xy, vec2(0.7, 2.6))));
+  return vec4(c, m);
+}
+
+void main() {
+  vec2 p = vec2(gl_FragCoord.x, uRes.y * uScale - gl_FragCoord.y) / uScale;
+  vec2 f = field(p);
+  float s = f.x, pd = f.y;
+
+  // ---------- ground: forest floor under the trees, sunny grass in the clearings ----------
+  vec4 n1 = N(p, 900.0), n2 = N(p + 311.0, 260.0);
+  vec3 floorC = mix(FLOOR, FLOOR2, ss(0.3, 0.75, n1.g)) * (0.9 + 0.2 * n2.r);
+  vec3 grass = mix(G_MID, G_SUN, ss(0.3, 0.75, n1.b * 0.6 + n2.g * 0.4));
+  grass = mix(grass, G_DEEP, ss(0.5, 0.85, N(p + 977.0, 1300.0).r) * 0.45);
+  grass = mix(grass, G_DEEP * 0.95, ss(-40.0, 0.0, s) * 0.55);                 // grass darker toward the trees
+  grass = mix(grass, grass * vec3(0.62, 0.74, 0.55), grassInk(p) * 0.7);
+  grass *= 1.0 + (hash2(floor(p * max(uScale, 1.0))) - 0.5) * 0.04;          // paper grain
+  float edge = ss(-6.0, 12.0, s + (n2.b - 0.5) * 26.0);
+  vec3 col = mix(grass, floorC, edge);
+  // flowers (only well inside the clearing, off the path)
+  if (s < -10.0) {
+    vec4 fl = flower(p);
+    col = mix(col, fl.rgb, fl.a * ss(-10.0, -24.0, s) * ss(7.0, 11.0, pd));
+  }
+  // dirt path: fades out deep inside the clearings (the icons stand on grass)
+  float pw = 7.5 + 2.5 * (N(p, 160.0).r - 0.5) * 2.0;
+  float pathA = ss(0.8, -0.8, pd - pw) * ss(-75.0, -35.0, s);
+  if (pathA > 0.0) {
+    vec3 dc = mix(DIRT, DIRT_D, ss(pw - 3.0, pw, pd) * 0.7);                  // darker worn rim
+    dc = mix(dc, DIRT * 1.12, ss(0.55, 0.8, N(p, 30.0).g) * 0.6);
+    vec2 pc = floor(p / 6.0), pq = (pc + 0.25 + 0.5 * vec2(hash2(pc + 1.3), hash2(pc + 4.1))) * 6.0;
+    dc = mix(dc, DIRT_D * 0.9, step(hash2(pc), 0.22) * ss(1.3, 0.6, length(p - pq)));   // pebbles
+    col = mix(col, dc * mix(1.0, 0.72, edge), pathA);
+  }
+
+  // ---------- fox (on the ground, under the canopy) ----------
+  bool foxNear = uFoxOn > 0.5 && length(p - uFox.xy) < 46.0;
+  if (foxNear) col = mix(col, col * SHADE, foxShadow(p) * 0.6);
+  for (int i = 0; i < 3; i++)
+    if (uWk2[i].x > 0.5 && length(p - uWk[i].xy) < 34.0) col = mix(col, col * SHADE, walkerShadow(p, uWk[i], uWk2[i]) * 0.55);
+
+  // ---------- tree crowns: find the two highest crowns covering this pixel and the cast shadows ----------
+  vec4 c1 = vec4(0.0), c2 = vec4(0.0);
+  float h1 = -1.0, h2 = -1.0, d1 = 1e9, d2 = 1e9;
+  float shB[4] = float[4](0.0, 0.0, 0.0, 0.0);
+  ivec2 cell = ivec2(floor(p / uCellG)) + 2;
+  bool inGrid = cell.x >= 0 && cell.y >= 0 && float(cell.x) < uTGrid.x && float(cell.y) < uTGrid.y;
+  if (inGrid) for (int k = 0; k < TK; k++) {
+    vec4 c = texelFetch(uTree, ivec2(cell.x * TK + k, cell.y), 0);
+    if (c.z <= 0.0) break;
+    float h = fract(c.w);
+    vec2 dv = p - c.xy;
+    float l = length(dv);
+    if (l < c.z * 1.14 + 1.0) {
+      float d = l - c.z * edgeF(int(c.w), atan(dv.y, dv.x), h);
+      if (d < 1.0) {
+        if (h > h1) { c2 = c1; h2 = h1; d2 = d1; c1 = c; h1 = h; d1 = d; }
+        else if (h > h2) { c2 = c; h2 = h; d2 = d; }
+      }
+    }
+    // drop shadow: taller trees throw it farther
+    float ds = length(dv - SHDIR * (5.0 + 15.0 * h)) - c.z * 0.97;
+    float cov = ss(6.0, -4.0, ds);
+    int b = min(int(h * 4.0), 3);
+    shB[b] = max(shB[b], cov);
+  }
+  float shAll = max(max(shB[0], shB[1]), max(shB[2], shB[3]));
+  col = mix(col, col * SHADE, shAll * mix(0.75, 0.35, edge));               // on the ground (weaker on the dark floor)
+  if (h1 >= 0.0) {
+    float aa = 1.0 / uScale;
+    vec3 under = col;
+    if (h2 >= 0.0) {
+      int b2 = min(int(h2 * 4.0), 3);
+      float sh2 = 0.0; for (int b = 0; b < 4; b++) if (b > b2) sh2 = max(sh2, shB[b]);
+      under = mix(under, crownCol(c2, p, sh2 * 0.7), clamp(0.5 - d2 / aa, 0.0, 1.0));
+    }
+    int b1 = min(int(h1 * 4.0), 3);
+    float sh1 = 0.0; for (int b = 0; b < 4; b++) if (b > b1) sh1 = max(sh1, shB[b]);
+    vec3 top = crownCol(c1, p, sh1 * 0.7);
+    top = mix(top, top * 0.62, ss(-3.5, 0.0, d1) * 0.55);                   // painted dark outline at the crown edge
+    col = mix(under, top, clamp(0.5 - d1 / aa, 0.0, 1.0));
+  }
+
+  // fox is drawn after the ground but before... it has to be hidden by crowns: draw it only where no crown covers
+  if (foxNear) {
+    vec4 fx = foxCol(p);
+    float cover = h1 >= 0.0 ? clamp(0.5 - d1 * uScale, 0.0, 1.0) : 0.0;
+    col = mix(col, fx.rgb, fx.a * (1.0 - cover));
+  }
+  for (int i = 0; i < 3; i++) {
+    if (uWk2[i].x < 0.5 || length(p - uWk[i].xy) > 32.0) continue;
+    vec4 wc = walkerCol(p, uWk[i], uWk2[i]);
+    float cover = h1 >= 0.0 ? clamp(0.5 - d1 * uScale, 0.0, 1.0) : 0.0;
+    col = mix(col, wc.rgb, wc.a * (1.0 - cover));
+  }
+
+  // ---------- butterflies over the clearings ----------
+  for (int i = 0; i < 3; i++) {
+    vec4 b = uFly[i];
+    if (b.w < 0.5 || abs(p.x - b.x) > 14.0 || abs(p.y - b.y) > 14.0) continue;
+    col = mix(col, col * SHADE, ss(4.0, 1.0, length(p - b.xy - SHDIR * 8.0)) * 0.35);
+    vec4 fc = flyCol(p, b);
+    col = mix(col, fc.rgb, fc.a);
+  }
+  // ---------- birds: shadow far below on the canopy, then the bird ----------
+  for (int i = 0; i < 6; i++) {
+    if (float(i) >= uBirdN) break;
+    vec4 b = uBird[i];
+    vec2 so = SHDIR * 70.0;
+    if (length(p - b.xy - so) < 18.0) col = mix(col, col * SHADE, ss(2.5, -2.5, birdD(p - so, b)) * 0.45);
+    if (length(p - b.xy) < 16.0) col = mix(col, vec3(0.16, 0.15, 0.18), ss(0.6, -0.6, birdD(p, b)));
+  }
+
+  // soft vignette of light: the sun is in the upper left
+  col *= 1.0 + 0.06 * (0.5 - (p.x + p.y) / (uRes.x + uRes.y));
+  o = vec4(col, 1.0);
+}`;
+
+/* ======================================================================
+   WebGL
+   ====================================================================== */
+const cv = document.getElementById('art');
+const gl = cv.getContext('webgl2', { antialias: false });
+if (!gl) document.getElementById('nogl').style.display = 'grid';
+function program(fs) {
+  const mk = (type, src) => {
+    const s = gl.createShader(type);
+    gl.shaderSource(s, src); gl.compileShader(s);
+    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) { console.error(gl.getShaderInfoLog(s)); throw new Error('shader: ' + gl.getShaderInfoLog(s)); }
+    return s;
+  };
+  const p = gl.createProgram();
+  gl.attachShader(p, mk(gl.VERTEX_SHADER, VS));
+  gl.attachShader(p, mk(gl.FRAGMENT_SHADER, fs));
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) console.error(gl.getProgramInfoLog(p));
+  const U = {};
+  const n = gl.getProgramParameter(p, gl.ACTIVE_UNIFORMS);
+  for (let i = 0; i < n; i++) { const nm = gl.getActiveUniform(p, i).name.replace(/\[0\]$/, ''); U[nm] = gl.getUniformLocation(p, nm); }
+  return { p, U };
+}
+const PR = program(FS);
+gl.bindVertexArray(gl.createVertexArray());
+
+let noiseTex = null;
+function buildNoiseTex() {
+  const { S, d } = makeNoiseImage();
+  noiseTex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, noiseTex);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, S, S, 0, gl.RGBA, gl.UNSIGNED_BYTE, d);
+  gl.generateMipmap(gl.TEXTURE_2D);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.REPEAT);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.REPEAT);
+}
+const f32 = new Float32Array(1), u32 = new Uint32Array(f32.buffer);
+function toHalf(v) {
+  f32[0] = v; const x = u32[0];
+  const sign = (x >>> 16) & 0x8000, e = ((x >>> 23) & 0xff) - 112, m = x & 0x7fffff;
+  if (e <= 0) return sign;
+  if (e >= 31) return sign | 0x7c00;
+  return sign | (e << 10) | (m >>> 13);
+}
+// two field textures (RG16F: s, path distance); the shader blends from -> to
+const ftex = [null, null];
+let fromI = 0, toI = 0, FA = null, FB = null;
+let morphT0 = -1e9, morphDur = MORPH_MS, curMix = 1;
+function allocField() {
+  for (let i = 0; i < 2; i++) {
+    if (ftex[i]) gl.deleteTexture(ftex[i]);
+    ftex[i] = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, ftex[i]);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RG16F, Gw, Gh, 0, gl.RG, gl.HALF_FLOAT, null);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  }
+}
+function uploadField(i, Fd) {
+  const n = Gw * Gh, d = new Uint16Array(n * 2);
+  for (let k = 0; k < n; k++) { d[k * 2] = toHalf(Math.min(Fd.s[k], 6e4)); d[k * 2 + 1] = toHalf(Fd.pd[k]); }
+  gl.bindTexture(gl.TEXTURE_2D, ftex[i]);
+  gl.pixelStorei(gl.UNPACK_ALIGNMENT, 2);
+  gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, Gw, Gh, gl.RG, gl.HALF_FLOAT, d);
+}
+
+let icons = [];
+const iconRects = () => icons.map(ic => ({ cx: ic.x + ic.w / 2, cy: ic.y + ic.h / 2, hw: ic.w / 2 - 4, hh: ic.h / 2 - 2 }));
+// Field currently on screen (from -> to blended by curMix): a new transition must start from it, not from the
+// previous target, or the scenery jumps when icons move again while a transition is still running.
+function blendFields(A, B, m) {
+  const out = {};
+  for (const k in B) {
+    const a = A && A[k], b = B[k];
+    if (!(b instanceof Float32Array) || !(a instanceof Float32Array) || a.length !== b.length) return null;
+    const r = new Float32Array(b.length);
+    for (let i = 0; i < b.length; i++) r[i] = a[i] + (b[i] - a[i]) * m;
+    out[k] = r;
+  }
+  return out;
+}
+function commit(fromEmpty = false) {
+  const nf = computeField(iconRects());
+  setPathNet(lastLinks);
+  const target = 1 - toI;
+  if (fromEmpty) { FA = computeField([]); uploadField(toI, FA); }
+  else if (FA && FB && curMix < 0.999 && (FA = blendFields(FA, FB, Math.max(0, curMix)))) uploadField(toI, FA);
+  else FA = FB || nf;
+  FB = nf;
+  uploadField(target, FB);
+  fromI = toI; toI = target;
+  morphT0 = performance.now();
+  morphDur = fromEmpty ? 2600 : MORPH_MS;
+  curMix = 0;
+  treeDirty = true;
+}
+function refresh() {
+  FA = FB = computeField(iconRects());
+  setPathNet(lastLinks);
+  uploadField(toI, FB);
+  fromI = toI; morphT0 = -1e9; curMix = 1;
+  treeDirty = true;
+}
+const curS = (x, y) => FB ? sampleArr(FA.s, x, y) * (1 - curMix) + sampleArr(FB.s, x, y) * curMix : 999;
+const curP = (x, y) => FB ? sampleArr(FA.pd, x, y) * (1 - curMix) + sampleArr(FB.pd, x, y) * curMix : PATH_MAX;
+
+/* ======================================================================
+   Trees: a jittered grid of crowns; each frame they are sized by the current field, swayed and binned
+   ====================================================================== */
+const CELL_G = 40, TK = 24;
+let trees = null, treeDirty = true, treeTex = null, treeBuf = null, tgW = 0, tgH = 0, treeStats = null;
+function buildTrees() {
+  const SP = 40 / Math.sqrt(P.density);
+  const list = [];
+  const nx = Math.ceil((W + 4 * SP) / SP), ny = Math.ceil((H + 4 * SP) / SP);
+  for (let gy = 0; gy < ny; gy++) for (let gx = 0; gx < nx; gx++) {
+    const u = k => hash2(gx, gy, k);
+    const x = (gx - 2 + 0.5 + (u(1) - 0.5) * 0.85) * SP, y = (gy - 2 + 0.5 + (u(2) - 0.5) * 0.85) * SP;
+    let r = SP * (0.58 + 0.34 * u(3) * u(3));
+    if (u(4) < 0.05) r *= 1.35;                         // a few old giants
+    const h = Math.min(0.999, 0.6 * (r / (SP * 1.2)) + 0.4 * u(5));
+    // colour: autumn trees come in groves; some pines; otherwise three greens
+    const grove = fbm(x * 0.004, y * 0.004, 9);
+    let idx;
+    if (u(6) < P.autumn * (0.3 + 1.4 * grove) * 1.1) idx = 4 + Math.floor(u(7) * 3);
+    else if (u(8) < 0.16 + 0.25 * sstep(0.55, 0.7, fbm(x * 0.003, y * 0.003, 5))) idx = 3;
+    else idx = Math.floor(u(9) * 3);
+    list.push({ x, y, r, h, idx, ph: u(10) * 6.283, g: 1 });
+  }
+  trees = list; treeDirty = true;
+}
+function sizeTrees() {
+  for (const t of trees) {
+    const s = curS(t.x, t.y), pd = curP(t.x, t.y);
+    t.g = sstep(t.r * 0.35, t.r * 0.95, s) * sstep(t.r * 0.55 + 4, t.r * 0.55 + 16, pd);
+  }
+}
+function uploadTrees(t) {
+  gl.activeTexture(gl.TEXTURE3);
+  const gw = Math.ceil(W / CELL_G) + 4, gh = Math.ceil(H / CELL_G) + 4;   // 2 extra cells on each side
+  if (!treeTex || gw !== tgW || gh !== tgH) {
+    tgW = gw; tgH = gh;
+    if (treeTex) gl.deleteTexture(treeTex);
+    treeTex = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, treeTex);
+    gl.texStorage2D(gl.TEXTURE_2D, 1, gl.RGBA32F, gw * TK, gh);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    treeBuf = new Float32Array(gw * TK * gh * 4);
+  }
+  if (!trees) buildTrees();
+  if (treeDirty || curMix < 1) { sizeTrees(); treeDirty = curMix < 1; }
+  // wind: a slow gust wave rolls across the forest plus each tree's own small rocking
+  const wd = P.wind;
+  const live = [];
+  for (const tr of trees) {
+    const r = tr.r * tr.g;
+    if (r < 1.5) continue;
+    const gust = 0.5 + 0.5 * Math.sin(t * 0.35 - tr.x * 0.004 - tr.y * 0.0016);
+    const amp = wd * (0.6 + 1.4 * tr.h) * (0.35 + 0.65 * gust);
+    const dx = amp * (0.6 * gust + 0.4 * Math.sin(t * (0.55 + 0.15 * tr.h) + tr.ph));
+    const dy = amp * 0.35 * Math.sin(t * (0.45 + 0.12 * tr.h) + tr.ph * 1.7);
+    live.push(tr.x + dx, tr.y + dy, r, tr.idx + tr.h);
+  }
+  treeBuf.fill(0);
+  const cnt = new Uint8Array(gw * gh);
+  const order = [];
+  for (let i = 0; i < live.length; i += 4) order.push(i);
+  order.sort((a, b) => live[b + 2] - live[a + 2]);
+  let over = 0;
+  for (const i of order) {
+    const x = live[i], y = live[i + 1], rr = live[i + 2], h = live[i + 3] % 1;
+    // bin by the union of the crown and its shadow (shadow offset up to 20px down-right)
+    const sx = 0.58 * (5 + 15 * h), sy = 0.81 * (5 + 15 * h), R = rr * 1.15 + 7;
+    const bx0 = Math.min(x - R, x + sx - R), bx1 = Math.max(x + R, x + sx + R);
+    const by0 = Math.min(y - R, y + sy - R), by1 = Math.max(y + R, y + sy + R);
+    const x0 = Math.max(0, Math.floor(bx0 / CELL_G) + 2), x1 = Math.min(gw - 1, Math.floor(bx1 / CELL_G) + 2);
+    const y0 = Math.max(0, Math.floor(by0 / CELL_G) + 2), y1 = Math.min(gh - 1, Math.floor(by1 / CELL_G) + 2);
+    for (let gy = y0; gy <= y1; gy++) for (let gx = x0; gx <= x1; gx++) {
+      // skip cells neither the crown nor its shadow can reach
+      const cx0 = (gx - 2) * CELL_G, cy0 = (gy - 2) * CELL_G;
+      const near = (ox, oy) => { const nx = Math.max(cx0, Math.min(ox, cx0 + CELL_G)), ny = Math.max(cy0, Math.min(oy, cy0 + CELL_G)); return (nx - ox) * (nx - ox) + (ny - oy) * (ny - oy) <= R * R; };
+      if (!near(x, y) && !near(x + sx, y + sy)) continue;
+      const ci = gy * gw + gx;
+      if (cnt[ci] >= TK) { over++; continue; }
+      const o = (ci * TK + cnt[ci]++) * 4;
+      treeBuf[o] = x; treeBuf[o + 1] = y; treeBuf[o + 2] = rr; treeBuf[o + 3] = live[i + 3];
+    }
+  }
+  if (frameN % 30 === 0) treeStats = { trees: live.length / 4, maxPerCell: Math.max(...cnt), over };
+  gl.bindTexture(gl.TEXTURE_2D, treeTex);
+  gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, gw * TK, gh, gl.RGBA, gl.FLOAT, treeBuf);
+}
+
+/* ======================================================================
+   Life: birds over the canopy, butterflies in the clearings, a fox now and then
+   ====================================================================== */
+const birdU = new Float32Array(24), flyU = new Float32Array(12), foxU = new Float32Array(4);
+const LIFETEST = QS.has('lifetest');            // debug: bring the fox and birds out right away
+let flock = null, flockNext = LIFETEST ? 0.5 : 4, foxRun = null, foxNext = LIFETEST ? 0.5 : 25 + Math.random() * 30, flies = [];
+let birdN = 0, foxOn = 0;
+function clearingPoint(tries = 20) {
+  if (!icons.length || !FB) return null;
+  for (let k = 0; k < tries; k++) {
+    const ic = icons[Math.floor(Math.random() * icons.length)];
+    const a = Math.random() * 6.283, d = Math.random() * P.sigma * 1.1 + 30;
+    const x = ic.x + ic.w / 2 + Math.cos(a) * d, y = ic.y + ic.h / 2 + Math.sin(a) * d;
+    if (x > 10 && y > 10 && x < W - 10 && y < H - 10 && curS(x, y) < -18) return [x, y];
+  }
+  return null;
+}
+
+/* ----------------------------------------------------------------------
+   Path walkers: a deer, a hare and a hedgehog stroll along the dirt paths between the clearings. At a clearing
+   they stop (graze / sit up / sniff), then go round the icon to another path or turn back. When icons move,
+   animals whose path is still there keep walking; the others slip away (fade) and come back on the new paths.
+   ---------------------------------------------------------------------- */
+const WALK_MAX = 3, SPECIES = { deer: 1, hare: 2, hog: 3 };
+const SPEED = { deer: 24, hare: 0, hog: 10 };            // hare speed comes from its hops
+const walkU = new Float32Array(WALK_MAX * 4), walkK = new Float32Array(WALK_MAX * 4);
+let pathNet = [], walkers = [], walkNext = LIFETEST ? 0.3 : 3 + Math.random() * 5;
+function rectGap(r, x, y) {                              // distance from a point to an icon rect (0 inside)
+  const dx = Math.max(Math.abs(x - r.cx) - r.hw, 0), dy = Math.max(Math.abs(y - r.cy) - r.hh, 0);
+  return Math.hypot(dx, dy);
+}
+function setPathNet(links) {
+  const net = [];
+  for (const L of links) {
+    const P2 = L.pts, n = P2.length / 2, cum = new Float32Array(n);
+    for (let k = 1; k < n; k++) cum[k] = cum[k - 1] + Math.hypot(P2[2 * k] - P2[2 * k - 2], P2[2 * k + 1] - P2[2 * k - 1]);
+    // walk only outside the icons themselves: trim each end where the path leaves the icon (+ a margin)
+    let i0 = 0, i1 = n - 1;
+    while (i0 < n - 1 && rectGap(L.ra, P2[2 * i0], P2[2 * i0 + 1]) < 16) i0++;
+    while (i1 > 0 && rectGap(L.rb, P2[2 * i1], P2[2 * i1 + 1]) < 16) i1--;
+    if (cum[i1] - cum[i0] < 40) continue;
+    net.push({ a: L.a, b: L.b, ra: L.ra, rb: L.rb, pts: P2, cum, d0: cum[i0], d1: cum[i1], key: L.ra.cx.toFixed(0) + ',' + L.ra.cy.toFixed(0) + '>' + L.rb.cx.toFixed(0) + ',' + L.rb.cy.toFixed(0) });
+  }
+  pathNet = net;
+  // keep animals whose path is still in place; the rest leave
+  for (const w of walkers) {
+    if (w.fade < 0) continue;
+    const same = w.L && net.find(L => L.key === w.L.key);
+    if (same) { w.L = same; if (w.arc) w.arc = null, w.pause = Math.max(w.pause, 0.5); w.d = Math.min(Math.max(w.d, same.d0), same.d1); }
+    else w.fade = -1;
+  }
+}
+function linkPos(L, d) {
+  const c = L.cum, n = c.length;
+  let lo = 0, hi = n - 1;
+  while (hi - lo > 1) { const m = (lo + hi) >> 1; if (c[m] <= d) lo = m; else hi = m; }
+  const t = Math.min(Math.max((d - c[lo]) / Math.max(c[hi] - c[lo], 1e-3), 0), 1), P2 = L.pts;
+  return [P2[2 * lo] + (P2[2 * hi] - P2[2 * lo]) * t, P2[2 * lo + 1] + (P2[2 * hi + 1] - P2[2 * lo + 1]) * t];
+}
+function linkDir(L, d, dir) {
+  const a = linkPos(L, d - 7), b = linkPos(L, d + 7);
+  return Math.atan2((b[1] - a[1]) * dir, (b[0] - a[0]) * dir);
+}
+const angTo = (a, b, k) => { let d = b - a; d = Math.atan2(Math.sin(d), Math.cos(d)); return a + d * Math.min(k, 1); };
+function spawnWalker(t) {
+  if (!pathNet.length) return;
+  const have = new Set(walkers.map(w => w.sp));
+  const free = Object.keys(SPECIES).filter(k => !have.has(k));
+  if (!free.length) return;
+  const sp = free[Math.floor(Math.random() * free.length)];
+  const used = new Set(walkers.map(w => w.L));
+  const opts = pathNet.filter(L => !used.has(L));
+  const L = (opts.length ? opts : pathNet)[Math.floor(Math.random() * (opts.length || pathNet.length))];
+  const dir = Math.random() < 0.5 ? 1 : -1;
+  // appear somewhere along the path (as if stepping out from the trees), not in the middle of a clearing
+  const d = L.d0 + (L.d1 - L.d0) * (0.25 + 0.5 * Math.random());
+  const [x, y] = linkPos(L, d);
+  walkers.push({ sp, L, dir, d, x, y, ang: linkDir(L, d, dir), a: 0, fade: 1, pause: 1 + Math.random(), gait: 0,
+                 head: 0, alert: 0, look: 0, arc: null, side: (Math.random() - 0.5) * 3 });
+}
+// at the end of a path: pick the next path from this icon (or turn back) and plan an arc round the icon to it
+function nextLeg(w) {
+  const node = w.dir > 0 ? w.L.b : w.L.a, r = w.dir > 0 ? w.L.rb : w.L.ra;
+  const opts = pathNet.filter(L => L !== w.L && (L.a === node || L.b === node));
+  if (!opts.length || Math.random() < 0.15) { w.dir = -w.dir; return; }   // dead end: turn round
+  const L = opts[Math.floor(Math.random() * opts.length)];
+  const dir = L.a === node ? 1 : -1, d = dir > 0 ? L.d0 : L.d1;
+  const [x1, y1] = linkPos(L, d);
+  const a0 = Math.atan2(w.y - r.cy, w.x - r.cx), r0 = Math.hypot(w.x - r.cx, w.y - r.cy);
+  let a1 = Math.atan2(y1 - r.cy, x1 - r.cx); const r1 = Math.hypot(x1 - r.cx, y1 - r.cy);
+  a1 = a0 + Math.atan2(Math.sin(a1 - a0), Math.cos(a1 - a0));
+  const len = Math.abs(a1 - a0) * (r0 + r1) / 2 + Math.abs(r1 - r0);
+  w.arc = { cx: r.cx, cy: r.cy, a0, a1, r0, r1, len, s: 0, L, dir, d };
+}
+function stepWalkers(t, dt) {
+  walkU.fill(0); walkK.fill(0);
+  if (curMix >= 1 && pathNet.length && t > walkNext) {
+    if (walkers.length < Math.min(WALK_MAX, pathNet.length + 1)) spawnWalker(t);
+    walkNext = t + (LIFETEST ? 0.3 : 8 + Math.random() * 14);
+  }
+  for (const w of walkers) {
+    w.a = Math.min(Math.max(w.a + w.fade * dt / (w.fade > 0 ? 1.2 : 0.8), 0), 1);
+    let v = 0, moving = w.pause <= 0;
+    if (!moving) {
+      w.pause -= dt;
+      // resting: the deer grazes, the hare sits up with its ears raised, the hedgehog sniffs about
+      w.head += ((w.sp === 'deer' ? 1 : 0) - w.head) * Math.min(dt * 2, 1);
+      w.alert += ((w.sp === 'hare' ? 1 : 0) - w.alert) * Math.min(dt * 3, 1);
+      w.look = Math.sin(t * (w.sp === 'hog' ? 3.1 : 0.9) + w.side) * (w.sp === 'deer' ? 0.25 : 0.35);
+    } else {
+      w.head *= Math.max(0, 1 - dt * 3); w.alert *= Math.max(0, 1 - dt * 3); w.look *= Math.max(0, 1 - dt * 3);
+      if (w.sp === 'hare') { w.gait += dt * 8.5; v = 95 * Math.pow(Math.max(0, Math.sin(w.gait)), 1.5); }
+      else { v = SPEED[w.sp]; w.gait += dt * v * (w.sp === 'deer' ? 0.32 : 0.9); }
+      if (Math.random() < dt * 0.04) w.pause = 1.5 + Math.random() * 2.5;      // stop to look round now and then
+    }
+    let tx, ty, tang;
+    if (w.arc) {
+      const A = w.arc;
+      A.s = Math.min(A.s + v * dt, A.len);
+      const k = A.len > 0 ? A.s / A.len : 1, ang = A.a0 + (A.a1 - A.a0) * k, rr = A.r0 + (A.r1 - A.r0) * k;
+      tx = A.cx + Math.cos(ang) * rr; ty = A.cy + Math.sin(ang) * rr;
+      tang = Math.atan2(ty - w.y, tx - w.x);
+      if (Math.hypot(tx - w.x, ty - w.y) < 0.01) tang = w.ang;
+      if (A.s >= A.len) { w.L = A.L; w.dir = A.dir; w.d = A.d; w.arc = null; }
+    } else {
+      w.d += w.dir * v * dt;
+      const end = w.dir > 0 ? w.L.d1 : w.L.d0;
+      if ((w.d - end) * w.dir >= 0) {
+        w.d = end;
+        if (w.fade > 0) { w.pause = 1.5 + Math.random() * 2.5; nextLeg(w); }
+      }
+      [tx, ty] = linkPos(w.L, w.d);
+      tang = linkDir(w.L, w.d, w.dir);
+      tx += -Math.sin(tang) * w.side; ty += Math.cos(tang) * w.side;   // keep to its own side of the path
+    }
+    w.x = tx; w.y = ty;
+    w.ang = angTo(w.ang, tang, dt * (moving ? 5 : 2.5));
+  }
+  walkers = walkers.filter(w => !(w.fade < 0 && w.a <= 0));
+  if (LIFETEST && Math.floor(t / 2) !== Math.floor((t - dt) / 2))      // debug trace: ?lifetest=1, read window.__walkTrace
+    (window.__walkTrace = window.__walkTrace || []).push(walkers.map(w => w.sp[0] + (w.arc ? 'A' : w.pause > 0 ? 'P' : 'W') + pathNet.indexOf(w.L) + (w.dir > 0 ? '+' : '-') + '@' + Math.round(w.x) + ',' + Math.round(w.y)).join(' '));
+  walkers.forEach((w, i) => {
+    walkU.set([w.x, w.y, w.ang + w.look, w.gait], i * 4);
+    walkK.set([SPECIES[w.sp], w.a, w.head, w.alert], i * 4);
+  });
+}
+function stepLife(t, dt) {
+  birdN = 0; foxOn = 0; flyU.fill(0);
+  if (!P.life) { flock = null; foxRun = null; flies = []; walkers = []; walkU.fill(0); walkK.fill(0); return; }
+  stepWalkers(t, dt);
+  // birds: a small flock crosses the screen in a loose V
+  if (!flock && t > flockNext) {
+    const n = 3 + Math.floor(Math.random() * 4), side = Math.random();
+    const ang = (side < 0.5 ? 0 : Math.PI) + (Math.random() - 0.5) * 0.7;
+    const cx = W / 2 - Math.cos(ang) * (W / 2 + 120), cy = H * (0.2 + Math.random() * 0.6) - Math.sin(ang) * (W / 2 + 120);
+    flock = { x: cx, y: cy, ang, v: 85 + Math.random() * 30, n, t0: t, off: [] };
+    for (let i = 0; i < n; i++) {
+      const row = Math.ceil(i / 2), sgn = i % 2 ? 1 : -1;
+      flock.off.push([-row * 20 + (Math.random() - 0.5) * 6, sgn * row * 16 + (Math.random() - 0.5) * 6, Math.random() * 6.283]);
+    }
+  }
+  if (flock) {
+    flock.x += Math.cos(flock.ang) * flock.v * dt; flock.y += Math.sin(flock.ang) * flock.v * dt;
+    flock.ang += Math.sin(t * 0.3) * 0.04 * dt;
+    const c = Math.cos(flock.ang), s = Math.sin(flock.ang);
+    let inside = false;
+    for (let i = 0; i < flock.n; i++) {
+      const [ox, oy, ph] = flock.off[i];
+      const x = flock.x + ox * c - oy * s, y = flock.y + ox * s + oy * c;
+      if (x > -200 && x < W + 200 && y > -200 && y < H + 200) inside = true;
+      const flap = Math.sin(t * 9 + ph);
+      birdU.set([x, y, flock.ang, Math.sin(t * 0.8 + ph) > -0.3 ? flap : 0.6], birdN * 4); birdN++;
+    }
+    if (!inside && t - flock.t0 > 3) { flock = null; flockNext = t + 20 + Math.random() * 35; }
+  }
+  // butterflies: flutter between random spots in the clearings
+  const want = icons.length ? 3 : 0;
+  while (flies.length < want) { const pt = clearingPoint(); if (!pt) break; flies.push({ x: pt[0], y: pt[1], tx: pt[0], ty: pt[1], ph: Math.random() * 6, c: 1 + flies.length % 3, rest: 0 }); }
+  if (flies.length > want) flies.length = want;
+  flies.forEach((f, i) => {
+    const dx = f.tx - f.x, dy = f.ty - f.y, d = Math.hypot(dx, dy);
+    if (d < 4) {
+      f.rest -= dt;
+      if (f.rest <= 0) { const pt = clearingPoint(); if (pt) { f.tx = pt[0]; f.ty = pt[1]; } f.rest = 1 + Math.random() * 4; }
+    } else {
+      const v = Math.min(d, 38 * dt);
+      f.x += dx / d * v + Math.sin(t * 5 + f.ph) * 18 * dt; f.y += dy / d * v + Math.cos(t * 4.3 + f.ph) * 18 * dt;
+    }
+    if (curS(f.x, f.y) > 0) { const pt = clearingPoint(); if (pt) { f.tx = pt[0]; f.ty = pt[1]; } }
+    f.ph += dt * (d < 4 ? 2.5 : 14);
+    flyU.set([f.x, f.y, f.ph, f.c], i * 4);
+  });
+  // fox: walks out of the forest, across a clearing, stops to look around, and disappears into the trees again
+  if (!foxRun && t > foxNext && icons.length && curMix >= 1) {
+    for (let k = 0; k < 12 && !foxRun; k++) {
+      const ic = icons[Math.floor(Math.random() * icons.length)];
+      const cx = ic.x + ic.w / 2 + (Math.random() - 0.5) * 60, cy = ic.y + ic.h + 10 + Math.random() * 20;
+      const ang = Math.random() * 6.283, ux = Math.cos(ang), uy = Math.sin(ang);
+      const out = sg => {
+        for (let d = 20; d < 600; d += 10) {
+          const x = cx + sg * ux * d, y = cy + sg * uy * d;
+          if (x < -30 || y < -30 || x > W + 30 || y > H + 30) return -1;
+          if (curS(x, y) > 50) return d + 25;
+        }
+        return -1;
+      };
+      const d0 = out(-1), d1 = out(1);
+      if (d0 > 0 && d1 > 0) foxRun = { x0: cx - ux * d0, y0: cy - uy * d0, ux, uy, len: d0 + d1, d: 0, stop: d0 + (Math.random() - 0.5) * 30, paused: 0, look: 0, gait: 0 };
+    }
+    foxNext = t + (foxRun ? 45 + Math.random() * 60 : 3);
+  }
+  if (foxRun) {
+    const f = foxRun;
+    if (f.d >= f.stop && f.paused < 2.6) { f.paused += dt; f.look = Math.sin(f.paused * 2.2) * 0.6; }
+    else { f.d += 42 * dt; f.gait += dt * 11; f.look *= 0.9; }
+    const wig = Math.sin(f.d * 0.02) * 10;
+    const x = f.x0 + f.ux * f.d - f.uy * wig, y = f.y0 + f.uy * f.d + f.ux * wig;
+    const ang = Math.atan2(f.uy, f.ux) + Math.cos(f.d * 0.02) * 0.2 + f.look;
+    foxU.set([x, y, ang, f.gait]); foxOn = 1;
+    if (LIFETEST) window.__snapErrors = ['fox ' + Math.round(x) + ',' + Math.round(y), 'fieldMs ' + fieldMs.toFixed(1), 'frameMs ' + frameMs.toFixed(1), JSON.stringify(treeStats)];
+    if (f.d > f.len) foxRun = null;
+  }
+}
+
+/* ======================================================================
+   Frame loop
+   ====================================================================== */
+function resize() {
+  W = innerWidth; H = innerHeight;
+  const scale = PREVIEW ? 0.45 : Math.min(devicePixelRatio || 1, P.quality);
+  const box = cv.getBoundingClientRect();
+  cv.width = Math.round((box.width || W) * scale); cv.height = Math.round((box.height || H) * scale); cv._scale = scale;
+  Gw = Math.ceil(W / STEP) + 2; Gh = Math.ceil(H / STEP) + 2;
+  buildNoise();
+  allocField();
+  trees = null;
+}
+
+const T0 = performance.now();
+let lastT = 0, fpsEMA = 0, frameN = 0, frameMs = 0, lifeT = 0;
+let paused = false;
+function frame(now) {
+  requestAnimationFrame(frame);
+  if (paused) { lastT = 0; return; }
+  if (P.cap30 && now - lastT < 31) return;
+  const dt = lastT ? Math.min((now - lastT) / 1000, 0.1) : 0.03;
+  if (lastT) fpsEMA = fpsEMA ? fpsEMA * 0.9 + (1 / dt) * 0.1 : 1 / dt;
+  lastT = now;
+  lifeT += dt;
+  stepLife(lifeT, dt);
+  draw(now);
+  frameN++;
+}
+function draw(now) {
+  const t0 = performance.now();
+  const e = Math.min(Math.max((now - morphT0) / morphDur, 0), 1);
+  curMix = e < 0.5 ? 2 * e * e : 1 - Math.pow(-2 * e + 2, 2) / 2;
+  const t = (now - T0) / 1000;
+  uploadTrees(t);
+  const { p, U } = PR;
+  gl.useProgram(p);
+  gl.viewport(0, 0, cv.width, cv.height);
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, noiseTex);
+  gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, ftex[fromI]);
+  gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D, ftex[toI]);
+  gl.activeTexture(gl.TEXTURE3); gl.bindTexture(gl.TEXTURE_2D, treeTex);
+  gl.uniform1i(U.uNoise, 0); gl.uniform1i(U.uFA, 1); gl.uniform1i(U.uFB, 2); gl.uniform1i(U.uTree, 3);
+  gl.uniform2f(U.uRes, cv.width / cv._scale, cv.height / cv._scale);
+  gl.uniform2f(U.uGrid, Gw, Gh);
+  gl.uniform2f(U.uTGrid, tgW, tgH);
+  gl.uniform1f(U.uCellG, CELL_G);
+  gl.uniform1f(U.uScale, cv._scale);
+  gl.uniform1f(U.uSeed, (seed % 997) * 0.37);
+  gl.uniform1f(U.uStep, STEP);
+  gl.uniform1f(U.uMix, curMix);
+  gl.uniform1f(U.uTime, t % 3600);
+  gl.uniform1f(U.uWind, P.wind);
+  gl.uniform4fv(U.uBird, birdU); gl.uniform1f(U.uBirdN, birdN);
+  gl.uniform4fv(U.uFly, flyU);
+  gl.uniform4fv(U.uFox, foxU); gl.uniform1f(U.uFoxOn, foxOn);
+  gl.uniform4fv(U.uWk, walkU); gl.uniform4fv(U.uWk2, walkK);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+  frameMs = performance.now() - t0;
+}
+
+/* ======================================================================
+   Settings / hosted mode
+   ====================================================================== */
+let iconsSeen = !(WALL || PREVIEW);
+function reseed(v) {
+  seed = v; buildNoise(); trees = null;
+  if (!iconsSeen) return;
+  commit(true);
+}
+function applySettings(v) {
+  if (typeof v.seed === 'number' && v.seed !== seed) reseed(v.seed);
+  let field = false, rebuild = false;
+  for (const k in v) {
+    if (!KEYS[k] || typeof v[k] !== 'number' || !isFinite(v[k]) || P[k] === v[k]) continue;
+    const [lo, hi] = KEYS[k];
+    let x = Math.min(Math.max(v[k], lo), hi);
+    if (k === 'life') { if (x !== 0 && x !== 1) continue; }
+    P[k] = x;
+    if (k === 'sigma') field = true;
+    if (k === 'density' || k === 'autumn') rebuild = true;
+  }
+  if (rebuild) trees = null;
+  if (field && FB) commit();                      // clearing size: smooth transition too
+}
+function drawGhosts() {
+  const box = document.getElementById('ghosts');
+  if (box) box.innerHTML = icons.map(ic => `<div class="ghost" style="left:${ic.x}px;top:${ic.y}px;width:${ic.w}px;height:${ic.h}px"><i></i><b></b></div>`).join('');
+}
+function startHostedMode() {
+  if (PREVIEW) {
+    document.body.classList.add('preview');
+    const g = document.createElement('div'); g.id = 'ghosts'; document.body.appendChild(g);
+  }
+  icons = [];
+  refresh();                                     // full forest until we know where the icons are
+  let first = true;
+  const handle = m => {
+    if (!m || typeof m !== 'object') return;
+    if (m.t === 'pause') { paused = PREVIEW ? false : !!m.v; return; }
+    if (m.t === 'settings') { applySettings(m.v || {}); return; }
+    if (m.t === 'reset') { applySettings(Object.assign({}, DEFAULTS, m.v || {})); return; }
+    if (m.t !== 'icons') return;
+    const k = window.devicePixelRatio || 1;       // physical -> CSS pixels
+    icons = m.vis && Array.isArray(m.r) ? m.r.map(([l, t, r, b]) => ({ x: l / k, y: t / k, w: (r - l) / k, h: (b - t) / k })) : [];
+    if (PREVIEW) drawGhosts();
+    iconsSeen = true;
+    commit(first);                                // first time: clearings open up; later: smooth transition
+    first = false;
+  };
+  if (PREVIEW) {
+    addEventListener('message', ev => { if (ev.source === parent) { try { handle(typeof ev.data === 'string' ? JSON.parse(ev.data) : ev.data); } catch (e) {} } });
+    parent.postMessage(JSON.stringify({ t: 'ready' }), '*');
+    return;
+  }
+  const host = window.chrome && window.chrome.webview;
+  if (!host) return;
+  host.addEventListener('message', ev => { try { handle(JSON.parse(ev.data)); } catch (e) { console.error(e); } });
+  host.postMessage('ready');
+}
+function startDemo() {
+  // plain browser: a column of icons on the right and a few scattered ones
+  const list = [];
+  for (let r = 0; r < 6; r++) list.push({ x: W - 90, y: 10 + r * 100, w: 76, h: 92 });
+  list.push({ x: W * 0.22, y: H * 0.3, w: 76, h: 92 }, { x: W * 0.45, y: H * 0.62, w: 76, h: 92 }, { x: W * 0.52, y: H * 0.18, w: 76, h: 92 });
+  icons = list;
+  commit(true);
+}
+
+let resizeT = 0;
+addEventListener('resize', () => {
+  clearTimeout(resizeT);
+  resizeT = setTimeout(() => { resize(); refresh(); }, 100);
+});
+
+window.__dbg = { P, stats: () => ({ fieldMs, frameMs, treeStats, fps: fpsEMA }) };
+resize();
+buildNoiseTex();
+if (WALL || PREVIEW) startHostedMode();
+else startDemo();
+requestAnimationFrame(frame);
+</script>
+<script src="share.js"></script>
+</body>
+</html>

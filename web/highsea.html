@@ -1,0 +1,864 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Iconland · High Sea</title>
+<!--
+  Iconland · High Sea theme (looking straight down on the open ocean from far above; pure WebGL2, one full-screen pass)
+  - Icon clouds: the same circle-cloud engine as the meadow theme. A CPU field (gaussian metaballs + noise warp) gives the
+    signed distance to the cloud mass around the icons; a few hundred circles are scattered on fixed grids inside it,
+    binned into a small cell texture, and the shader smooth-unions them. Small free clouds drift across open water.
+  - Every cloud casts a soft shadow far below on the sea (offset down-right: the sun is in the upper left).
+  - Sea: deep blue-teal washes that slowly drift, long swell bands, short painted crest strokes that fade in and out,
+    a few whitecaps, and sun glints twinkling in the upper-left part of the screen.
+  - Life (optional): a tiny ship that crosses now and then with a Kelvin wake, and a rare pod of whales that surfaces,
+    blows and dives again. Both are a handful of uniforms drawn as small SDFs.
+-->
+<style>
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #0d4a63; }
+  #art { position: fixed; inset: 0; width: 100vw; height: 100vh; display: block; }
+  /* preview mode (?preview=1, settings window): translucent boxes show where the real icons are */
+  #ghosts { position: fixed; inset: 0; pointer-events: none; display: none; }
+  body.preview #ghosts { display: block; }
+  .ghost { position: absolute; }
+  .ghost i { position: absolute; left: 50%; top: 4px; width: 48px; height: 48px; margin-left: -24px; border-radius: 9px;
+    background: rgba(255,255,255,.88); box-shadow: 3px 6px 8px rgba(30,50,80,.3); }
+  .ghost b { position: absolute; left: 14%; right: 14%; top: 60px; height: 10px; border-radius: 5px; background: rgba(255,255,255,.75); }
+  #nogl { position: fixed; inset: 0; display: none; place-items: center; color: #fff; font: 16px system-ui, sans-serif; }
+</style>
+</head>
+<body>
+<canvas id="art"></canvas>
+<div id="nogl">WebGL2 is not available.</div>
+<script>
+'use strict';
+
+/* ======================================================================
+   Parameters
+   ====================================================================== */
+const CELL_W = 76, CELL_H = 100, GRID_X0 = 4, GRID_Y0 = 6, TASKBAR = 0;
+const STEP = 5;
+const MORPH_MS = 1800;
+const WARP = 40;                         // how much the cloud mass outline is bent by noise (px)
+const EDGE = 10;                         // pushes the cloud mass edge in a little (px)
+
+const QS = new URLSearchParams(location.search);
+const WALL = QS.has('wallpaper');        // real desktop: messages from the host
+const PREVIEW = QS.has('preview');       // settings window preview (iframe): messages from the parent page
+// Defaults must match themes.json
+const P = {
+  sigma: 72, cover: 0.35, flow: 1, life: 1,
+  quality: 2, cap30: true,
+};
+const DEFAULTS = Object.assign({}, P);
+const KEYS = { sigma: [40, 200], cover: [0, 1], flow: [0, 3], life: [0, 1] };
+
+/* ======================================================================
+   Random / noise helpers (CPU)
+   ====================================================================== */
+let seed = (Math.random() * 1e6) | 0;
+function hash2(x, y, k = 0) {
+  let h = Math.imul(x | 0, 374761393) ^ Math.imul(y | 0, 668265263) ^ Math.imul(seed + k, 2246822519);
+  h = Math.imul(h ^ (h >>> 13), 1274126177);
+  return ((h ^ (h >>> 16)) >>> 0) / 4294967296;
+}
+function vnoise(x, y, k = 0) {
+  const ix = Math.floor(x), iy = Math.floor(y), fx = x - ix, fy = y - iy;
+  const ux = fx * fx * (3 - 2 * fx), uy = fy * fy * (3 - 2 * fy);
+  const a = hash2(ix, iy, k), b = hash2(ix + 1, iy, k), c = hash2(ix, iy + 1, k), d = hash2(ix + 1, iy + 1, k);
+  return a + (b - a) * ux + (c - a) * uy + (a - b - c + d) * ux * uy;
+}
+function fbm(x, y, k = 0) {
+  let a = 0.5, s = 0;
+  for (let i = 0; i < 4; i++) { s += a * vnoise(x, y, k + i * 7); x = x * 2.03 + 17.1; y = y * 2.03 + 17.1; a *= 0.5; }
+  return s;
+}
+// Tileable noise texture (fixed, does not depend on the seed): 4 channels of fbm at different scales
+function tileNoise(x, y, px, py, k) {
+  const ix = Math.floor(x), iy = Math.floor(y), fx = x - ix, fy = y - iy;
+  const ux = fx * fx * (3 - 2 * fx), uy = fy * fy * (3 - 2 * fy);
+  const m = (v, p) => ((v % p) + p) % p;
+  const x0 = m(ix, px), x1 = m(ix + 1, px), y0 = m(iy, py), y1 = m(iy + 1, py);
+  const h = (a, b) => { let v = Math.imul(a, 374761393) ^ Math.imul(b, 668265263) ^ Math.imul(k, 2246822519); v = Math.imul(v ^ (v >>> 13), 1274126177); return ((v ^ (v >>> 16)) >>> 0) / 4294967296; };
+  const a = h(x0, y0), b = h(x1, y0), c = h(x0, y1), d = h(x1, y1);
+  return a + (b - a) * ux + (c - a) * uy + (a - b - c + d) * ux * uy;
+}
+function makeNoiseImage() {
+  const S = 256, d = new Uint8Array(S * S * 4);
+  const chans = [[8, 16, 32, 64], [8, 16, 32, 64], [4, 8, 16, 32], [16, 32, 64, 128]];
+  for (let y = 0; y < S; y++) for (let x = 0; x < S; x++) {
+    const u = x / S, v = y / S, i = (y * S + x) * 4;
+    for (let c = 0; c < 4; c++) {
+      let s = 0, w = 0.5, tw = 0;
+      for (let j = 0; j < chans[c].length; j++) { const p = chans[c][j]; s += w * tileNoise(u * p, v * p, p, p, 100 + c * 50 + j * 13); tw += w; w *= 0.5; }
+      d[i + c] = Math.min(Math.max((s / tw - 0.5) * 1.9 + 0.5, 0), 1) * 255;
+    }
+  }
+  return { S, d };
+}
+const sstep = (a, b, x) => { const t = Math.min(Math.max((x - a) / (b - a), 0), 1); return t * t * (3 - 2 * t); };
+
+/* ======================================================================
+   Cloud mass field (CPU): s = signed distance to the edge of the cloud mass around the icons (<0 inside)
+   ====================================================================== */
+let W = innerWidth, H = innerHeight, Gw = 1, Gh = 1, NZ = null;
+function buildNoise() {
+  const N = Gw * Gh;
+  NZ = { wx: new Float32Array(N), wy: new Float32Array(N) };
+  for (let gy = 0; gy < Gh; gy++) for (let gx = 0; gx < Gw; gx++) {
+    const i = gy * Gw + gx, x = gx * STEP, y = gy * STEP;
+    NZ.wx[i] = fbm(x * 0.0028, y * 0.0028, 1) - 0.47;
+    NZ.wy[i] = fbm(x * 0.0028, y * 0.0028, 2) - 0.47;
+  }
+}
+let fieldMs = 0;
+function computeField(rects) {
+  const t0 = performance.now();
+  const N = Gw * Gh, f1 = new Float32Array(N);
+  const sig = P.sigma, is1 = 1 / (sig * sig);
+  const wa = WARP * 2.2, wmax = wa * 0.5;
+  for (const r of rects) {
+    const R = 5.5 * sig + Math.max(r.hw, r.hh) * 0.5 + wmax;
+    const gx0 = Math.max(0, Math.floor((r.cx - R) / STEP)), gx1 = Math.min(Gw - 1, Math.ceil((r.cx + R) / STEP));
+    const gy0 = Math.max(0, Math.floor((r.cy - R) / STEP)), gy1 = Math.min(Gh - 1, Math.ceil((r.cy + R) / STEP));
+    const chw = r.hw * 0.5, chh = r.hh * 0.5;
+    for (let gy = gy0; gy <= gy1; gy++) for (let gx = gx0; gx <= gx1; gx++) {
+      const i = gy * Gw + gx;
+      const qx = gx * STEP + NZ.wx[i] * wa, qy = gy * STEP + NZ.wy[i] * wa;
+      let dx = Math.abs(qx - r.cx) - chw, dy = Math.abs(qy - r.cy) - chh;
+      if (dx < 0) dx = 0; if (dy < 0) dy = 0;
+      f1[i] += Math.exp(-(dx * dx + dy * dy) * is1);
+    }
+  }
+  // floor = the contribution at the edge of the evaluated window, so far-away sea has no square seams
+  const c0 = Math.sqrt(-Math.log(0.35)), s = new Float32Array(N), fMin = Math.exp(-30);
+  for (let i = 0; i < N; i++) {
+    const g = Math.log(Math.max(f1[i], fMin));
+    // clamped far out at sea so old and new fields cross-fade evenly during a transition
+    s[i] = Math.min(400, sig * (Math.sqrt(Math.max(-g, 0)) - c0) - sig * 0.6 * Math.max(g, 0));
+  }
+  fieldMs = performance.now() - t0;
+  return { s };
+}
+function sampleArr(a, x, y) {
+  const fx = Math.min(Math.max(x / STEP, 0), Gw - 1.001), fy = Math.min(Math.max(y / STEP, 0), Gh - 1.001);
+  const ix = Math.floor(fx), iy = Math.floor(fy), tx = fx - ix, ty = fy - iy, i = iy * Gw + ix;
+  return (a[i] * (1 - tx) + a[i + 1] * tx) * (1 - ty) + (a[i + Gw] * (1 - tx) + a[i + Gw + 1] * tx) * ty;
+}
+
+/* ======================================================================
+   Shaders
+   ====================================================================== */
+const VS = `#version 300 es
+void main() {
+  vec2 p = vec2(float((gl_VertexID << 1) & 2), float(gl_VertexID & 2));
+  gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);
+}`;
+
+const FS = `#version 300 es
+precision highp float;
+uniform sampler2D uNoise, uFA, uFB;
+uniform highp sampler2D uCirc;   // cloud circles binned per cell: CIRC_K per cell, (x, y, radius, tone); radius 0 = end
+uniform vec2 uRes, uGrid, uCGrid;
+uniform float uScale, uSeed, uStep, uMix, uTime, uCellG, uEdge;
+uniform vec4 uShip;              // x, y, heading, on (0/1)
+uniform float uShipTrail;        // how far the ship has sailed on screen (the wake is never longer)
+uniform vec4 uWhale[3];          // x, y, heading, dive phase 0..1 (<0 = none)
+out vec4 o;
+
+const int CIRC_K = 36;
+const vec3 SEA_DEEP = vec3(0.035, 0.20, 0.34), SEA_MID = vec3(0.05, 0.30, 0.44), SEA_TEAL = vec3(0.07, 0.42, 0.50);
+const vec3 CREST = vec3(0.42, 0.72, 0.78), FOAM = vec3(0.90, 0.96, 0.97), GLINT = vec3(1.0, 0.97, 0.86);
+const vec3 SHADOW = vec3(0.34, 0.43, 0.58);                 // multiply colour of cloud shadows on the water (cool)
+const vec3 CLOUD_HI = vec3(1.0, 1.0, 0.99);                 // sunlit rim of the clouds
+const vec3 CLOUD_BODY = vec3(0.90, 0.93, 0.96), CLOUD_SH = vec3(0.80, 0.85, 0.90);   // body / darker puffs (not too white: white icon labels)
+const vec3 CLOUD_SHADE = vec3(0.70, 0.77, 0.86);            // the shaded lower-right flank
+const vec2 LIGHT = vec2(-0.6, -0.8);                        // sun in the upper left
+const vec2 SHDIR = vec2(0.6, 0.8);
+const vec2 SHADOW_OFF = vec2(96.0, 128.0);                  // clouds float high: their shadows land far down-right
+const float SWELL = -0.38;                                  // swell direction (crests run along this angle)
+
+float hash2(vec2 p) {
+  vec3 p3 = fract(vec3(p.xyx) * 0.1031);
+  p3 += dot(p3, p3.yzx + 33.33);
+  return fract((p3.x + p3.y) * p3.z);
+}
+float ss(float a, float b, float x) { float t = clamp((x - a) / (b - a), 0.0, 1.0); return t * t * (3.0 - 2.0 * t); }
+vec4 N(vec2 p, float scale) { return texture(uNoise, p / scale + uSeed * 0.013); }
+float fieldS(sampler2D t, vec2 p) { return texture(t, (p / uStep + 0.5) / uGrid).r; }
+float smin(float a, float b, float k) { float h = clamp(0.5 + 0.5 * (b - a) / k, 0.0, 1.0); return mix(b, a, h) - k * h * (1.0 - h); }
+float segD(vec2 p, vec2 a, vec2 b) { vec2 pa = p - a, ba = b - a; return length(pa - ba * clamp(dot(pa, ba) / dot(ba, ba), 0.0, 1.0)); }
+float ellD(vec2 p, vec2 r) { return (length(p / r) - 1.0) * min(r.x, r.y); }   // rough ellipse distance (fine for small shapes)
+mat2 rot(float a) { float c = cos(a), s = sin(a); return mat2(c, s, -s, c); }
+
+// distance to the clouds (<0 inside): the mass around the icons plus the circles in this cell (as in the meadow theme)
+// front = true also returns the covering circle whose centre is lowest (frontmost): fc = (x, y, radius, tone)
+float cloudDist(vec2 q, bool front, inout vec4 fc) {
+  float sF = mix(fieldS(uFA, q), fieldS(uFB, q), uMix);
+  float d = sF - uEdge + 0.6 * 95.0;                                  // the mass: fills the gaps between circles
+  ivec2 cell = ivec2(floor(q / uCellG)) + 4;                          // 4 extra cells left / top (for the shadows), 3 right / bottom
+  if (cell.x < 0 || cell.y < 0 || float(cell.x) >= uCGrid.x || float(cell.y) >= uCGrid.y) return d;
+  for (int k = 0; k < CIRC_K; k++) {
+    vec4 c = texelFetch(uCirc, ivec2(cell.x * CIRC_K + k, cell.y), 0);
+    if (c.z <= 0.0) break;
+    float di = length(q - c.xy) - c.z;
+    d = smin(d, di, 6.0);
+    if (front && di < 0.0 && c.y > fc.y) fc = c;
+  }
+  return d;
+}
+float cloudDist(vec2 q) { vec4 fc = vec4(0.0, -1e9, 0.0, 0.0); return cloudDist(q, false, fc); }
+
+// short painted crest strokes: at most one per 28x10 cell of the swell-aligned grid; each fades in and out on its own clock
+// returns (ink, foam): ink = light crest stroke, foam = the few that are whitecaps
+vec2 waveInk(vec2 p, float t) {
+  vec2 q = rot(SWELL) * p;
+  q.y += t * 2.4;                                    // crests creep slowly with the swell
+  const vec2 G = vec2(46.0, 9.0);
+  float ink = 0.0, foam = 0.0;
+  for (int j = -1; j <= 1; j++) {
+    float row = floor(q.y / G.y) + float(j);
+    vec2 c = vec2(floor((q.x - row * 17.0) / G.x), row);            // rows staggered so strokes do not line up
+    vec2 cp = (c + 0.5) * G + vec2(row * 17.0, 0.0);
+    float h = hash2(c + 3.1);
+    float dens = 0.06 + 0.42 * ss(0.35, 0.78, N(cp, 640.0).r);
+    if (h > dens) continue;
+    float life = sin(fract(t * (0.045 + 0.05 * hash2(c + 7.7)) + hash2(c + 1.3)) * 3.14159);
+    life *= life;
+    float len = 7.0 + 11.0 * hash2(c + 1.9);
+    vec2 ctr = cp + (vec2(hash2(c + 4.3), hash2(c + 5.9)) - 0.5) * vec2(8.0, 4.0);
+    vec2 d = q - ctr;
+    d.y -= (0.10 + 0.12 * hash2(c + 6.6)) * d.x * d.x / len - 0.6 * sin(d.x / len * 3.0 + h * 9.0);                   // each crest is a little arc
+    float k = clamp(d.x / len, -1.0, 1.0);
+    float th = (0.15 + 0.7 * (1.0 - k * k)) * (0.7 + 0.5 * hash2(c + 9.1));
+    float a = (1.0 - ss(th * 0.4, th + 0.75, segD(d, vec2(-len, 0.0), vec2(len, 0.0)))) * life;
+    ink = max(ink, a * (0.3 + 0.4 * hash2(c + 2.7)));
+    if (hash2(c + 12.7) < 0.04 + 0.22 * ss(0.62, 0.88, N(cp + 90.0, 360.0).g)) foam = max(foam, a * 0.8);
+  }
+  return vec2(ink, foam);
+}
+// twinkling sun glints: tiny four-point stars on a 9px grid, only where g (the sun's reflection) is strong
+float glint(vec2 p, float t, float g) {
+  const float G = 9.0;
+  vec2 c = floor(p / G);
+  float h = hash2(c + 21.7);
+  if (h > 0.22 * g * g) return 0.0;
+  vec2 ctr = (c + 0.2 + 0.6 * vec2(hash2(c + 2.3), hash2(c + 8.1))) * G;
+  float tw = pow(max(0.0, sin(t * (0.25 + 0.35 * hash2(c + 4.4)) + h * 90.0)), 8.0);   // slow, calm twinkle
+  vec2 d = abs(p - ctr);
+  float arm = (1.0 - ss(0.2, 0.6, min(d.x, d.y))) * (1.0 - ss(0.0, 0.5 + 3.0 * tw, max(d.x, d.y)));
+  return max(1.0 - ss(0.2, 1.0, length(d)), arm) * tw;
+}
+
+// ---------- the little ship (forward = +x), seen from straight above ----------
+vec4 shipCol(vec2 q) {
+  // pointed bow, rounded stern
+  float w = 3.4 * (1.0 - 0.75 * ss(-2.0, 11.0, q.x));
+  float d = max(abs(q.y) - w, abs(q.x - 0.5) - 10.5);
+  d = min(d, ellD(q + vec2(9.0, 0.0), vec2(2.4, 3.4)));
+  float m = ss(0.5, -0.5, d);
+  vec3 col = vec3(0.70, 0.17, 0.14);                                     // red hull rim
+  col = mix(col, vec3(0.86, 0.82, 0.74), ss(0.4, -0.4, d + 1.1));        // deck
+  col = mix(col, vec3(0.98, 0.98, 0.96), ss(0.4, -0.4, max(abs(q.x + 4.0) - 2.6, abs(q.y) - 1.9)));   // white bridge
+  col = mix(col, vec3(0.20, 0.22, 0.26), ss(0.4, -0.4, length(q + vec2(5.6, 0.0)) - 0.9));         // funnel
+  return vec4(col, m);
+}
+// wake: white churn right behind the stern plus the two arms of a Kelvin wake that spread and fade
+float wake(vec2 q, float t) {
+  float along = -q.x - 8.0;
+  if (along < 0.0) return 0.0;
+  float lim = min(uShipTrail, 240.0);
+  float fade = exp(-along / 90.0) * ss(lim, lim - 30.0, along);
+  float churn = (1.0 - ss(1.5 + along * 0.05, 3.5 + along * 0.09, abs(q.y))) * (0.7 + 0.3 * N(q + vec2(t * 4.0, 0.0), 24.0).r);
+  float armD = abs(abs(q.y) - along * 0.34 - 1.0);
+  float arms = (1.0 - ss(0.4 + along * 0.008, 1.3 + along * 0.02, armD)) * (0.6 + 0.4 * sin(along * 0.35 - t * 1.2));
+  return clamp(max(churn, arms * 0.8) * fade, 0.0, 1.0);
+}
+
+// ---------- a whale (forward = +x), surfacing: phase 0..1 ----------
+vec4 whaleCol(vec2 p, vec4 w, vec3 sea, float t) {
+  vec2 q = rot(-w.z) * (p - w.xy);
+  float ph = w.w, up = sin(ph * 3.14159);                 // 0 deep, 1 at the surface
+  float body = ellD(q - vec2(2.0, 0.0), vec2(21.0, 6.6));
+  // tail stock and flukes
+  float stock = max(abs(q.y) - (2.6 - 0.06 * (-q.x - 12.0)), abs(q.x + 20.0) - 9.0);
+  vec2 fq = vec2(q.x + 30.0, abs(q.y));
+  float fl = ellD(rot(-0.6) * (fq - vec2(-2.0, 5.5)), vec2(2.4, 6.0));   // flukes swept back
+  float d = min(min(body, stock), fl);
+  float m = ss(0.6, -0.6, d);
+  vec3 dark = vec3(0.13, 0.19, 0.25);
+  vec3 col = mix(dark, dark * 1.6 + 0.04, ss(0.4, -0.4, ellD(q - vec2(3.0, -2.0), vec2(14.0, 2.2))) * 0.6);   // sunlit back
+  // under water the body is just a darker, blue-tinted shape; at the surface it shows its colour
+  float vis = ss(0.0, 0.5, up);
+  col = mix(mix(sea, sea * vec3(0.55, 0.68, 0.78), 0.9), col, ss(0.55, 0.95, up));
+  float a = m * vis;
+  // foam ring and a spout at the top of the breath
+  float ring = abs(ellD(q - vec2(2.0, 0.0), vec2(26.0, 10.0)) - 1.5 * N(q + t * 3.0, 20.0).r);
+  float fa = (1.0 - ss(0.5, 2.5, ring)) * ss(0.7, 1.0, up) * 0.7 * (1.0 - m);
+  col = mix(col, FOAM, fa / max(a + fa, 1e-3));
+  a = max(a, fa);
+  float sp = ss(0.42, 0.5, ph) * ss(0.66, 0.54, ph);
+  if (sp > 0.0) {
+    float r = 2.0 + 7.0 * ss(0.42, 0.62, ph);
+    float s = ss(0.8, -0.8, length(q - vec2(16.0, 0.0)) - r * (0.85 + 0.3 * N(q * 2.0 + t * 5.0, 30.0).g));
+    col = mix(col, vec3(0.97, 0.99, 1.0), s * sp);
+    a = max(a, s * sp * 0.9);
+  }
+  return vec4(col, a);
+}
+
+void main() {
+  vec2 p = vec2(gl_FragCoord.x, uRes.y * uScale - gl_FragCoord.y) / uScale;
+  float t = uTime;
+
+  // ---------- sea: big slow washes of deep blue and teal ----------
+  vec2 drift = vec2(t * 1.6, t * 0.7);
+  float w1 = N(p + drift, 1700.0).b, w2 = N(p - drift * 0.6 + 311.0, 620.0).g;
+  vec3 col = mix(SEA_DEEP, SEA_MID, ss(0.2, 0.75, w1 * 0.65 + w2 * 0.35));
+  col = mix(col, SEA_TEAL, ss(0.55, 0.9, N(p + drift * 0.4 + 977.0, 1300.0).r) * 0.55);
+  // long swell bands, bent by noise, rolling slowly
+  vec2 q = rot(SWELL) * p;
+  float bend = N(p, 900.0).r * 7.0 + N(p + 41.0, 260.0).g * 1.6;
+  float sw = sin(q.y * 0.05 + bend + t * 0.35);
+  col *= 0.9 + 0.12 * sw;
+  col = mix(col, col * 1.18 + vec3(0.0, 0.02, 0.02), ss(0.75, 1.0, sw) * 0.35 * ss(0.3, 0.7, N(p + 500.0, 480.0).b));
+  // the sun's broad reflection in the upper left
+  vec2 sun = vec2(uRes.x * 0.2, uRes.y * 0.14);
+  float g = 1.0 - ss(0.0, 1.0, length((p - sun) / vec2(uRes.x * 0.5, uRes.y * 0.55)));
+  col += vec3(0.05, 0.08, 0.07) * g * (0.6 + 0.4 * N(p + drift, 420.0).r);
+  // painted crest strokes and whitecaps
+  vec2 wi = waveInk(p, t);
+  col = mix(col, mix(col, CREST, 0.6 + 0.2 * g), wi.x);
+  col = mix(col, FOAM, wi.y * 0.85);
+  // brush texture and paper grain
+  col *= 0.94 + 0.12 * N(p * 1.0 + 70.0, 120.0).a;
+  col *= 1.0 + (hash2(floor(p * max(uScale, 1.0))) - 0.5) * 0.035;
+  // sun glints
+  float gli = glint(p, t, g * (0.45 + 0.8 * ss(0.4, 0.8, N(p + drift, 300.0).g)));
+  col = mix(col, GLINT, gli);
+
+  // ---------- whales ----------
+  for (int i = 0; i < 3; i++) {
+    vec4 w = uWhale[i];
+    if (w.w < 0.0 || length(p - w.xy) > 44.0) continue;
+    vec4 wc = whaleCol(p, w, col, t);
+    col = mix(col, wc.rgb, wc.a);
+  }
+  // ---------- the ship and its wake ----------
+  if (uShip.w > 0.5) {
+    vec2 sq = rot(-uShip.z) * (p - uShip.xy);
+    if (sq.x > -260.0 && sq.x < 20.0 && abs(sq.y) < 100.0) {
+      col = mix(col, FOAM, wake(sq, t) * 0.75);
+      vec2 shq = rot(-uShip.z) * (p - uShip.xy - SHDIR * 2.5);
+      col = mix(col, col * 0.6, shipCol(shq).a * 0.6);                      // tiny shadow on the water
+      vec4 sc = shipCol(sq);
+      col = mix(col, sc.rgb, sc.a);
+    }
+  }
+
+  // ---------- cloud shadows, far below on the water ----------
+  float sd = cloudDist(p - SHADOW_OFF);
+  col = mix(col, col * SHADOW, ss(12.0, -16.0, sd) * 0.85);
+
+  // ---------- clouds: round puffs, sunlit rim toward the upper left, a cool shaded flank toward the lower right ----------
+  vec4 fc = vec4(0.0, -1e9, 0.0, 0.0);
+  float d = cloudDist(p, true, fc);
+  if (d < 1.5) {
+    float hi = 0.0, sh = 0.0;
+    if (d > -24.0) {
+      hi = ss(-1.0, 1.0, cloudDist(p + LIGHT * 20.0));                       // a step toward the sun leaves the cloud: lit rim
+      sh = ss(-6.0, 6.0, cloudDist(p - LIGHT * 22.0));                       // a step away leaves it: shaded flank
+    }
+    vec3 cc = fc.y > -1e8 ? mix(CLOUD_BODY, CLOUD_SH, fc.w * 0.6) : mix(CLOUD_BODY, CLOUD_SH, 0.45);
+    cc = mix(cc, CLOUD_SHADE, sh * (1.0 - hi) * 0.75);
+    cc = mix(cc, CLOUD_HI, hi);
+    cc *= 0.985 + 0.03 * fract(fc.w * 7.31);                                 // a little painterly unevenness per puff (stable id)
+    col = mix(col, cc, ss(1.0, -1.0, d));
+  }
+  o = vec4(col, 1.0);
+}`;
+
+/* ======================================================================
+   WebGL
+   ====================================================================== */
+const cv = document.getElementById('art');
+const gl = cv.getContext('webgl2', { antialias: false });
+if (!gl) document.getElementById('nogl').style.display = 'grid';
+function program(fs) {
+  const mk = (type, src) => {
+    const s = gl.createShader(type);
+    gl.shaderSource(s, src); gl.compileShader(s);
+    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) { console.error(gl.getShaderInfoLog(s)); throw new Error('shader: ' + gl.getShaderInfoLog(s)); }
+    return s;
+  };
+  const p = gl.createProgram();
+  gl.attachShader(p, mk(gl.VERTEX_SHADER, VS));
+  gl.attachShader(p, mk(gl.FRAGMENT_SHADER, fs));
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) console.error(gl.getProgramInfoLog(p));
+  const U = {};
+  const n = gl.getProgramParameter(p, gl.ACTIVE_UNIFORMS);
+  for (let i = 0; i < n; i++) { const nm = gl.getActiveUniform(p, i).name.replace(/\[0\]$/, ''); U[nm] = gl.getUniformLocation(p, nm); }
+  return { p, U };
+}
+const PR = program(FS);
+gl.bindVertexArray(gl.createVertexArray());
+
+let noiseTex = null;
+function buildNoiseTex() {
+  const { S, d } = makeNoiseImage();
+  noiseTex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, noiseTex);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, S, S, 0, gl.RGBA, gl.UNSIGNED_BYTE, d);
+  gl.generateMipmap(gl.TEXTURE_2D);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.REPEAT);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.REPEAT);
+}
+const f32 = new Float32Array(1), u32 = new Uint32Array(f32.buffer);
+function toHalf(v) {
+  f32[0] = v; const x = u32[0];
+  const sign = (x >>> 16) & 0x8000, e = ((x >>> 23) & 0xff) - 112, m = x & 0x7fffff;
+  if (e <= 0) return sign;
+  if (e >= 31) return sign | 0x7c00;
+  return sign | (e << 10) | (m >>> 13);
+}
+// two field textures (R16F); the shader blends from -> to
+const ftex = [null, null];
+let fromI = 0, toI = 0, FA = null, FB = null;
+let morphT0 = -1e9, morphDur = MORPH_MS, curMix = 1;
+function allocField() {
+  for (let i = 0; i < 2; i++) {
+    if (ftex[i]) gl.deleteTexture(ftex[i]);
+    ftex[i] = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, ftex[i]);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.R16F, Gw, Gh, 0, gl.RED, gl.HALF_FLOAT, null);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  }
+}
+function uploadField(i, Fd) {
+  const d = new Uint16Array(Gw * Gh);
+  for (let k = 0; k < d.length; k++) d[k] = toHalf(Fd.s[k]);
+  gl.bindTexture(gl.TEXTURE_2D, ftex[i]);
+  gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);          // odd row widths upload tightly packed
+  gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, Gw, Gh, gl.RED, gl.HALF_FLOAT, d);
+}
+
+let icons = [];
+const iconRects = () => icons.map(ic => ({ cx: ic.x + ic.w / 2, cy: ic.y + ic.h / 2, hw: ic.w / 2 - 4, hh: ic.h / 2 - 2 }));
+// Field currently on screen (from -> to blended by curMix): a new transition must start from it, not from the
+// previous target, or the scenery jumps when icons move again while a transition is still running.
+function blendFields(A, B, m) {
+  const out = {};
+  for (const k in B) {
+    const a = A && A[k], b = B[k];
+    if (!(b instanceof Float32Array) || !(a instanceof Float32Array) || a.length !== b.length) return null;
+    const r = new Float32Array(b.length);
+    for (let i = 0; i < b.length; i++) r[i] = a[i] + (b[i] - a[i]) * m;
+    out[k] = r;
+  }
+  return out;
+}
+function commit(fromEmpty = false) {
+  const nf = computeField(iconRects());
+  const target = 1 - toI;
+  if (fromEmpty) { FA = computeField([]); uploadField(toI, FA); }
+  else if (FA && FB && curMix < 0.999 && (FA = blendFields(FA, FB, Math.max(0, curMix)))) uploadField(toI, FA);
+  else FA = FB || nf;
+  FB = nf;
+  uploadField(target, FB);
+  fromI = toI; toI = target;
+  morphT0 = performance.now();
+  morphDur = fromEmpty ? 2600 : MORPH_MS;
+  curMix = 0;
+}
+function refresh() {
+  FA = FB = computeField(iconRects());
+  uploadField(toI, FB);
+  fromI = toI; morphT0 = -1e9; curMix = 1;
+}
+const curS = (x, y) => FB ? sampleArr(FA.s, x, y) * (1 - curMix) + sampleArr(FB.s, x, y) * curMix : 999;
+
+/* ======================================================================
+   Cloud circles (same engine as the meadow theme): every frame the CPU lays out a few hundred circles,
+   bins them into a small texture, and the shader only reads the few in its own cell.
+   - Around the icons: three fixed grids (big / small / tiny), one circle per cell, kept only if the centre is inside
+     the cloud mass; smaller toward the edge, so the outline is all round puffs. They breathe very slowly and
+     grow / shrink smoothly with the field when icons move.
+   - Free clouds over open water: whole clouds made of circles (a flat-ish bottom row with puffs heaped on top)
+     that drift with the wind.
+   ====================================================================== */
+const CELL_G = 48, CIRC_K = 36;
+let circStats = null, circTex = null, circBuf = null, cgW = 0, cgH = 0;
+const skyClouds = [];
+let flowT = 0;
+function makeSkyCloud(x) {
+  const rnd = Math.random, R = 95 * (0.85 + rnd() * 0.4);
+  // 1) the rough outline: a row of big circles (bigger in the middle) with a few heaped on top
+  const n = 3 + Math.floor(rnd() * 3), w = R * (1.0 + n * 0.5);
+  const body = [];
+  for (let i = 0; i < n; i++) {
+    const t = n === 1 ? 0 : i / (n - 1) - 0.5, r = R * (0.6 - Math.abs(t) * 0.45 + rnd() * 0.12);
+    body.push([t * w, -r * 0.55, r]);
+  }
+  for (let i = 0; i < n - 1; i++) {
+    const t = n === 2 ? 0 : i / (n - 2) - 0.5, r = R * (0.55 + rnd() * 0.25);
+    body.push([t * w * 0.6 + (rnd() - 0.5) * R * 0.4, -R * (0.5 + rnd() * 0.35), r]);
+  }
+  if (rnd() < 0.6) body.push([(rnd() - 0.5) * w * 0.3, -R * 1.05, R * (0.4 + rnd() * 0.15)]);
+  const ciOf = (px, py) => { let d = 1e9; for (const [cx, cy, r] of body) d = Math.min(d, Math.hypot(px - cx, py - cy) - r); return d; };
+  let x0 = 1e9, x1 = -1e9, y0 = 1e9, y1 = -1e9;
+  for (const [cx, cy, r] of body) { x0 = Math.min(x0, cx - r); x1 = Math.max(x1, cx + r); y0 = Math.min(y0, cy - r); y1 = Math.max(y1, cy + r); }
+  // 2) fill it like the icon clouds: one random circle per grid cell per layer, centre inside the outline,
+  //    smaller toward the edge; small ones only near the edge and only if they overlap a bigger one
+  const circles = [];
+  const S = 0.62 / 1.2;
+  const layer = (G, size, band, bandFn, attach) => {
+    for (let gy = Math.floor((y0 - G) / G); gy <= Math.ceil((y1 + G) / G); gy++) for (let gx = Math.floor((x0 - G) / G); gx <= Math.ceil((x1 + G) / G); gx++) {
+      const px = (gx + 0.1 + rnd() * 0.8) * G, py = (gy + 0.1 + rnd() * 0.8) * G;
+      const ci = ciOf(px, py);
+      if (ci > 0 || ci < band) continue;
+      let r = G * (size[0] + (size[1] - size[0]) * rnd()) * bandFn(ci);
+      if (attach) {
+        let att = 0;
+        for (const [cx, cy, cr] of circles) att = Math.max(att, sstep(0.2 * r, 0.6 * r, cr + r - Math.hypot(cx - px, cy - py)));
+        r *= att;
+      }
+      r *= sstep(5, 11, r);
+      if (r > 0.5) circles.push([px, py, r, rnd()]);
+    }
+  };
+  const Rm = 95 * 1.2 * S;
+  const Gb = 90;
+  layer(Gb, [0.55, 0.85], -1e9, ci => sstep(-0.2 * Gb, -0.65 * Gb, ci), false);
+  layer(Rm, [0.6, 0.95], -1e9, ci => sstep(-0.1 * Rm, -0.7 * Rm, ci), false);
+  for (const [cx, cy, r] of body) if (r > 0.75 * Rm) circles.push([cx, cy, r - 0.75 * Rm, rnd()]);   // no gaps deep inside
+  layer(34 * 0.85, [0.5, 0.9], -1.0 * Rm, ci => sstep(-0.05 * Rm, -0.35 * Rm, ci) * (1 - sstep(-0.7 * Rm, -1.0 * Rm, ci)), true);
+  layer(24 * 0.85, [0.45, 0.8], -0.6 * Rm, ci => sstep(0, -0.2 * Rm, ci) * (1 - sstep(-0.4 * Rm, -0.6 * Rm, ci)), true);
+  const y = 60 + rnd() * (H - TASKBAR - 100);
+  return { x, y, circles, v: 0.7 + rnd() * 0.6, grow: 0, hw: Math.max(-x0, x1) + 20 };
+}
+function stepSkyClouds(dt) {
+  flowT += dt * P.flow;                                     // the clouds' own clock: faster drift, faster puff changes
+  const want = Math.round(P.cover * 10);
+  // fewer wanted: extra ones shrink away; more: fade in where the other free clouds are not too close
+  const alive = skyClouds.filter(c => !c.dying);
+  for (let i = want; i < alive.length; i++) alive[i].dying = true;
+  for (let n = alive.length; n < want; n++) {
+    let best = null, bestD = -1;
+    for (let k = 0; k < 20; k++) {
+      const c = makeSkyCloud(Math.random() * W);
+      const dmin = Math.min(1e9, ...skyClouds.map(o => Math.hypot((o.x - c.x) / 1.6, o.y - c.y)));
+      if (dmin > bestD) { bestD = dmin; best = c; }
+    }
+    skyClouds.push(best);
+  }
+  for (let i = skyClouds.length - 1; i >= 0; i--) {
+    const c = skyClouds[i];
+    c.x += P.flow * 11 * c.v * dt;                          // about 11 px/s at x1
+    c.grow = c.dying ? c.grow - dt * 0.5 : Math.min(1, c.grow + dt * 0.5);
+    if (c.grow <= 0) { skyClouds.splice(i, 1); continue; }
+    // drifted off the screen: a new one comes in from the upwind side
+    if (c.x - c.hw > W + 50) { const n = makeSkyCloud(-c.hw - 50); n.grow = 1; skyClouds[i] = n; }
+  }
+}
+let massList = null, massT = -1e9;
+function buildMassCircles() {
+  const list = [];
+  const R = 95;
+  const big = new Map();
+  const layer = (G, k0, size, band, isBig) => {
+    if (!FB) return;
+    for (let cy = -Math.ceil(2 * R / G); cy <= Math.ceil((H + 2 * R) / G); cy++) for (let cx = -Math.ceil(2 * R / G); cx <= Math.ceil((W + 2 * R) / G); cx++) {
+      const ox = hash2(cx, cy, k0), oy = hash2(cx, cy, k0 + 1), rr = hash2(cx, cy, k0 + 2), ph = hash2(cx, cy, k0 + 3);
+      const x = (cx + 0.1 + ox * 0.8) * G, y = (cy + 0.1 + oy * 0.8) * G;
+      const ci = curS(x, y) - EDGE;                         // how far inside the mass the centre is (<0 inside)
+      if (ci > 0 || ci < band[1] - 10) continue;
+      let r = G * (size[0] + (size[1] - size[0]) * rr) * band[2](ci);
+      // must connect: reach the mass body (its edge is at ci = -0.6R) or (small ones) overlap a big circle
+      const gap = ci + 0.6 * R;
+      let att = sstep(gap - 4, gap + 12, r);
+      if (!isBig) {
+        const bx = Math.floor(x / R), by = Math.floor(y / R);
+        for (let j = by - 1; j <= by + 1; j++) for (let i = bx - 1; i <= bx + 1; i++) {
+          const o = big.get(i + ',' + j);
+          if (!o) continue;
+          const ov = o[2] + r - Math.hypot(o[0] - x, o[1] - y);
+          att = Math.max(att, sstep(0.2 * r, 0.6 * r, ov));
+        }
+      }
+      r *= att;
+      r *= sstep(5, 11, r);                                 // tiny circles shrink away instead of leaving dots
+      if (r < 0.5) continue;
+      if (isBig) big.set(cx + ',' + cy, [x, y, r]);
+      list.push(x, y, r * (1 + 0.04 * Math.sin(flowT * (0.09 + 0.035 * ph) + ph * 6.283)), ph);
+    }
+  };
+  layer(R, 1, [0.55, 0.9], [0, -1e9, ci => sstep(-0.15 * R, -0.8 * R, ci)], true);
+  layer(34, 11, [0.5, 0.9], [0, -1.0 * R, ci => sstep(-0.05 * R, -0.3 * R, ci) * (1 - sstep(-0.7 * R, -1.0 * R, ci))], false);
+  layer(24, 21, [0.45, 0.8], [0, -0.6 * R, ci => sstep(0, -0.15 * R, ci) * (1 - sstep(-0.4 * R, -0.6 * R, ci))], false);
+  return list;
+}
+// every circle circles slowly around its home (6~15px, 20~30s a turn); neighbours roughly move together
+const wobX = (x, y, r, ph) => (4.5 + 0.12 * r) * (0.85 * Math.sin(flowT * 0.24 + x * 0.011 + y * 0.004) + 0.3 * Math.sin(flowT * 0.3 + ph * 6.283));
+const wobY = (x, y, r, ph) => (4.5 + 0.12 * r) * (0.65 * Math.sin(flowT * 0.2 + y * 0.013 - x * 0.006 + 1.7) + 0.25 * Math.cos(flowT * 0.28 + ph * 6.283));
+function uploadCircles(t) {
+  gl.activeTexture(gl.TEXTURE3);
+  const gw = Math.ceil(W / CELL_G) + 7, gh = Math.ceil(H / CELL_G) + 7;   // 4 extra cells left / top (shadows of off-screen clouds), 3 right / bottom
+  if (!circTex || gw !== cgW || gh !== cgH) {
+    cgW = gw; cgH = gh;
+    if (circTex) gl.deleteTexture(circTex);
+    circTex = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, circTex);
+    gl.texStorage2D(gl.TEXTURE_2D, 1, gl.RGBA32F, gw * CIRC_K, gh);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    circBuf = new Float32Array(gw * CIRC_K * gh * 4);
+  }
+  // icon cloud circles: every frame while the field morphs, otherwise every 0.5s (the breathing is very slow)
+  const morphing = curMix < 1 || !massList || massList.W !== W || massList.H !== H;
+  if (morphing || t - massT > 0.5) { massList = buildMassCircles(); massList.W = W; massList.H = H; massT = t; }
+  const list = massList.slice();
+  for (let i = 0; i < list.length; i += 4) {
+    const x = list[i], y = list[i + 1], r = list[i + 2], ph = list[i + 3];
+    list[i] = x + wobX(x, y, r, ph); list[i + 1] = y + wobY(x, y, r, ph);
+  }
+  for (const c of skyClouds) {
+    const g = c.grow * c.grow * (3 - 2 * c.grow);
+    c.circles.forEach(([dx, dy, r, ph], i) => {
+      const rb = r * g * (1 + 0.04 * Math.sin(flowT * (0.09 + 0.035 * ph) + ph * 6.283 + i));
+      if (rb > 0.5) list.push(c.x + dx + wobX(dx, dy, r, ph), c.y + dy + wobY(dx, dy, r, ph), rb, ph);
+    });
+  }
+  // bin: a copy in every cell the circle touches; a full cell keeps the bigger ones
+  circBuf.fill(0);
+  const cnt = new Uint8Array(gw * gh);
+  const order = [];
+  for (let i = 0; i < list.length; i += 4) order.push(i);
+  order.sort((a, b) => list[b + 2] - list[a + 2]);
+  let over = 0;
+  for (const i of order) {
+    const x = list[i], y = list[i + 1], r = list[i + 2] + 6;
+    const x0 = Math.max(0, Math.floor((x - r) / CELL_G) + 4), x1 = Math.min(gw - 1, Math.floor((x + r) / CELL_G) + 4);
+    const y0 = Math.max(0, Math.floor((y - r) / CELL_G) + 4), y1 = Math.min(gh - 1, Math.floor((y + r) / CELL_G) + 4);
+    for (let gy = y0; gy <= y1; gy++) for (let gx = x0; gx <= x1; gx++) {
+      const ci = gy * gw + gx;
+      const nx = Math.max((gx - 4) * CELL_G, Math.min(x, (gx - 3) * CELL_G)), ny = Math.max((gy - 4) * CELL_G, Math.min(y, (gy - 3) * CELL_G));
+      if ((nx - x) * (nx - x) + (ny - y) * (ny - y) > r * r) continue;
+      if (cnt[ci] >= CIRC_K) { over++; continue; }
+      const o = (ci * CIRC_K + cnt[ci]++) * 4;
+      circBuf[o] = x; circBuf[o + 1] = y; circBuf[o + 2] = list[i + 2]; circBuf[o + 3] = list[i + 3];
+    }
+  }
+  if (frameN % 30 === 0) circStats = { circles: list.length / 4, maxPerCell: Math.max(...cnt), over };
+  gl.bindTexture(gl.TEXTURE_2D, circTex);
+  gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, gw * CIRC_K, gh, gl.RGBA, gl.FLOAT, circBuf);
+}
+
+/* ======================================================================
+   Life: a ship crossing now and then, a rare pod of whales surfacing in open water
+   ====================================================================== */
+const shipU = new Float32Array(4), whaleU = new Float32Array(12).fill(-1);
+const LIFETEST = QS.has('lifetest');            // debug: bring the ship and whales out right away
+let ship = null, shipNext = LIFETEST ? 0.2 : 10 + Math.random() * 25, shipTrail = 0;
+let pod = null, podNext = LIFETEST ? 0.2 : 40 + Math.random() * 50;
+const WHALE_T = 18;                             // seconds for one surfacing (rise, blow, dive)
+function stepLife(t, dt) {
+  shipU.fill(0); whaleU.fill(-1);
+  if (!P.life) { ship = null; pod = null; return; }
+  // ship: enters from off screen, sails straight across, its wake trailing behind
+  if (!ship && t > shipNext) {
+    const ang = Math.random() * 6.283, ux = Math.cos(ang), uy = Math.sin(ang);
+    const tx = W * (0.15 + 0.7 * Math.random()), ty = H * (0.15 + 0.7 * Math.random());
+    let d = 0;
+    while (d < 4000) { const x = tx - ux * d, y = ty - uy * d; if (x < -40 || y < -40 || x > W + 40 || y > H + 40) break; d += 10; }
+    ship = { x: tx - ux * d, y: ty - uy * d, ux, uy, ang, v: 9 + 5 * Math.random(), trail: 0 };
+  }
+  if (ship) {
+    const s = ship;
+    s.x += s.ux * s.v * dt; s.y += s.uy * s.v * dt;
+    // the wake only exists where the ship has actually been (it entered from outside the screen)
+    s.trail += s.v * dt;
+    shipU.set([s.x, s.y, s.ang, 1]); shipTrail = s.trail + 40;
+    const m = 300;
+    if (s.trail > 100 && (s.x < -m || s.y < -m || s.x > W + m || s.y > H + m)) { ship = null; shipNext = t + 40 + 70 * Math.random(); }
+  }
+  // whales: a pod of 1-3 rises somewhere in open water (well away from the icon clouds), blows and dives
+  if (!pod && t > podNext && curMix >= 1) {
+    let spot = null;
+    for (let k = 0; k < 40 && !spot; k++) {
+      const x = 80 + Math.random() * (W - 160), y = 80 + Math.random() * (H - 160);
+      if (curS(x, y) - EDGE > 140) spot = [x, y];
+    }
+    if (spot) {
+      const ang = Math.random() * 6.283, n = 1 + Math.floor(Math.random() * 3), list = [];
+      for (let i = 0; i < n; i++) {
+        const a = i === 0 ? 0 : -40 * i + (Math.random() - 0.5) * 20, b = i === 0 ? 0 : (i % 2 ? 1 : -1) * (24 + Math.random() * 14);
+        list.push({ x: spot[0] + Math.cos(ang) * a - Math.sin(ang) * b, y: spot[1] + Math.sin(ang) * a + Math.cos(ang) * b, ang: ang + (Math.random() - 0.5) * 0.25, off: i * (0.06 + Math.random() * 0.06) });
+      }
+      pod = { t0: t, list };
+    }
+    podNext = t + (pod ? 70 + Math.random() * 90 : 5);
+  }
+  if (pod) {
+    let alive = false;
+    pod.list.forEach((w, i) => {
+      const ph = (t - pod.t0) / WHALE_T - w.off;
+      w.x += Math.cos(w.ang) * 5 * dt; w.y += Math.sin(w.ang) * 5 * dt;
+      w.ang += Math.sin(t * 0.2 + i) * 0.01 * dt;
+      if (ph <= 1) alive = true;
+      if (ph >= 0 && ph <= 1) whaleU.set([w.x, w.y, w.ang, ph], i * 4);
+    });
+    if (!alive) pod = null;
+  }
+  if (LIFETEST) window.__snapErrors = ['ship ' + (ship ? Math.round(ship.x) + ',' + Math.round(ship.y) : '-'), 'whales ' + Array.from(whaleU).map(v => v.toFixed(2)).join(' '), 'fieldMs ' + fieldMs.toFixed(1), 'frameMs ' + frameMs.toFixed(1), JSON.stringify(circStats)];
+}
+
+/* ======================================================================
+   Frame loop
+   ====================================================================== */
+function resize() {
+  W = innerWidth; H = innerHeight;
+  const scale = PREVIEW ? 0.45 : Math.min(devicePixelRatio || 1, P.quality);
+  const box = cv.getBoundingClientRect();
+  cv.width = Math.round((box.width || W) * scale); cv.height = Math.round((box.height || H) * scale); cv._scale = scale;
+  Gw = Math.ceil(W / STEP) + 2; Gh = Math.ceil(H / STEP) + 2;
+  buildNoise();
+  allocField();
+  massList = null;
+}
+
+const T0 = performance.now();
+let lastT = 0, fpsEMA = 0, frameN = 0, frameMs = 0, lifeT = 0;
+let paused = false;
+function frame(now) {
+  requestAnimationFrame(frame);
+  if (paused) { lastT = 0; return; }
+  if (P.cap30 && now - lastT < 31) return;
+  const dt = lastT ? Math.min((now - lastT) / 1000, 0.1) : 0.03;
+  if (lastT) fpsEMA = fpsEMA ? fpsEMA * 0.9 + (1 / dt) * 0.1 : 1 / dt;
+  lastT = now;
+  lifeT += dt;
+  stepSkyClouds(dt);
+  stepLife(lifeT, dt);
+  draw(now);
+  frameN++;
+}
+function draw(now) {
+  const t0 = performance.now();
+  const e = Math.min(Math.max((now - morphT0) / morphDur, 0), 1);
+  curMix = e < 0.5 ? 2 * e * e : 1 - Math.pow(-2 * e + 2, 2) / 2;
+  const t = (now - T0) / 1000;
+  uploadCircles(t);
+  const { p, U } = PR;
+  gl.useProgram(p);
+  gl.viewport(0, 0, cv.width, cv.height);
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, noiseTex);
+  gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, ftex[fromI]);
+  gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D, ftex[toI]);
+  gl.activeTexture(gl.TEXTURE3); gl.bindTexture(gl.TEXTURE_2D, circTex);
+  gl.uniform1i(U.uNoise, 0); gl.uniform1i(U.uFA, 1); gl.uniform1i(U.uFB, 2); gl.uniform1i(U.uCirc, 3);
+  gl.uniform2f(U.uRes, cv.width / cv._scale, cv.height / cv._scale);
+  gl.uniform2f(U.uGrid, Gw, Gh);
+  gl.uniform2f(U.uCGrid, cgW, cgH);
+  gl.uniform1f(U.uCellG, CELL_G);
+  gl.uniform1f(U.uScale, cv._scale);
+  gl.uniform1f(U.uSeed, (seed % 997) * 0.37);
+  gl.uniform1f(U.uStep, STEP);
+  gl.uniform1f(U.uMix, curMix);
+  gl.uniform1f(U.uTime, t % 3600);
+  gl.uniform1f(U.uEdge, EDGE);
+  gl.uniform4fv(U.uShip, shipU); gl.uniform1f(U.uShipTrail, shipTrail);
+  gl.uniform4fv(U.uWhale, whaleU);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+  frameMs = performance.now() - t0;
+}
+
+/* ======================================================================
+   Settings / hosted mode
+   ====================================================================== */
+let iconsSeen = !(WALL || PREVIEW);
+function reseed(v) {
+  seed = v; buildNoise(); massList = null;
+  if (!iconsSeen) return;
+  commit(true);
+}
+function applySettings(v) {
+  if (typeof v.seed === 'number' && v.seed !== seed) reseed(v.seed);
+  let field = false;
+  for (const k in v) {
+    if (!KEYS[k] || typeof v[k] !== 'number' || !isFinite(v[k]) || P[k] === v[k]) continue;
+    const [lo, hi] = KEYS[k];
+    const x = Math.min(Math.max(v[k], lo), hi);
+    if (k === 'life' && x !== 0 && x !== 1) continue;
+    P[k] = x;
+    if (k === 'sigma') field = true;
+  }
+  if (field && FB) commit();                      // cloud size: smooth transition too
+}
+function drawGhosts() {
+  const box = document.getElementById('ghosts');
+  if (box) box.innerHTML = icons.map(ic => `<div class="ghost" style="left:${ic.x}px;top:${ic.y}px;width:${ic.w}px;height:${ic.h}px"><i></i><b></b></div>`).join('');
+}
+function startHostedMode() {
+  if (PREVIEW) {
+    document.body.classList.add('preview');
+    const g = document.createElement('div'); g.id = 'ghosts'; document.body.appendChild(g);
+  }
+  icons = [];
+  refresh();                                     // open sea until we know where the icons are
+  let first = true;
+  const handle = m => {
+    if (!m || typeof m !== 'object') return;
+    if (m.t === 'pause') { paused = PREVIEW ? false : !!m.v; return; }
+    if (m.t === 'settings') { applySettings(m.v || {}); return; }
+    if (m.t === 'reset') { applySettings(Object.assign({}, DEFAULTS, m.v || {})); return; }
+    if (m.t !== 'icons') return;
+    const k = window.devicePixelRatio || 1;       // physical -> CSS pixels
+    icons = m.vis && Array.isArray(m.r) ? m.r.map(([l, t, r, b]) => ({ x: l / k, y: t / k, w: (r - l) / k, h: (b - t) / k })) : [];
+    if (PREVIEW) drawGhosts();
+    iconsSeen = true;
+    commit(first);                                // first time: the clouds gather; later: smooth transition
+    first = false;
+  };
+  if (PREVIEW) {
+    addEventListener('message', ev => { if (ev.source === parent) { try { handle(typeof ev.data === 'string' ? JSON.parse(ev.data) : ev.data); } catch (e) {} } });
+    parent.postMessage(JSON.stringify({ t: 'ready' }), '*');
+    return;
+  }
+  const host = window.chrome && window.chrome.webview;
+  if (!host) return;
+  host.addEventListener('message', ev => { try { handle(JSON.parse(ev.data)); } catch (e) { console.error(e); } });
+  host.postMessage('ready');
+}
+function startDemo() {
+  // plain browser: a column of icons on the right and a few scattered ones
+  const list = [];
+  for (let r = 0; r < 6; r++) list.push({ x: W - 90, y: 10 + r * 100, w: 76, h: 92 });
+  list.push({ x: W * 0.22, y: H * 0.3, w: 76, h: 92 }, { x: W * 0.45, y: H * 0.62, w: 76, h: 92 }, { x: W * 0.52, y: H * 0.18, w: 76, h: 92 });
+  icons = list;
+  commit(true);
+}
+
+let resizeT = 0;
+addEventListener('resize', () => {
+  clearTimeout(resizeT);
+  resizeT = setTimeout(() => { resize(); refresh(); skyClouds.length = 0; }, 100);
+});
+
+window.__dbg = { P, stats: () => ({ fieldMs, frameMs, circStats, fps: fpsEMA }) };
+resize();
+buildNoiseTex();
+if (WALL || PREVIEW) startHostedMode();
+else startDemo();
+requestAnimationFrame(frame);
+</script>
+<script src="share.js"></script>
+</body>
+</html>

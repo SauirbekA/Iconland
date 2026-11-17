@@ -1,0 +1,679 @@
+{
+  "version": 1,
+  "themes": [
+    {
+      "id": "meadow",
+      "adaptive": true,
+      "name": "草地",
+      "desc": "钢笔淡彩的草地，图标藏在白云里，云影是一块块深绿",
+      "page": "meadow.html",
+      "status": "ready",
+      "product": "free",
+      "thumb": "url(thumbs/meadow.webp?v=5d36b1f2d4) center / cover no-repeat, radial-gradient(ellipse 22% 16% at 36% 38%, #fdfeff 60%, #dfe7ef 75%, transparent 78%), radial-gradient(ellipse 22% 16% at 46% 58%, #5f8a3e 70%, transparent 74%), radial-gradient(ellipse 18% 13% at 72% 70%, #fdfeff 60%, #dfe7ef 75%, transparent 78%), radial-gradient(ellipse 18% 13% at 80% 86%, #5f8a3e 70%, transparent 74%), linear-gradient(160deg, #c3d684 0%, #a2c06a 100%)",
+      "thumbSource": "custom",
+      "groups": [
+        {
+          "name": "图标周围",
+          "params": [
+            {
+              "key": "sigma",
+              "label": "云团大小",
+              "hint": "图标所在的云从图标往外铺多远",
+              "min": 40,
+              "max": 200,
+              "step": 1,
+              "default": 72,
+              "unit": "px"
+            }
+          ]
+        },
+        {
+          "name": "云",
+          "params": [
+            {
+              "key": "cover",
+              "label": "草地上的云",
+              "hint": "空旷的草地上空零星飘着的云有多少",
+              "min": 0,
+              "max": 1,
+              "step": 0.01,
+              "default": 0.3,
+              "format": "percent"
+            },
+            {
+              "key": "flow",
+              "label": "流动速度",
+              "hint": "云飘多快、云团的鼓包变化多快",
+              "min": 0,
+              "max": 3,
+              "step": 0.05,
+              "default": 1,
+              "format": "times"
+            }
+          ]
+        },
+        {
+          "name": "角色",
+          "params": [
+            {
+              "key": "showBoy",
+              "label": "显示男孩",
+              "hint": "男孩和他手中的风筝一起显示或隐藏",
+              "options": [
+                "隐藏",
+                "显示"
+              ],
+              "default": 1
+            },
+            {
+              "key": "showCat",
+              "label": "显示小猫",
+              "hint": "躺在草地上的小黑猫",
+              "options": [
+                "隐藏",
+                "显示"
+              ],
+              "default": 1
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "beach",
+      "name": "沙滩",
+      "desc": "海岸线绕着你的文件弯曲，海浪一层层冲上沙滩",
+      "page": "flat.html",
+      "status": "ready",
+      "product": "free",
+      "thumb": "url(thumbs/beach.webp?v=017578bc5c) center / cover no-repeat, linear-gradient(160deg, #f6ecdf 0%, #f6ecdf 34%, #bfeee0 36%, #57cfd0 55%, #0f9fc4 78%, #0a86b0 100%)",
+      "thumbSource": "custom",
+      "groups": [
+        {
+          "name": "岸线",
+          "params": [
+            {
+              "key": "sigma",
+              "label": "离岸距离",
+              "hint": "海岸线离图标多远",
+              "min": 40,
+              "max": 200,
+              "step": 1,
+              "default": 85,
+              "unit": "px"
+            },
+            {
+              "key": "warp",
+              "label": "海岸曲折",
+              "hint": "岸线弯弯绕绕的程度",
+              "min": 0,
+              "max": 80,
+              "step": 1,
+              "default": 34
+            }
+          ]
+        },
+        {
+          "name": "海水",
+          "params": [
+            {
+              "key": "shoal",
+              "label": "透明浅滩",
+              "hint": "能看见沙底的浅水有多宽",
+              "min": 0,
+              "max": 300,
+              "step": 1,
+              "default": 110,
+              "unit": "px"
+            },
+            {
+              "key": "shallow",
+              "label": "浅海宽度",
+              "hint": "从青绿过渡到深蓝的距离",
+              "min": 120,
+              "max": 700,
+              "step": 1,
+              "default": 260,
+              "unit": "px"
+            }
+          ]
+        },
+        {
+          "name": "元素",
+          "params": [
+            {
+              "key": "palms",
+              "label": "椰子树数量",
+              "hint": "沿岸椰子树的数量，设为 0 可隐藏；沙地不足时会减少显示",
+              "min": 0,
+              "max": 10,
+              "step": 1,
+              "default": 4,
+              "unit": "棵"
+            },
+            {
+              "key": "kayaks",
+              "label": "皮划艇",
+              "min": 0,
+              "max": 4,
+              "step": 1,
+              "default": 2,
+              "unit": "艘"
+            },
+            {
+              "key": "birds",
+              "label": "海鸟",
+              "hint": "在上空滑翔、盘旋的海鸥",
+              "min": 0,
+              "max": 8,
+              "step": 1,
+              "default": 3,
+              "unit": "只"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "woods",
+      "name": "森林",
+      "desc": "俯瞰一片童话森林：图标坐落在洒满阳光的林间空地上，蜿蜒的土路连着空地，圆圆的树冠随风摇摆。",
+      "page": "woods.html",
+      "status": "ready",
+      "product": "free",
+      "thumb": "url(thumbs/woods.webp) center / cover no-repeat, linear-gradient(160deg,#5e8f3a 0%,#2f5a2a 100%)",
+      "thumbSource": "custom",
+      "groups": [
+        {
+          "name": "林间空地",
+          "params": [
+            {
+              "key": "sigma",
+              "label": "空地大小",
+              "hint": "图标周围空地的大小",
+              "min": 40,
+              "max": 200,
+              "step": 1,
+              "default": 70,
+              "unit": "px"
+            }
+          ]
+        },
+        {
+          "name": "森林",
+          "params": [
+            {
+              "key": "density",
+              "label": "树木密度",
+              "hint": "树越密，树冠越小、越挤",
+              "min": 0.5,
+              "max": 1.6,
+              "step": 0.05,
+              "default": 1,
+              "format": "times"
+            },
+            {
+              "key": "wind",
+              "label": "风力",
+              "hint": "树冠随风摇摆的幅度",
+              "min": 0,
+              "max": 3,
+              "step": 0.05,
+              "default": 1,
+              "format": "times"
+            },
+            {
+              "key": "autumn",
+              "label": "秋色",
+              "hint": "变成橙色、金色、红色的树的比例",
+              "min": 0,
+              "max": 1,
+              "step": 0.01,
+              "default": 0.12,
+              "format": "percent"
+            }
+          ]
+        },
+        {
+          "name": "显示",
+          "params": [
+            {
+              "key": "life",
+              "label": "小动物",
+              "hint": "飞过的鸟、蝴蝶和偶尔路过的狐狸",
+              "options": [
+                "隐藏",
+                "显示"
+              ],
+              "default": 1
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "highsea",
+      "adaptive": true,
+      "name": "远海",
+      "desc": "从高空俯瞰远海：图标躺在大朵白云里，云影轻轻落在深蓝的海面上",
+      "page": "highsea.html",
+      "status": "ready",
+      "product": "free",
+      "thumb": "url(thumbs/highsea.webp) center / cover no-repeat, linear-gradient(160deg,#1d5f7a 0%,#0d3550 100%)",
+      "thumbSource": "custom",
+      "groups": [
+        {
+          "name": "图标周围",
+          "params": [
+            {
+              "key": "sigma",
+              "label": "云团大小",
+              "hint": "图标所在的云从图标往外铺多远",
+              "min": 40,
+              "max": 200,
+              "step": 1,
+              "default": 72,
+              "unit": "px"
+            }
+          ]
+        },
+        {
+          "name": "云",
+          "params": [
+            {
+              "key": "cover",
+              "label": "海上的云",
+              "hint": "开阔海面上空零星飘着的云有多少",
+              "min": 0,
+              "max": 1,
+              "step": 0.01,
+              "default": 0.35,
+              "format": "percent"
+            },
+            {
+              "key": "flow",
+              "label": "流动速度",
+              "hint": "云飘多快、云团的鼓包变化多快",
+              "min": 0,
+              "max": 3,
+              "step": 0.05,
+              "default": 1,
+              "format": "times"
+            }
+          ]
+        },
+        {
+          "name": "海上",
+          "params": [
+            {
+              "key": "life",
+              "label": "船和鲸鱼",
+              "hint": "偶尔驶过的小船，和偶尔浮出水面换气的鲸群",
+              "options": [
+                "隐藏",
+                "显示"
+              ],
+              "default": 1
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "pond",
+      "name": "池塘",
+      "desc": "宁静的水彩池塘：图标坐落在长满青草的岸上，桌面其余部分是清澈的池水，漂着睡莲，倒映着飘过的云，还有水黾和蜻蜓。",
+      "page": "pond.html",
+      "status": "ready",
+      "product": "free",
+      "thumb": "url(thumbs/pond.webp) center / cover no-repeat, linear-gradient(160deg,#3f8f86 0%,#2c6a68 100%)",
+      "thumbSource": "custom",
+      "groups": [
+        {
+          "name": "池塘",
+          "params": [
+            {
+              "key": "sigma",
+              "label": "陆地大小",
+              "hint": "图标周围草地的范围",
+              "min": 40,
+              "max": 200,
+              "step": 1,
+              "default": 70,
+              "unit": "px"
+            },
+            {
+              "key": "warp",
+              "label": "岸线弯曲",
+              "hint": "岸线被扭曲的程度",
+              "min": 0,
+              "max": 100,
+              "step": 1,
+              "default": 40,
+              "unit": "px"
+            },
+            {
+              "key": "lilies",
+              "label": "睡莲数量",
+              "hint": "水面上睡莲叶和花的多少",
+              "min": 0,
+              "max": 2,
+              "step": 0.05,
+              "default": 1,
+              "format": "percent"
+            },
+            {
+              "key": "speed",
+              "label": "动画速度",
+              "hint": "水波、云影和小虫的速度",
+              "min": 0,
+              "max": 3,
+              "step": 0.05,
+              "default": 1,
+              "format": "times"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "cloudsky",
+      "name": "云端",
+      "desc": "欢快的卡通天空：图标躺在蓬松的云朵上，天空跟着你的时钟从蓝天变成晚霞、再到星夜",
+      "page": "cloudsky.html",
+      "status": "ready",
+      "product": "free",
+      "thumb": "url(thumbs/cloudsky.webp) center / cover no-repeat, linear-gradient(180deg,#4a90e2 0%,#a8d4f7 100%)",
+      "thumbSource": "custom",
+      "groups": [
+        {
+          "name": "图标周围",
+          "params": [
+            {
+              "key": "sigma",
+              "label": "云朵大小",
+              "hint": "图标下面的云从图标往外铺多远",
+              "min": 40,
+              "max": 200,
+              "step": 1,
+              "default": 64,
+              "unit": "px"
+            }
+          ]
+        },
+        {
+          "name": "天空",
+          "params": [
+            {
+              "key": "tod",
+              "label": "时段",
+              "hint": "自动：跟随电脑的本地时间变成白天、黄昏或夜晚",
+              "options": [
+                "自动",
+                "白天",
+                "黄昏",
+                "夜晚"
+              ],
+              "default": 0
+            },
+            {
+              "key": "cover",
+              "label": "背景小云",
+              "hint": "远处飘过的小云有多少",
+              "min": 0,
+              "max": 1,
+              "step": 0.01,
+              "default": 0.5,
+              "format": "percent"
+            },
+            {
+              "key": "speed",
+              "label": "动画速度",
+              "hint": "云的飘动、热气球、飞鸟和星星闪烁的快慢",
+              "min": 0,
+              "max": 3,
+              "step": 0.05,
+              "default": 1,
+              "format": "times"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "archipelago",
+      "name": "群岛",
+      "desc": "俯瞰一片热带深海：每个图标都成了一座绿树成荫的小岛，环着白浪和碧绿的浅湖，小帆船在岛与岛之间来回航行",
+      "page": "archipelago.html",
+      "status": "ready",
+      "product": "free",
+      "thumb": "url(thumbs/archipelago.webp) center / cover no-repeat, linear-gradient(160deg,#1f8fb5 0%,#0b2f6b 100%)",
+      "thumbSource": "custom",
+      "groups": [
+        {
+          "name": "岛屿",
+          "params": [
+            {
+              "key": "sigma",
+              "label": "岛屿大小",
+              "hint": "图标周围的岛从图标往外延伸多远",
+              "min": 30,
+              "max": 140,
+              "step": 1,
+              "default": 62,
+              "unit": "px"
+            },
+            {
+              "key": "warp",
+              "label": "海岸曲折",
+              "hint": "岛屿海岸线弯弯绕绕的程度",
+              "min": 0,
+              "max": 80,
+              "step": 1,
+              "default": 40
+            }
+          ]
+        },
+        {
+          "name": "帆船",
+          "params": [
+            {
+              "key": "ships",
+              "label": "帆船数量",
+              "hint": "在岛屿之间航行的帆船数量，设为 0 可隐藏",
+              "min": 0,
+              "max": 8,
+              "step": 1,
+              "default": 4,
+              "unit": "艘"
+            },
+            {
+              "key": "speed",
+              "label": "航速",
+              "hint": "帆船航行的快慢",
+              "min": 0.3,
+              "max": 3,
+              "step": 0.05,
+              "default": 1,
+              "format": "times"
+            }
+          ]
+        },
+        {
+          "name": "海水",
+          "params": [
+            {
+              "key": "waves",
+              "label": "波浪",
+              "hint": "开阔海面上的浪花和浅滩上的光纹有多少",
+              "min": 0,
+              "max": 2,
+              "step": 0.05,
+              "default": 1,
+              "format": "times"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "oldland",
+      "name": "古地图·大陆",
+      "desc": "一张古老的手绘大陆地图：森林、山脉、河流和固定的城镇，马车沿着道路在城镇间缓缓行驶；图标坐落在小湖或空旷的平原上。",
+      "page": "oldland.html",
+      "status": "ready",
+      "product": "free",
+      "thumb": "url(thumbs/oldland.webp) center / cover no-repeat, linear-gradient(160deg,#e6d4a8 0%,#c4a873 100%)",
+      "thumbSource": "custom",
+      "groups": [
+        {
+          "name": "地图",
+          "params": [
+            {
+              "key": "sigma",
+              "label": "湖泊与空地大小",
+              "hint": "图标周围的湖泊和空旷平原有多大",
+              "min": 30,
+              "max": 110,
+              "step": 1,
+              "default": 50,
+              "unit": "px"
+            },
+            {
+              "key": "forest",
+              "label": "森林密度",
+              "hint": "地图上森林覆盖的多少",
+              "min": 0,
+              "max": 1,
+              "step": 0.05,
+              "default": 0.65,
+              "format": "percent"
+            },
+            {
+              "key": "details",
+              "label": "地图细节",
+              "hint": "山脉、丘陵和草丛的数量",
+              "min": 0,
+              "max": 1,
+              "step": 0.05,
+              "default": 0.6,
+              "format": "percent"
+            }
+          ]
+        },
+        {
+          "name": "动画",
+          "params": [
+            {
+              "key": "carriages",
+              "label": "马车",
+              "hint": "在城镇之间道路上行驶的马车",
+              "options": [
+                "隐藏",
+                "显示"
+              ],
+              "default": 1
+            },
+            {
+              "key": "speed",
+              "label": "动画速度",
+              "hint": "马车行驶的速度",
+              "min": 0,
+              "max": 3,
+              "step": 0.1,
+              "default": 1,
+              "format": "times"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "oldmap",
+      "name": "古海图",
+      "desc": "泛黄羊皮纸上的手绘古航海图：小帆船沿着虚线航线在岛屿之间往来，你的图标藏在一朵朵古地图式的云朵里",
+      "page": "oldmap.html",
+      "status": "ready",
+      "product": "free",
+      "thumb": "url(thumbs/oldmap.webp) center / cover no-repeat, linear-gradient(160deg,#e8d9b5 0%,#c9b07c 100%)",
+      "thumbSource": "custom",
+      "groups": [
+        {
+          "name": "云朵",
+          "params": [
+            {
+              "key": "sigma",
+              "label": "云朵大小",
+              "hint": "盖住图标的云朵从图标往外铺多远",
+              "min": 40,
+              "max": 200,
+              "step": 1,
+              "default": 60,
+              "unit": "px"
+            },
+            {
+              "key": "billow",
+              "label": "云团大小",
+              "hint": "云朵边缘一个个圆鼓鼓的云团有多大",
+              "min": 0,
+              "max": 1,
+              "step": 0.01,
+              "default": 0.5,
+              "format": "percent"
+            }
+          ]
+        },
+        {
+          "name": "海图",
+          "params": [
+            {
+              "key": "islands",
+              "label": "岛屿",
+              "hint": "海图上岛屿的多少和大小",
+              "min": 0,
+              "max": 1,
+              "step": 0.01,
+              "default": 0.5,
+              "format": "percent"
+            },
+            {
+              "key": "details",
+              "label": "地图细节",
+              "hint": "山丘、树林、小镇等地图符号、海浪纹和海岸点刻的多少",
+              "min": 0,
+              "max": 1,
+              "step": 0.01,
+              "default": 0.6,
+              "format": "percent"
+            }
+          ]
+        },
+        {
+          "name": "航海",
+          "params": [
+            {
+              "key": "life",
+              "label": "船只与海怪",
+              "hint": "在岛屿间沿航线航行的小帆船和偶尔浮出水面的海蛇",
+              "options": [
+                "隐藏",
+                "显示"
+              ],
+              "default": 1
+            },
+            {
+              "key": "speed",
+              "label": "动画速度",
+              "hint": "帆船航行、云朵起伏、海蛇出没的快慢",
+              "min": 0,
+              "max": 3,
+              "step": 0.05,
+              "default": 1,
+              "format": "times"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

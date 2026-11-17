@@ -1,0 +1,445 @@
+{
+  "name": "English",
+  "ui": {
+    "adaptive": "Adaptive",
+    "themes": "Themes",
+    "collectionTitle": "Find your scenery.",
+    "collectionSubtitle": "Make your icons part of the landscape.",
+    "language": "Language",
+    "langAuto": "System default",
+    "langAutoWith": "System default ({name})",
+    "autostart": "Start with Mac",
+    "autostartTitle": "Open Iconland automatically when you log in to your Mac",
+    "autostartBlocked": "Start with Mac may have been blocked",
+    "autostartWarnSw": "Iconland didn't open automatically this time — {sw} may have blocked it. Open {sw} and allow Iconland, then check that Iconland is turned on in System Settings → General → Login Items.",
+    "autostartWarnGeneric": "Iconland didn't open automatically this time — your security software or the Login Items setting may have blocked it. Turn Iconland on in System Settings → General → Login Items.",
+    "gotIt": "Got it",
+    "updateAvailable": "Update available",
+    "updateVersion": "Iconland {version} is ready. Your current theme and settings will be kept.",
+    "updateProgram": "Update now",
+    "updateRetry": "Retry update",
+    "updateWorking": "Updating…",
+    "updateDownloading": "Downloading and installing… {progress}",
+    "updateInstalling": "Installing the update… {progress}",
+    "updateCompletedTitle": "Update complete",
+    "updateCompleted": "The update has been downloaded and installed. If Iconland does not restart automatically, open it again.",
+    "updateDone": "Done",
+    "updateCanceled": "The update was canceled. You can try again later.",
+    "updateLowBattery": "The update could not finish on battery power. Plug in your device and try again.",
+    "updateWifiRecommended": "This network may incur charges. Switch networks or try again later.",
+    "updateWifiRequired": "Connect to Wi-Fi to download this update.",
+    "updateStoreRequired": "This update method is only available in the App Store edition.",
+    "updateFailed": "The update failed. Check your connection or the App Store and try again.",
+    "updateCheckingTitle": "Checking for updates",
+    "updateChecking": "Connecting to the update server and checking for a new version…",
+    "updateFailedTitle": "Update not completed",
+    "updateCheckFailedTitle": "Couldn't check for updates",
+    "networkTimeout": "The connection or download timed out. Check your network, proxy or firewall and try again. If other websites work, the server may also be responding slowly.",
+    "networkDns": "The server address couldn't be resolved. Check your network, DNS or proxy settings and try again.",
+    "networkTls": "A secure connection couldn't be established. Check the system time and any security interception by your network or proxy, then try again.",
+    "networkLocal": "The network connection failed or was interrupted. Check your network, proxy or firewall and try again.",
+    "serverUnavailable": "The server was reached, but the service is temporarily unavailable (HTTP 5xx). Please try again later.",
+    "serverRejected": "The server rejected the request (HTTP 4xx). Try again later or contact support if this continues.",
+    "serverInvalid": "The server returned an unrecognized response. Try again later or contact support if this continues.",
+    "downloadInvalid": "The download was incomplete or failed security verification, so installation was stopped. Try again or contact support if this keeps happening.",
+    "livePreview": "Live preview",
+    "previewIcons": "Live preview · using the {n} icons on your desktop",
+    "previewNoIcons": "Live preview · desktop icons are hidden",
+    "refresh": "Refresh",
+    "refreshTitle": "Generate a new scene for this theme",
+    "shareImage": "Share image",
+    "shareImageTitle": "Share your desktop image while protecting your privacy",
+    "shareVideo": "Share video",
+    "shareVideoTitle": "Share your desktop animation while protecting your privacy",
+    "generating": "Generating…",
+    "preparingRec": "Getting ready…",
+    "recording": "Recording {p}%",
+    "savingVideo": "Saving…",
+    "shareFailImage": "Couldn't create the image: {msg}",
+    "shareFailVideo": "Couldn't record the video: {msg}",
+    "unknownReason": "unknown error",
+    "shareReadyImage": "Your desktop picture is ready",
+    "shareReadyVideo": "Your desktop clip is ready",
+    "sharePrivacy": "Icons are replaced with sample icons and file names with color blocks, so none of your files are shown.",
+    "shareCopiedImage": "The image is on your clipboard — paste it straight into a chat or a post.",
+    "shareCopiedVideo": "The video file is on your clipboard — paste it into a chat window to send it.",
+    "shareBrowserHint": " (Browser preview: click “{btn}” to download.)",
+    "savedTo": "Saved to {path}",
+    "openFolder": "Show in folder",
+    "openImage": "Open image",
+    "openVideo": "Open video",
+    "saveImage": "Save image",
+    "saveVideo": "Save video",
+    "ok": "OK",
+    "sharePreviewAlt": "Preview of the shared image",
+    "autosave": "Changes are saved automatically and applied to your desktop right away",
+    "saved": "Saved ✓",
+    "resetAll": "Reset all",
+    "resetAllTitle": "Reset all settings of this theme to their defaults",
+    "helpButtonTitle": "Common questions and troubleshooting",
+    "helpTitle": "Help",
+    "helpSubtitle": "Common questions and troubleshooting",
+    "helpWallpaperQ": "Do I need to change my Mac wallpaper?",
+    "helpWallpaperA": "Not really. Iconland draws its scenery above the system wallpaper, so whichever wallpaper you pick in macOS barely matters — dynamic or rotating wallpapers are fine too.",
+    "helpWallpaperStep1": "To change the system wallpaper anyway, open System Settings → Wallpaper.",
+    "helpWallpaperStep2": "If the scenery flickers or disappears, click the Iconland icon in the menu bar and choose Reload.",
+    "helpWallpaperStep3": "If the problem persists, quit Iconland and open it again.",
+    "badgeOn": "In use",
+    "badgeReady": "Available",
+    "badgeSoon": "Coming soon",
+    "badgeLocked": "Wallpaper",
+    "lockedTitle": "{name} · Wallpaper edition theme; click for purchase details",
+    "purchaseLocalTitle": "Unlock the Wallpaper edition",
+    "purchaseLocalTheme": "“{name}” is included in the Wallpaper edition.",
+    "purchaseLocalMessage": "After you buy from the current store, Iconland verifies your purchase and unlocks it automatically—no account sign-in needed. If you just bought it, check again.",
+    "purchaseRecheck": "Check purchases on this Mac",
+    "purchaseChecking": "Checking…",
+    "purchaseCrossChannel": "Restore another channel",
+    "ongoingTitle": "More on the way",
+    "ongoingDesc": "New scenes and elements will be added over time.",
+    "noParams": "This theme has no settings yet",
+    "resetOne": "Reset to default: {v}",
+    "resetOneAria": "Reset {label} to default",
+    "dblclickReset": "Double-click to reset ({v})",
+    "comingSoon": "Coming soon:",
+    "purchaseTitle": "Get the Wallpaper edition",
+    "purchaseTheme": "“{name}” is included in the Wallpaper edition.",
+    "purchaseMessage": "The preview includes Beach and Meadow forever. Get the Wallpaper edition to unlock more themes in the same Iconland app.",
+    "purchaseLater": "Keep exploring",
+    "purchaseWebsite": "Visit website"
+  },
+  "host": {
+    "traySettings": "Settings…",
+    "trayPause": "Pause animation",
+    "trayReload": "Reload",
+    "trayAutostart": "Start with Mac",
+    "trayExit": "Quit",
+    "welcomeTitle": "Iconland is running",
+    "welcomeBody": "Click the beach icon in the menu bar at the top of the screen to open the menu.\nCan't see it? The menu bar may be too full — try hiding some other menu bar icons.",
+    "welcomeHotkey": "",
+    "errNotReady": "The wallpaper isn't ready yet",
+    "errNoImage": "No image came back",
+    "errNoVideo": "No video came back",
+    "errBusyImage": "The previous image is still being generated",
+    "errBusyVideo": "The previous clip is still recording",
+    "errImageTimeout": "Generating took too long",
+    "errVideoTimeout": "Recording took too long",
+    "errBadData": "The page returned incomplete data",
+    "errRebuilt": "macOS kept rebuilding the wallpaper layer, so Iconland has stopped.",
+    "errSeeLog": "See the log for details: {path}",
+    "errSettings": "Couldn't open the settings window: {msg}",
+    "errNoPage": "Page not found: {path}",
+    "errNoDesktop": "Couldn't find the desktop window, so the wallpaper can't be attached.",
+    "errStart": "Couldn't start: {msg}"
+  },
+  "themes": {
+    "beach": {
+      "name": "Beach",
+      "desc": "The shoreline curves around your files as waves roll up the sand",
+      "groups": [
+        "Shoreline",
+        "Water",
+        "Details"
+      ],
+      "params": {
+        "palms": {
+          "label": "Coconut palms",
+          "hint": "Number of coastal palms; 0 to hide. Fewer appear if there is not enough sand.",
+          "unit": ""
+        },
+        "sigma": {
+          "label": "Distance from icons",
+          "hint": "How far the shoreline sits from your icons"
+        },
+        "warp": {
+          "label": "Winding coast",
+          "hint": "How much the shoreline twists and turns"
+        },
+        "shoal": {
+          "label": "Clear shallows",
+          "hint": "How wide the see-through water over the sand is"
+        },
+        "shallow": {
+          "label": "Shallow sea",
+          "hint": "How far the water fades from turquoise to deep blue"
+        },
+        "kayaks": {
+          "label": "Kayaks",
+          "unit": ""
+        },
+        "birds": {
+          "label": "Seabirds",
+          "hint": "Gulls gliding and circling overhead",
+          "unit": ""
+        }
+      }
+    },
+    "meadow": {
+      "name": "Meadow",
+      "desc": "A pen-and-wash meadow where your icons hide in white clouds that cast dark green shadows",
+      "groups": [
+        "Around icons",
+        "Clouds",
+        "Characters"
+      ],
+      "params": {
+        "sigma": {
+          "label": "Cloud size",
+          "hint": "How far the clouds around your icons spread out"
+        },
+        "cover": {
+          "label": "Clouds over the meadow",
+          "hint": "How many clouds drift over the open meadow"
+        },
+        "flow": {
+          "label": "Drift speed",
+          "hint": "How fast the clouds drift and their puffs change"
+        },
+        "showBoy": {
+          "label": "Show boy",
+          "hint": "Show or hide the boy together with his kite",
+          "options": [
+            "Hide",
+            "Show"
+          ]
+        },
+        "showCat": {
+          "label": "Show kitten",
+          "hint": "The little black kitten resting on the grass",
+          "options": [
+            "Hide",
+            "Show"
+          ]
+        }
+      }
+    },
+    "woods": {
+      "name": "Woods",
+      "desc": "A storybook forest seen from above: icons rest in sunny clearings, dirt paths wind between them, and the round crowns sway in the wind.",
+      "groups": [
+        "Clearings",
+        "Forest",
+        "Display"
+      ],
+      "params": {
+        "sigma": {
+          "label": "Clearing size",
+          "hint": "How much open grass surrounds the icons"
+        },
+        "density": {
+          "label": "Tree density",
+          "hint": "Denser woods have smaller, more crowded crowns"
+        },
+        "wind": {
+          "label": "Wind",
+          "hint": "How much the tree crowns sway"
+        },
+        "autumn": {
+          "label": "Autumn",
+          "hint": "Share of trees turned orange, gold and red"
+        },
+        "life": {
+          "label": "Wildlife",
+          "hint": "Birds flying over, butterflies, and a fox now and then",
+          "options": [
+            "Hide",
+            "Show"
+          ]
+        }
+      }
+    },
+    "highsea": {
+      "name": "High Sea",
+      "desc": "Looking straight down on the open ocean: your icons rest in big white clouds that cast soft shadows on the deep blue water",
+      "groups": [
+        "Around icons",
+        "Clouds",
+        "At sea"
+      ],
+      "params": {
+        "sigma": {
+          "label": "Cloud size",
+          "hint": "How far the clouds around your icons spread out"
+        },
+        "cover": {
+          "label": "Clouds over the sea",
+          "hint": "How many small clouds drift over the open water"
+        },
+        "flow": {
+          "label": "Drift speed",
+          "hint": "How fast the clouds drift and their puffs change"
+        },
+        "life": {
+          "label": "Ships and whales",
+          "hint": "A small ship passing now and then, and a pod of whales that rarely surfaces to breathe",
+          "options": [
+            "Hide",
+            "Show"
+          ]
+        }
+      }
+    },
+    "pond": {
+      "name": "Pond",
+      "desc": "A calm watercolor pond: icons rest on grassy banks while clear water, lily pads, drifting cloud reflections, water striders and dragonflies fill the rest of the desktop.",
+      "groups": [
+        "Pond"
+      ],
+      "params": {
+        "sigma": {
+          "label": "Land size",
+          "hint": "How far the grass extends around icons"
+        },
+        "warp": {
+          "label": "Shoreline wiggle",
+          "hint": "How much the shoreline winds"
+        },
+        "lilies": {
+          "label": "Lily pads",
+          "hint": "How many lily pads and flowers float on the water"
+        },
+        "speed": {
+          "label": "Animation speed",
+          "hint": "Speed of ripples, cloud reflections and insects"
+        }
+      }
+    },
+    "cloudsky": {
+      "name": "Cloud Sky",
+      "desc": "Cheerful cartoon sky: your icons rest on puffy clouds, and the sky follows your clock from blue day to sunset to starry night",
+      "groups": [
+        "Around icons",
+        "Sky"
+      ],
+      "params": {
+        "sigma": {
+          "label": "Cloud size",
+          "hint": "How far the cloud under your icons spreads out"
+        },
+        "tod": {
+          "label": "Time of day",
+          "hint": "Auto follows your Mac's local time: day, dusk or night",
+          "options": [
+            "Auto",
+            "Day",
+            "Dusk",
+            "Night"
+          ]
+        },
+        "cover": {
+          "label": "Background clouds",
+          "hint": "How many little clouds drift by in the distance"
+        },
+        "speed": {
+          "label": "Animation speed",
+          "hint": "How fast clouds drift, the balloon and birds fly, and stars twinkle"
+        }
+      }
+    },
+    "archipelago": {
+      "name": "Archipelago",
+      "desc": "A deep tropical ocean seen from above: your icons become lush islands ringed by surf and turquoise lagoons, and little sailing ships voyage between them",
+      "groups": [
+        "Islands",
+        "Ships",
+        "Water"
+      ],
+      "params": {
+        "sigma": {
+          "label": "Island size",
+          "hint": "How far the islands reach out from your icons"
+        },
+        "warp": {
+          "label": "Winding coast",
+          "hint": "How much the island shorelines twist and turn"
+        },
+        "ships": {
+          "label": "Sailing ships",
+          "hint": "How many ships sail between the islands; 0 to hide",
+          "unit": ""
+        },
+        "speed": {
+          "label": "Sailing speed",
+          "hint": "How fast the ships sail"
+        },
+        "waves": {
+          "label": "Waves",
+          "hint": "How many wave crests on open water and light ripples in the shallows"
+        }
+      }
+    },
+    "oldmap": {
+      "name": "Old Sea Chart",
+      "desc": "An antique hand-inked sea chart on aged parchment: little ships sail the dotted routes between the islands, and your icons hide in old-map clouds. Click a ship to take the helm: WASD or arrows, click to sail there, Esc to let it go: it sails on to the nearest harbour",
+      "groups": [
+        "Clouds",
+        "Chart",
+        "Seafaring"
+      ],
+      "params": {
+        "sigma": {
+          "label": "Cloud size",
+          "hint": "How far the clouds covering your icons reach"
+        },
+        "billow": {
+          "label": "Billow size",
+          "hint": "How big the round puffs along the cloud edge are"
+        },
+        "islands": {
+          "label": "Islands",
+          "hint": "How many islands are on the chart and how large they are"
+        },
+        "details": {
+          "label": "Map details",
+          "hint": "How many map symbols (hills, woods, towns), wave marks and how much shore stippling"
+        },
+        "life": {
+          "label": "Ships & sea creatures",
+          "hint": "Little ships sailing the routes between the islands, and now and then a sea monster: a sea serpent, the kraken or a ghost ship",
+          "options": [
+            "Hide",
+            "Show"
+          ]
+        },
+        "speed": {
+          "label": "Animation speed",
+          "hint": "How fast the ships sail, the clouds billow and the monsters appear"
+        }
+      }
+    },
+    "oldland": {
+      "name": "Old Land Map",
+      "desc": "An antique hand-inked map of a land: forests, mountains, rivers and towns that stay put, with horse carriages slowly travelling the roads between them. Icons rest in little lakes or on open plains.",
+      "groups": [
+        "Map",
+        "Animation"
+      ],
+      "params": {
+        "sigma": {
+          "label": "Lake & plain size",
+          "hint": "How large the lakes and open plains around icons are"
+        },
+        "forest": {
+          "label": "Forest density",
+          "hint": "How much of the map is covered with forest"
+        },
+        "details": {
+          "label": "Map details",
+          "hint": "Amount of mountains, hills and grass tufts"
+        },
+        "carriages": {
+          "label": "Carriages",
+          "hint": "Horse carriages travelling the roads between towns",
+          "options": [
+            "Hide",
+            "Show"
+          ]
+        },
+        "speed": {
+          "label": "Animation speed",
+          "hint": "How fast the carriages travel"
+        }
+      }
+    }
+  }
+}

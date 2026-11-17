@@ -1,0 +1,1418 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Iconland · Old Land Map</title>
+<!--
+  Iconland · Old Land Map theme (an antique hand-inked map of a land of towns and roads; WebGL2, one full-screen pass)
+  - Field (CPU, only when icons change, STEP grid): sP = signed distance to the clear "plain" around every icon
+    cluster, sL = signed distance to a small lake around isolated icons (clusters of 1-2), d = distance to the
+    nearest icon. Both are gaussian metaballs + a little noise warp, blended smoothly between icon layouts.
+  - World (CPU, built once per seed / screen size / first icon layout and then kept): rivers, 5-9 towns at fixed
+    places with names, a road network (minimum spanning tree + shortcuts), farm plots and region names. Towns never
+    move; when icons come over a town later, the town (and its roads) simply fade out.
+  - Ink layer (Canvas2D at device resolution, redrawn only when the field/settings change; two of them cross-fade
+    with the field): forests of tree glyphs, mountain ranges, hills, tufts, rivers, dotted roads, towns and labels.
+    Channels: R = ink, G = paper knock-out (erases what is behind a glyph), B = engraved shade.
+  - Shader: parchment (mottling, tea stains, fibres, folds, burnt edges), the light plains with a stippled edge,
+    inked lakes with waterlines, the ink layer, the compass rose (own texture), and the horse carriages.
+  - Life: 2-3 covered wagons drawn by a horse travel the open roads from town to town, pausing in each town,
+    turning smoothly to face the way they go. They are drawn in their own local coordinates (no screen-space
+    sampling inside moving objects), so nothing flickers.
+-->
+<style>
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #dcc79c; }
+  #art { position: fixed; inset: 0; width: 100vw; height: 100vh; display: block; }
+  #ghosts { position: fixed; inset: 0; pointer-events: none; display: none; }
+  body.preview #ghosts { display: block; }
+  .ghost { position: absolute; }
+  .ghost i { position: absolute; left: 50%; top: 4px; width: 48px; height: 48px; margin-left: -24px; border-radius: 9px;
+    background: rgba(255,255,255,.55); box-shadow: 0 1px 3px rgba(0,0,0,.25); }
+  .ghost b { position: absolute; left: 14%; right: 14%; top: 60px; height: 10px; border-radius: 5px; background: rgba(255,255,255,.75); }
+  #nogl { position: fixed; inset: 0; display: none; place-items: center; color: #fff; font: 16px system-ui, sans-serif; }
+</style>
+</head>
+<body>
+<canvas id="art"></canvas>
+<div id="nogl">WebGL2 is not available.</div>
+<script>
+'use strict';
+
+/* ======================================================================
+   Parameters
+   ====================================================================== */
+const CELL_W = 76, CELL_H = 100, GRID_X0 = 4, GRID_Y0 = 6, TASKBAR = 0;
+const STEP = 5;
+const MORPH_MS = 1800;
+const S_CLAMP = 90, D_CLAMP = 600, I_CLAMP = 200;   // shader clamp of the plain / lake channels, CPU clamp, icon distance clamp
+const ROSE = 72;                                      // compass rose radius (CSS px)
+const MAX_CARS = 4;
+
+const QS = new URLSearchParams(location.search);
+const WALL = QS.has('wallpaper');
+const PREVIEW = QS.has('preview');
+// Defaults must match themes.json
+const P = {
+  sigma: 50, forest: 0.65, details: 0.6, carriages: 1, speed: 1,
+  quality: 2, cap30: true,
+};
+const DEFAULTS = Object.assign({}, P);
+const KEYS = { sigma: [30, 110], forest: [0, 1], details: [0, 1], carriages: [0, 1], speed: [0, 3] };
+
+/* ======================================================================
+   Random / noise helpers (CPU)
+   ====================================================================== */
+let seed = (Math.random() * 1e6) | 0;
+function hash2(x, y, k = 0) {
+  let h = Math.imul(x | 0, 374761393) ^ Math.imul(y | 0, 668265263) ^ Math.imul(seed + k, 2246822519);
+  h = Math.imul(h ^ (h >>> 13), 1274126177);
+  return ((h ^ (h >>> 16)) >>> 0) / 4294967296;
+}
+function vnoise(x, y, k = 0) {
+  const ix = Math.floor(x), iy = Math.floor(y), fx = x - ix, fy = y - iy;
+  const ux = fx * fx * (3 - 2 * fx), uy = fy * fy * (3 - 2 * fy);
+  const a = hash2(ix, iy, k), b = hash2(ix + 1, iy, k), c = hash2(ix, iy + 1, k), d = hash2(ix + 1, iy + 1, k);
+  return a + (b - a) * ux + (c - a) * uy + (a - b - c + d) * ux * uy;
+}
+function fbm(x, y, k = 0) {
+  let a = 0.5, s = 0;
+  for (let i = 0; i < 4; i++) { s += a * vnoise(x, y, k + i * 7); x = x * 2.03 + 17.1; y = y * 2.03 + 17.1; a *= 0.5; }
+  return s;
+}
+function tileNoise(x, y, px, py, k) {
+  const ix = Math.floor(x), iy = Math.floor(y), fx = x - ix, fy = y - iy;
+  const ux = fx * fx * (3 - 2 * fx), uy = fy * fy * (3 - 2 * fy);
+  const m = (v, p) => ((v % p) + p) % p;
+  const x0 = m(ix, px), x1 = m(ix + 1, px), y0 = m(iy, py), y1 = m(iy + 1, py);
+  const h = (a, b) => { let v = Math.imul(a, 374761393) ^ Math.imul(b, 668265263) ^ Math.imul(k, 2246822519); v = Math.imul(v ^ (v >>> 13), 1274126177); return ((v ^ (v >>> 16)) >>> 0) / 4294967296; };
+  const a = h(x0, y0), b = h(x1, y0), c = h(x0, y1), d = h(x1, y1);
+  return a + (b - a) * ux + (c - a) * uy + (a - b - c + d) * ux * uy;
+}
+function makeNoiseImage() {
+  const S = 256, d = new Uint8Array(S * S * 4);
+  const chans = [[8, 16, 32, 64], [8, 16, 32, 64], [4, 8, 16, 32], [16, 32, 64, 128]];
+  for (let y = 0; y < S; y++) for (let x = 0; x < S; x++) {
+    const u = x / S, v = y / S, i = (y * S + x) * 4;
+    for (let c = 0; c < 4; c++) {
+      let s = 0, w = 0.5, tw = 0;
+      for (let j = 0; j < chans[c].length; j++) { const p = chans[c][j]; s += w * tileNoise(u * p, v * p, p, p, 100 + c * 50 + j * 13); tw += w; w *= 0.5; }
+      d[i + c] = Math.min(Math.max((s / tw - 0.5) * 1.9 + 0.5, 0), 1) * 255;
+    }
+  }
+  return { S, d };
+}
+const sstep = (a, b, x) => { const t = Math.min(Math.max((x - a) / (b - a), 0), 1); return t * t * (3 - 2 * t); };
+
+// terrain functions of the seed (static): forest cover, mountain ridges
+const forestVal = (x, y) => fbm(x * 0.0042 + 3.1, y * 0.0042 - 1.7, 41);
+const conVal = (x, y) => fbm(x * 0.006, y * 0.006, 47);
+function mountVal(x, y) {
+  const r = 1 - Math.abs(fbm(x * 0.0026, y * 0.0026, 31) - 0.47) * 3.4;     // ridges along a noise contour
+  return Math.max(r, 0) * sstep(0.4, 0.56, fbm(x * 0.0019 + 9.0, y * 0.0019, 37));
+}
+
+/* ======================================================================
+   Field (CPU): sP plain, sL lake (signed, <0 inside), d distance to the nearest icon
+   ====================================================================== */
+let W = innerWidth, H = innerHeight, Gw = 1, Gh = 1, NZ = null;
+function buildNoise() {
+  const N = Gw * Gh;
+  NZ = { wx: new Float32Array(N), wy: new Float32Array(N), fn: new Float32Array(N), fl: new Float32Array(N) };
+  for (let gy = 0; gy < Gh; gy++) for (let gx = 0; gx < Gw; gx++) {
+    const i = gy * Gw + gx, x = gx * STEP, y = gy * STEP;
+    NZ.wx[i] = fbm(x * 0.0045, y * 0.0045, 1) - 0.47;
+    NZ.wy[i] = fbm(x * 0.0045, y * 0.0045, 2) - 0.47;
+    NZ.fn[i] = fbm(x * 0.02, y * 0.02, 3) - 0.47;
+    NZ.fl[i] = (fbm(x * 0.011, y * 0.011, 4) - 0.47) * 1.6 + (fbm(x * 0.04, y * 0.04, 5) - 0.47) * 0.12;
+  }
+}
+// icons closer than this (gap, px) belong to one cluster; clusters of 1-2 icons sit in a lake
+function lakeFlags(rects) {
+  const n = rects.length, par = rects.map((_, i) => i);
+  const find = i => { while (par[i] !== i) i = par[i] = par[par[i]]; return i; };
+  for (let i = 0; i < n; i++) for (let j = i + 1; j < n; j++) {
+    const a = rects[i], b = rects[j];
+    if (Math.abs(a.cx - b.cx) - a.hw - b.hw < 44 && Math.abs(a.cy - b.cy) - a.hh - b.hh < 44) par[find(i)] = find(j);
+  }
+  const cnt = new Map();
+  for (let i = 0; i < n; i++) cnt.set(find(i), (cnt.get(find(i)) || 0) + 1);
+  return rects.map((_, i) => cnt.get(find(i)) <= 2);
+}
+let fieldMs = 0;
+function computeField(rects) {
+  const t0 = performance.now();
+  const N = Gw * Gh, fP = new Float32Array(N), fL = new Float32Array(N), d = new Float32Array(N).fill(I_CLAMP);
+  const sigL = P.sigma, sigP = P.sigma * 1.3 + 12, isP = 1 / (sigP * sigP), isL = 1 / (sigL * sigL);
+  const wa = 34, lake = lakeFlags(rects);
+  rects.forEach((r, ri) => {
+    const Rf = sigP * 1.1 + 160, Rf2 = Rf * Rf, RL2 = (sigL * 1.1 + 110) ** 2, Ic2 = I_CLAMP * I_CLAMP;
+    const R = Math.max(Rf, I_CLAMP) + Math.max(r.hw, r.hh) + wa;
+    const gx0 = Math.max(0, Math.floor((r.cx - R) / STEP)), gx1 = Math.min(Gw - 1, Math.ceil((r.cx + R) / STEP));
+    const gy0 = Math.max(0, Math.floor((r.cy - R) / STEP)), gy1 = Math.min(Gh - 1, Math.ceil((r.cy + R) / STEP));
+    const chw = r.hw * 0.5, chh = r.hh * 0.5, isLake = lake[ri];
+    for (let gy = gy0; gy <= gy1; gy++) for (let gx = gx0; gx <= gx1; gx++) {
+      const i = gy * Gw + gx, x = gx * STEP, y = gy * STEP;
+      const qx = x + NZ.wx[i] * wa, qy = y + NZ.wy[i] * wa;
+      let dx = Math.abs(qx - r.cx) - chw, dy = Math.abs(qy - r.cy) - chh;
+      if (dx < 0) dx = 0; if (dy < 0) dy = 0;
+      const d2 = dx * dx + dy * dy;
+      if (d2 < Rf2) fP[i] += Math.exp(-d2 * isP);
+      if (isLake && d2 < RL2) fL[i] += Math.exp(-d2 * isL);
+      let ex = Math.abs(x - r.cx) - r.hw - 4, ey = Math.abs(y - r.cy) - r.hh - 2;
+      if (ex < 0) ex = 0; if (ey < 0) ey = 0;
+      const e2 = ex * ex + ey * ey;
+      if (e2 < Ic2) { const e = Math.sqrt(e2); if (e < d[i]) d[i] = e; }
+    }
+  });
+  const c0 = Math.sqrt(-Math.log(0.35)), sP = new Float32Array(N), sL = new Float32Array(N), fMin = Math.exp(-60);
+  for (let i = 0; i < N; i++) {
+    let g = Math.log(Math.max(fP[i], fMin));
+    sP[i] = Math.min(D_CLAMP, sigP * (Math.sqrt(Math.max(-g, 0)) - c0) - sigP * 0.6 * Math.max(g, 0) + NZ.fn[i] * 26);
+    g = Math.log(Math.max(fL[i], fMin));
+    sL[i] = Math.min(D_CLAMP, sigL * (Math.sqrt(Math.max(-g, 0)) - c0) - sigL * 0.6 * Math.max(g, 0) + NZ.fl[i] * 40);
+  }
+  fieldMs = performance.now() - t0;
+  return { sP, sL, d };
+}
+function blankField() {
+  const N = Gw * Gh;
+  return { sP: new Float32Array(N).fill(-S_CLAMP), sL: new Float32Array(N).fill(S_CLAMP), d: new Float32Array(N).fill(I_CLAMP), blank: true, alive: [], open: [], regAlive: [], compass: null };
+}
+function sampleArr(a, x, y) {
+  const fx = Math.min(Math.max(x / STEP, 0), Gw - 1.001), fy = Math.min(Math.max(y / STEP, 0), Gh - 1.001);
+  const ix = Math.floor(fx), iy = Math.floor(fy), tx = fx - ix, ty = fy - iy, i = iy * Gw + ix;
+  return (a[i] * (1 - tx) + a[i + 1] * tx) * (1 - ty) + (a[i + Gw] * (1 - tx) + a[i + Gw + 1] * tx) * ty;
+}
+
+/* ======================================================================
+   World (constant per seed / screen size / first icon layout): rivers, towns, roads, plots, region names
+   ====================================================================== */
+const TOWN_NAMES = ['Ventiro', 'Pontalba', 'Rocavia', 'Silvarna', 'Fontebrina', 'Lumeria', 'Corvenna', 'Orsavia', 'Mirandel',
+  'Caldoria', 'Sanctum Ilicis', 'Pons Ferreus', 'Vicus Ursi', 'Arx Lucida', 'Brennica', 'Tolvesca', 'Aquavella', 'Castrum Nivis'];
+const REGION_NAMES = ['SALTUS MAGNUS', 'MARCHIA OCCIDUA', 'AGRI SERENI', 'VALLES TACITAE', 'DUCATUS ALBUS', 'SILVAE ANTIQUAE', 'PLANITIES LATA', 'COLLES RUBRI'];
+let WORLD = null, worldMs = 0;
+const TS = 1.4;      // town drawing scale
+function shuffled(list, k) { return list.map((v, i) => [hash2(i, 7, k), v]).sort((a, b) => a[0] - b[0]).map(e => e[1]); }
+
+function walkRiver(x, y, h0, len, k) {
+  const pts = [[x, y]];
+  let s = 0;
+  while (s < len) {
+    const hd = h0 + (fbm(s * 0.0045, k * 3.1, 600 + k) - 0.47) * 3.2 + (fbm(s * 0.024, k * 5.7, 640 + k) - 0.47) * 1.8;
+    x += Math.cos(hd) * 5; y += Math.sin(hd) * 5; s += 5;
+    pts.push([x, y]);
+    if (x < -24 || y < -24 || x > W + 24 || y > H + 24) break;
+  }
+  return pts;
+}
+function polyLen(pts) {
+  const cum = [0];
+  for (let i = 1; i < pts.length; i++) cum.push(cum[i - 1] + Math.hypot(pts[i][0] - pts[i - 1][0], pts[i][1] - pts[i - 1][1]));
+  return cum;
+}
+function bez(a, c, b, t) {
+  const u = 1 - t;
+  return [u * u * a[0] + 2 * u * t * c[0] + t * t * b[0], u * u * a[1] + 2 * u * t * c[1] + t * t * b[1]];
+}
+function buildWorld(F0) {
+  const t0 = performance.now();
+  const N = Gw * Gh, ko = new Uint8Array(N);
+  const stamp = (x, y, r) => {
+    const gx0 = Math.max(0, Math.floor((x - r) / STEP)), gx1 = Math.min(Gw - 1, Math.ceil((x + r) / STEP));
+    const gy0 = Math.max(0, Math.floor((y - r) / STEP)), gy1 = Math.min(Gh - 1, Math.ceil((y + r) / STEP));
+    for (let gy = gy0; gy <= gy1; gy++) for (let gx = gx0; gx <= gx1; gx++)
+      if ((gx * STEP - x) ** 2 + (gy * STEP - y) ** 2 <= r * r) ko[gy * Gw + gx] = 1;
+  };
+  const stampRect = (x0, y0, x1, y1) => {
+    for (let gy = Math.max(0, Math.floor(y0 / STEP)); gy <= Math.min(Gh - 1, Math.ceil(y1 / STEP)); gy++)
+      for (let gx = Math.max(0, Math.floor(x0 / STEP)); gx <= Math.min(Gw - 1, Math.ceil(x1 / STEP)); gx++) ko[gy * Gw + gx] = 1;
+  };
+  const dAt = (x, y) => sampleArr(F0.d, x, y), pAt = (x, y) => sampleArr(F0.sP, x, y);
+
+  // ---- rivers: one from the top edge (with a tributary), sometimes a second one from a side ----
+  const rivers = [];
+  const addRiver = (pts, w0, w1) => {
+    if (pts.length < 12) return;
+    const n = pts.length;
+    rivers.push(pts.map((q, i) => [q[0], q[1], w0 + (w1 - w0) * (i / (n - 1))]));
+  };
+  {
+    const h = hash2(1, 1, 500);
+    const main = walkRiver(W * (0.18 + 0.64 * h), -12, Math.PI / 2 + (hash2(2, 1, 500) - 0.5) * 0.7, Math.max(W, H) * 2.2, 1);
+    addRiver(main, 1.4, 5.0);
+    if (main.length > 60) {
+      const j = Math.floor(main.length * (0.42 + 0.2 * hash2(3, 1, 500)));
+      const a = main[j], b = main[Math.min(j + 3, main.length - 1)];
+      const dir = Math.atan2(b[1] - a[1], b[0] - a[0]) + Math.PI + (hash2(4, 1, 500) < 0.5 ? 1 : -1) * 0.95;
+      const trib = walkRiver(a[0], a[1], dir, 200 + 180 * hash2(5, 1, 500), 2).reverse();
+      const w = 1.0 + 3.2 * (j / main.length);
+      if (trib.length > 12) rivers.push(trib.map((q, i) => [q[0], q[1], 0.8 + (w * 0.6 - 0.8) * (i / (trib.length - 1))]));
+    }
+    if (hash2(6, 1, 500) < 0.55) {
+      const left = hash2(7, 1, 500) < 0.5;
+      addRiver(walkRiver(left ? -12 : W + 12, H * (0.3 + 0.45 * hash2(8, 1, 500)), left ? 0.1 : Math.PI - 0.1, Math.max(W, H) * 2, 3), 0.9, 3.2);
+    }
+  }
+  const riverDist = (x, y) => {
+    let m = 1e9;
+    for (const r of rivers) for (let i = 0; i < r.length; i += 2) { const dd = (r[i][0] - x) ** 2 + (r[i][1] - y) ** 2; if (dd < m) m = dd; }
+    return Math.sqrt(m);
+  };
+
+  // ---- towns: deterministic greedy pick on a candidate grid, far from icons and rivers, not on mountains ----
+  const want = Math.max(5, Math.min(9, Math.round(W * H / 175000)));
+  const cand = [];
+  for (let gy = 0; gy * 22 < H; gy++) for (let gx = 0; gx * 22 < W; gx++) {
+    const x = gx * 22 + 11 + (hash2(gx, gy, 510) - 0.5) * 12, y = gy * 22 + 11 + (hash2(gx, gy, 511) - 0.5) * 12;
+    if (x < 90 || x > W - 90 || y < 70 || y > H - 80) continue;
+    if (dAt(x, y) < 165 || pAt(x, y) < 70 || mountVal(x, y) > 0.55) continue;
+    const rd = riverDist(x, y);
+    if (rd < 36) continue;
+    cand.push({ x, y, sc: hash2(gx, gy, 512) + (rd < 110 ? 0.25 : 0) });
+  }
+  cand.sort((a, b) => b.sc - a.sc);
+  let towns = [];
+  for (let sp = Math.sqrt(W * H / want) * 0.8; sp >= 140 && towns.length < want; sp *= 0.88) {
+    towns = [];
+    for (const c of cand) {
+      if (towns.length >= want) break;
+      if (towns.every(t => Math.hypot(t.x - c.x, t.y - c.y) > sp)) towns.push({ x: c.x, y: c.y });
+    }
+  }
+  const names = shuffled(TOWN_NAMES, 520);
+  towns.forEach((t, i) => {
+    t.name = names[i % names.length];
+    t.big = hash2(i, 1, 530) < 0.35;
+    t.b = makeTown(i, t.big);
+    t.labDy = 32;
+    stamp(t.x, t.y - 6, t.big ? 44 : 38);
+  });
+
+  // ---- roads: minimum spanning tree (Prim) + a couple of shortcuts, gently curved around icons and peaks ----
+  const roads = [];
+  const n = towns.length, inT = new Array(n).fill(false), edges = [];
+  if (n) inT[0] = true;
+  for (let k = 1; k < n; k++) {
+    let best = null, bd = 1e9;
+    for (let i = 0; i < n; i++) if (inT[i]) for (let j = 0; j < n; j++) if (!inT[j]) {
+      const dd = Math.hypot(towns[i].x - towns[j].x, towns[i].y - towns[j].y);
+      if (dd < bd) { bd = dd; best = [i, j]; }
+    }
+    inT[best[1]] = true; edges.push(best);
+  }
+  const adj = towns.map(() => []);
+  edges.forEach(([i, j]) => { adj[i].push(j); adj[j].push(i); });
+  const pathLen = (s, e) => {      // tree distance between two towns
+    const dist = new Array(n).fill(-1), st = [s]; dist[s] = 0;
+    while (st.length) { const u = st.pop(); for (const v of adj[u]) if (dist[v] < 0) { dist[v] = dist[u] + Math.hypot(towns[u].x - towns[v].x, towns[u].y - towns[v].y); st.push(v); } }
+    return dist[e];
+  };
+  const extra = [];
+  for (let i = 0; i < n; i++) for (let j = i + 1; j < n; j++) {
+    if (edges.some(e => (e[0] === i && e[1] === j) || (e[0] === j && e[1] === i))) continue;
+    const L = Math.hypot(towns[i].x - towns[j].x, towns[i].y - towns[j].y);
+    if (L > 520 || pathLen(i, j) < L * 1.7) continue;
+    extra.push([i, j, L]);
+  }
+  extra.sort((a, b) => a[2] - b[2]);
+  extra.slice(0, 2).forEach(e => edges.push([e[0], e[1]]));
+  edges.forEach(([ia, ib], ei) => {
+    const A = towns[ia], B = towns[ib], a = [A.x, A.y], b = [B.x, B.y];
+    const L = Math.hypot(b[0] - a[0], b[1] - a[1]), px = -(b[1] - a[1]) / L, py = (b[0] - a[0]) / L;
+    const mx = (a[0] + b[0]) / 2, my = (a[1] + b[1]) / 2;
+    let best = null, bc = 1e18;
+    for (const k of [0.08, -0.08, 0.2, -0.2, 0.34, -0.34, 0.5, -0.5]) {
+      const c = [mx + px * L * k, my + py * L * k];
+      let cost = L * (1 + Math.abs(k) * 0.6);
+      for (let i = 1; i < 40; i++) {
+        const q = bez(a, c, b, i / 40);
+        if (q[0] < 20 || q[1] < 20 || q[0] > W - 20 || q[1] > H - 20) cost += 400;
+        const dv = dAt(q[0], q[1]);
+        if (dv < 70) cost += (70 - dv) * 6;
+        if (pAt(q[0], q[1]) < 12) cost += 60;
+        if (mountVal(q[0], q[1]) > 0.5) cost += 30;
+        for (let t = 0; t < n; t++) if (t !== ia && t !== ib && Math.hypot(q[0] - towns[t].x, q[1] - towns[t].y) < 40) cost += 200;
+      }
+      if (cost < bc) { bc = cost; best = c; }
+    }
+    // dense polyline with a slight hand-drawn wobble (none at the ends)
+    const pts = [], M = Math.max(16, Math.ceil(L / 4));
+    for (let i = 0; i <= M; i++) {
+      const u = i / M, q = bez(a, best, b, u), q2 = bez(a, best, b, Math.min(1, u + 0.01)), q1 = bez(a, best, b, Math.max(0, u - 0.01));
+      const tx = q2[0] - q1[0], ty = q2[1] - q1[1], tl = Math.hypot(tx, ty) || 1;
+      const w = (fbm(u * L * 0.012, ei * 4.3, 700) - 0.47) * 16 * Math.sin(Math.PI * u);
+      pts.push([q[0] - ty / tl * w, q[1] + tx / tl * w]);
+    }
+    const cum = polyLen(pts);
+    roads.push({ a: ia, b: ib, pts, cum, len: cum[cum.length - 1] });
+    for (let i = 0; i < pts.length; i += 2) stamp(pts[i][0], pts[i][1], 7);
+  });
+  for (const r of rivers) for (let i = 0; i < r.length; i += 2) stamp(r[i][0], r[i][1], 6 + r[i][2]);
+
+  // ---- town labels (below the town) and farm plots around the towns ----
+  const lctx = ovCtx;
+  lctx.setTransform(1, 0, 0, 1, 0, 0);
+  lctx.font = 'italic 14px Georgia, "Times New Roman", serif';
+  towns.forEach((t, ti) => {
+    t.lw = lctx.measureText(t.name).width;
+    // name below the town, or above it when more roads leave downwards (no road through the name)
+    const hits = dy => {
+      let n = 0;
+      for (const r of roads) if (r.a === ti || r.b === ti) for (const q of r.pts)
+        if (Math.abs(q[0] - t.x) < t.lw / 2 + 8 && q[1] > t.y + dy - 16 && q[1] < t.y + dy + 8) n++;
+      return n;
+    };
+    if (hits(-44) < hits(32)) t.labDy = -44;
+    stampRect(t.x - t.lw / 2 - 6, t.y + t.labDy - 12, t.x + t.lw / 2 + 6, t.y + t.labDy + 6);
+  });
+  const plots = [];
+  towns.forEach((t, ti) => {
+    for (let k = 0; k < 7 && plots.filter(p => p.town === ti).length < 3; k++) {
+      const a = hash2(ti, k, 540) * Math.PI * 2, r = 56 + hash2(ti, k, 541) * 26;
+      const x = t.x + Math.cos(a) * r, y = t.y + Math.sin(a) * r * 0.8;
+      const w = 15 + hash2(ti, k, 542) * 10, h = 9 + hash2(ti, k, 543) * 5, rot = (hash2(ti, k, 544) - 0.5) * 0.9;
+      let free = true;
+      for (const [ox, oy] of [[0, 0], [-w / 2, -h / 2], [w / 2, -h / 2], [-w / 2, h / 2], [w / 2, h / 2]]) {
+        const qx = x + ox * Math.cos(rot) - oy * Math.sin(rot), qy = y + ox * Math.sin(rot) + oy * Math.cos(rot);
+        const gi = Math.round(qy / STEP) * Gw + Math.round(qx / STEP);
+        if (qx < 20 || qy < 20 || qx > W - 20 || qy > H - 20 || ko[gi] || mountVal(qx, qy) > 0.5) { free = false; break; }
+      }
+      if (!free) continue;
+      plots.push({ town: ti, x, y, w, h, rot, kind: hash2(ti, k, 545) < 0.35 ? 1 : 0 });
+      stamp(x, y, Math.max(w, h) * 0.62);
+    }
+  });
+
+  // ---- region names in wide empty areas ----
+  const regions = [];
+  const rnames = shuffled(REGION_NAMES, 550);
+  lctx.font = '600 15px Georgia, "Times New Roman", serif';
+  for (let k = 0; k < 2; k++) {
+    const text = rnames[k], wTxt = text.length * 15 * 0.98;
+    let best = null, bs = 0;
+    for (let gy = 0; gy * 30 < H; gy++) for (let gx = 0; gx * 30 < W; gx++) {
+      const x = gx * 30 + 15, y = gy * 30 + 15;
+      if (x - wTxt / 2 < 50 || x + wTxt / 2 > W - 50 || y < 60 || y > H - 60) continue;
+      let sc = 1e9;
+      for (let i = -2; i <= 2; i++) {
+        const qx = x + i * wTxt / 4;
+        sc = Math.min(sc, dAt(qx, y) - 40, pAt(qx, y));
+        const gi = Math.round(y / STEP) * Gw + Math.round(qx / STEP);
+        if (ko[gi]) sc = -1;
+      }
+      for (const t of towns) sc = Math.min(sc, Math.hypot((t.x - x) / 1.6, t.y - y) - 70);
+      for (const r of regions) sc = Math.min(sc, Math.hypot(r.x - x, r.y - y) - 380);
+      sc += hash2(gx, gy, 560 + k) * 20;
+      if (sc > bs) { bs = sc; best = [x, y]; }
+    }
+    if (best && bs > 30) {
+      regions.push({ x: best[0], y: best[1], text, w: wTxt });
+      stampRect(best[0] - wTxt / 2 - 8, best[1] - 13, best[0] + wTxt / 2 + 8, best[1] + 9);
+    }
+  }
+  WORLD = { towns, roads, rivers, plots, regions, ko };
+  worldMs = performance.now() - t0;
+}
+// the little buildings of a town (relative to its centre; base y = 0 line of the building)
+function makeTown(i, big) {
+  const B = [];
+  B.push({ t: 'church', x: (hash2(i, 2, 531) - 0.5) * 6, y: -5, w: 9, h: 6, r: 4 });
+  const n = (big ? 7 : 4) + Math.floor(hash2(i, 3, 531) * 3);
+  for (let k = 0; k < n; k++) {
+    const a = (k / n) * Math.PI * 2 + hash2(i, k, 532) * 0.8;
+    const rx = (big ? 17 : 13) * (0.75 + 0.3 * hash2(i, k, 533)), ry = (big ? 8 : 6.5) * (0.75 + 0.3 * hash2(i, k, 534));
+    const w = 6 + hash2(i, k, 535) * 3, h = 4 + hash2(i, k, 536) * 2.2;
+    B.push({ t: 'house', x: Math.cos(a) * rx, y: Math.sin(a) * ry + 1, w, h, r: 3 + hash2(i, k, 537) * 1.8 });
+  }
+  if (big || hash2(i, 4, 531) < 0.4) B.push({ t: 'tower', x: (hash2(i, 5, 531) < 0.5 ? -1 : 1) * (big ? 20 : 15), y: -3, w: 5, h: 11, r: 0 });
+  B.sort((a, b) => a.y - b.y);
+  return B;
+}
+function regionAlive(F, r) {
+  for (let i = -2; i <= 2; i++) {
+    const qx = r.x + i * r.w / 4;
+    if (sampleArr(F.d, qx, r.y) < 30 || sampleArr(F.sP, qx, r.y) < 4 || sampleArr(F.sL, qx, r.y) < 20) return false;
+  }
+  return true;
+}
+function computeCompass(F, prev) {
+  const m = ROSE + 40;
+  const cand = [[m, H - m - 8], [W - m, H - m - 8], [m, m + 20], [W - m, m + 20], [W * 0.5, H - m - 8], [m, H * 0.5], [W * 0.5, m + 20], [W - m, H * 0.5],
+    [W * 0.25, H - m - 8], [W * 0.75, H - m - 8], [W * 0.25, m + 20], [W * 0.75, m + 20], [m, H * 0.3], [m, H * 0.7], [W - m, H * 0.7]];
+  if (prev) cand.unshift([prev.x, prev.y]);
+  const lines = WORLD ? WORLD.rivers.concat(WORLD.roads.map(r => r.pts)) : [];
+  const crossed = c => lines.some(L => L.some((q, i) => i % 3 === 0 && Math.hypot(q[0] - c[0], q[1] - c[1]) < ROSE * 1.1));
+  const room = c => {
+    let v = Math.min(sampleArr(F.d, c[0], c[1]), sampleArr(F.sP, c[0], c[1]) + ROSE * 0.4);
+    for (let k = 0; k < 8; k++) { const a = k * Math.PI / 4; v = Math.min(v, sampleArr(F.d, c[0] + Math.cos(a) * ROSE, c[1] + Math.sin(a) * ROSE) + ROSE); }
+    if (WORLD) {
+      for (const t of WORLD.towns) v = Math.min(v, Math.hypot(t.x - c[0], t.y + 10 - c[1]) - 50);
+      for (const r of WORLD.regions) v = Math.min(v, Math.hypot((r.x - c[0]) / Math.max(1, r.w / 150), r.y - c[1]) - 40);
+    }
+    return v;
+  };
+  for (const c of cand) if (room(c) > ROSE + 24 && !crossed(c)) return { x: c[0], y: c[1], r: ROSE };
+  for (const c of cand) if (room(c) > ROSE + 24) return { x: c[0], y: c[1], r: ROSE };
+  let best = null, bv = -1;
+  for (const c of cand) { const v = room(c); if (v > bv) { bv = v; best = c; } }
+  const r = Math.min(ROSE, bv - 24);
+  return r >= 40 ? { x: best[0], y: best[1], r } : null;
+}
+// things derived from a field: which towns / roads / region names are visible, the compass position
+function derive(F, prev) {
+  const Wd = WORLD;
+  if (!Wd || F.blank) { F.alive = []; F.open = []; F.regAlive = []; return; }
+  F.alive = Wd.towns.map(t => sampleArr(F.d, t.x, t.y) > 60 && sampleArr(F.d, t.x, t.y + t.labDy) > 26 && sampleArr(F.d, t.x - t.lw / 2, t.y + t.labDy) > 16 &&
+    sampleArr(F.d, t.x + t.lw / 2, t.y + t.labDy) > 16 && sampleArr(F.sP, t.x, t.y) > 18 && sampleArr(F.sL, t.x, t.y) > 30);
+  F.open = Wd.roads.map(r => {
+    if (!F.alive[r.a] || !F.alive[r.b]) return false;
+    for (let i = 0; i < r.pts.length; i += 3) { const q = r.pts[i]; if (sampleArr(F.d, q[0], q[1]) < 18 || sampleArr(F.sL, q[0], q[1]) < 6) return false; }
+    return true;
+  });
+  F.regAlive = Wd.regions.map(r => regionAlive(F, r));
+  F.compass = computeCompass(F, prev && prev.compass);
+}
+
+/* ======================================================================
+   Shaders
+   ====================================================================== */
+const VS = `#version 300 es
+void main() {
+  vec2 p = vec2(float((gl_VertexID << 1) & 2), float(gl_VertexID & 2));
+  gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);
+}`;
+
+const FS = `#version 300 es
+precision highp float;
+uniform sampler2D uNoise, uFA, uFB, uOA, uOB, uComp;
+uniform vec2 uRes, uCv, uGrid;
+uniform float uScale, uSeed, uStep, uMix;
+uniform vec4 uCompA, uCompB;
+uniform vec4 uCar[${MAX_CARS}];    // x, y, angle, alpha
+uniform vec4 uCarB[${MAX_CARS}];   // facing (-1..1), gait phase, wheel angle, -
+out vec4 o;
+
+const vec3 PAPER = vec3(0.885, 0.805, 0.635), PAPER_D = vec3(0.80, 0.69, 0.50), PAPER_L = vec3(0.935, 0.880, 0.745);
+const vec3 WATER = vec3(0.905, 0.865, 0.745), WATER_D = vec3(0.83, 0.79, 0.665);
+const vec3 INK = vec3(0.22, 0.145, 0.085), SHADE = vec3(0.80, 0.70, 0.56);
+const vec3 BURN = vec3(0.17, 0.09, 0.04);
+
+float hash2(vec2 p) {
+  vec3 p3 = fract(vec3(p.xyx) * 0.1031);
+  p3 += dot(p3, p3.yzx + 33.33);
+  return fract((p3.x + p3.y) * p3.z);
+}
+float ss(float a, float b, float x) { float t = clamp((x - a) / (b - a), 0.0, 1.0); return t * t * (3.0 - 2.0 * t); }
+vec4 N(vec2 p, float scale) { return texture(uNoise, p / scale + uSeed * 0.013); }
+vec3 field(vec2 p) {
+  vec2 uv = (p / uStep + 0.5) / uGrid;
+  return mix(texture(uFA, uv).rgb, texture(uFB, uv).rgb, uMix);
+}
+float segD(vec2 p, vec2 a, vec2 b) { vec2 pa = p - a, ba = b - a; return length(pa - ba * clamp(dot(pa, ba) / dot(ba, ba), 0.0, 1.0)); }
+mat2 rot(float a) { float c = cos(a), s = sin(a); return mat2(c, s, -s, c); }
+float AA;
+float stroke(float d, float w) { return 1.0 - ss(w - AA, w + AA, abs(d)); }
+float fillD(float d) { return 1.0 - ss(-AA, AA, d); }
+float sdBox(vec2 p, vec2 c, vec2 h) { vec2 d = abs(p - c) - h; return length(max(d, 0.0)) + min(max(d.x, d.y), 0.0); }
+float sdEll(vec2 p, vec2 c, vec2 r) { vec2 q = (p - c) / r; return (length(q) - 1.0) * min(r.x, r.y); }
+
+// stipple dots, density 0..1 (static positions; each dot fades in with the density, no popping)
+float stipple(vec2 p, float dens, float G) {
+  if (dens <= 0.0) return 0.0;
+  vec2 c = floor(p / G);
+  float h = hash2(c + 4.1);
+  float k = ss(0.0, 0.12, dens * 0.9 - h);
+  if (k <= 0.0) return 0.0;
+  vec2 l = p - (c + 0.5) * G - (vec2(hash2(c + 0.3), hash2(c + 1.7)) - 0.5) * G * 0.5;
+  float r = 0.45 + 0.25 * hash2(c + 2.9);
+  return fillD(length(l) - r) * k;
+}
+// little horizontal ripple strokes on a lake
+float ripples(vec2 p, float dens) {
+  if (dens <= 0.0) return 0.0;
+  const vec2 G = vec2(26.0, 13.0);
+  float row = floor(p.y / G.y);
+  vec2 q = p + vec2(mod(row, 2.0) * G.x * 0.5, 0.0);
+  vec2 c = floor(q / G);
+  if (hash2(c + 3.3) > dens * 0.55) return 0.0;
+  vec2 l = q - (c + 0.5) * G - (vec2(hash2(c + 1.1), hash2(c + 2.3)) - 0.5) * vec2(10.0, 4.0);
+  float L = 3.5 + 2.0 * hash2(c + 6.1);
+  float d = abs(l.y + 0.6 * sin(l.x * 0.9));
+  return stroke(d, 0.3) * (1.0 - ss(L - 1.0, L, abs(l.x))) * 0.55;
+}
+
+// ---------- a covered wagon drawn by one horse (side view, local coordinates; y down, the road at y = 0) ----------
+void carriage(inout vec3 col, vec2 p, vec4 A, vec4 B) {
+  if (A.w <= 0.0) return;
+  vec2 q = p - A.xy;
+  if (dot(q, q) > 900.0) return;
+  float AA0 = AA;
+  const float SC = 1.0;
+  q = rot(-A.z) * q / SC;
+  float fs = B.x;
+  fs = sign(fs + 1e-4) * max(abs(fs), 0.08);
+  q.x /= fs;
+  q.x -= 1.5;
+  AA = AA0 / SC;
+  float a = A.w;
+  vec3 HORSE = vec3(0.47, 0.33, 0.20), WOOD = vec3(0.56, 0.40, 0.24), CLOTH = vec3(0.95, 0.91, 0.80);
+  // soft ground shadow
+  col = mix(col, col * 0.84, (1.0 - ss(-1.5, 1.5, sdEll(q, vec2(-1.0, 0.6), vec2(17.0, 1.7)))) * 0.45 * a);
+  // legs: trot, diagonal pairs together; the far pair a little lighter
+  float legN = 1e9, legF = 1e9;
+  for (int k = 0; k < 4; k++) {
+    float fk = float(k);
+    vec2 hip = vec2(k < 2 ? 5.0 + fk * 1.1 : 10.6 + (fk - 2.0) * 1.1, -7.3);
+    float ph = B.y + ((k == 0 || k == 3) ? 0.0 : 3.14159);
+    float ang = sin(ph) * 0.34;
+    vec2 knee = hip + vec2(sin(ang), cos(ang)) * 3.8;
+    vec2 foot = knee + vec2(sin(ang * 0.4 - max(0.0, sin(ph + 1.2)) * 0.5), 1.0) * 3.4;
+    foot.y = min(foot.y, 0.2);
+    float d = min(segD(q, hip, knee), segD(q, knee, foot)) - 0.42;
+    if (k == 1 || k == 3) legF = min(legF, d); else legN = min(legN, d);
+  }
+  col = mix(col, mix(INK, HORSE, 0.45), fillD(legF) * a);
+  // horse: body, neck, head, ear, tail
+  float body = sdEll(q, vec2(8.4, -8.7), vec2(4.7, 2.6));
+  float neck = segD(q, vec2(11.6, -9.4), vec2(13.6, -13.0)) - 1.35;
+  float head = segD(q, vec2(13.6, -13.3), vec2(16.6, -11.4)) - 0.95;
+  float ear = segD(q, vec2(13.3, -14.0), vec2(12.9, -15.7)) - 0.35;
+  float horse = min(min(body, neck), min(head, ear));
+  float tail = segD(q, vec2(3.9, -9.6), vec2(2.4 + 0.3 * sin(B.y * 0.5), -5.4)) - 0.5;
+  col = mix(col, INK, fillD(tail) * a);
+  col = mix(col, HORSE, fillD(horse) * a);
+  col = mix(col, HORSE * 0.72, fillD(horse) * ss(-9.5, -7.0, q.y) * 0.5 * a);       // belly shade
+  col = mix(col, INK, stroke(horse, 0.42) * a);
+  col = mix(col, INK, fillD(length(q - vec2(15.0, -12.7)) - 0.4) * a);             // eye
+  col = mix(col, mix(INK, HORSE, 0.2), fillD(legN) * a);
+  // mane
+  col = mix(col, INK, stroke(segD(q, vec2(11.3, -10.6), vec2(13.0, -14.0)), 0.5) * a);
+  // shafts and reins
+  col = mix(col, INK, stroke(segD(q, vec2(-2.6, -5.2), vec2(7.6, -7.8)), 0.38) * a);
+  col = mix(col, INK, stroke(segD(q, vec2(-1.4, -10.0), vec2(14.2, -12.2)), 0.18) * 0.8 * a);
+  // wagon box and the canvas cover with ribs
+  float box = sdBox(q, vec2(-9.0, -5.6), vec2(6.6, 2.1));
+  float cover = max(sdEll(q, vec2(-9.0, -7.6), vec2(6.9, 6.3)), q.y + 7.6);
+  vec3 cc = CLOTH;
+  cc = mix(cc, INK, stroke(fract((q.x + 9.0) / 3.4 + 0.5) * 3.4 - 1.7, 0.22) * 0.7);
+  cc = mix(cc, cc * 0.82, ss(-11.0, -5.0, q.x) * 0.4 + ss(-10.0, -7.6, q.y) * 0.2);
+  col = mix(col, cc, fillD(cover) * a);
+  col = mix(col, INK, stroke(cover, 0.42) * a);
+  vec3 wc = mix(WOOD, WOOD * 0.75, ss(-6.0, -4.0, q.y));
+  wc = mix(wc, INK, stroke(q.y + 5.6, 0.18) * 0.7);
+  col = mix(col, wc, fillD(box) * a);
+  col = mix(col, INK, stroke(box, 0.42) * a);
+  // driver on the front bench
+  float drv = min(length(q - vec2(-1.5, -12.6)) - 1.15, segD(q, vec2(-1.7, -11.2), vec2(-2.3, -7.6)) - 0.85);
+  col = mix(col, mix(INK, WOOD, 0.35), fillD(drv) * a);
+  col = mix(col, INK, fillD(segD(q, vec2(-2.8, -13.6), vec2(-0.2, -13.6)) - 0.35) * a);   // hat brim
+  // wheels with turning spokes
+  for (int k = 0; k < 2; k++) {
+    vec2 wc2 = k == 0 ? vec2(-13.0, -2.7) : vec2(-5.0, -2.7);
+    float R = k == 0 ? 2.9 : 2.6;
+    vec2 l = q - wc2;
+    float r = length(l);
+    if (r > R + 1.0) continue;
+    col = mix(col, mix(col, CLOTH, 0.5), fillD(r - R) * a);
+    float sp = 1e9;
+    for (int j = 0; j < 3; j++) {
+      float an = B.z * (k == 0 ? 0.9 : 1.0) + float(j) * 1.0472;
+      vec2 n = vec2(-sin(an), cos(an));
+      sp = min(sp, abs(dot(l, n)));
+    }
+    col = mix(col, INK, stroke(sp, 0.2) * step(r, R) * a);
+    col = mix(col, INK, stroke(r - R, 0.42) * a);
+    col = mix(col, INK, fillD(r - 0.6) * a);
+  }
+  AA = AA0;
+}
+
+void main() {
+  vec2 fc = vec2(gl_FragCoord.x, uCv.y - gl_FragCoord.y);
+  vec2 p = fc / uScale;
+  AA = 0.5 / uScale;
+  vec3 f = field(p);
+  vec3 fx1 = field(p + vec2(4.0, 0.0)), fx0 = field(p - vec2(4.0, 0.0)), fy1 = field(p + vec2(0.0, 4.0)), fy0 = field(p - vec2(0.0, 4.0));
+  vec2 gP = vec2(fx1.x - fx0.x, fy1.x - fy0.x) / 8.0, gL = vec2(fx1.y - fx0.y, fy1.y - fy0.y) / 8.0;
+  float lfP = ss(0.12, 0.4, length(gP)), lfL = ss(0.12, 0.4, length(gL));
+  vec4 n1 = N(p, 700.0), n2 = N(p + 211.0, 260.0), n3 = N(p, 60.0);
+  float sp = f.x / clamp(length(gP), 0.45, 1.6) + (n3.g - 0.5) * 6.0 * lfP;
+  float sl = f.y / clamp(length(gL), 0.45, 1.6) + ((N(p, 70.0).r - 0.5) * 2.2 + (N(p, 30.0).a - 0.5) * 0.8) * lfL;
+
+  // ---------- parchment ----------
+  vec3 col = mix(PAPER, PAPER_D, ss(0.38, 0.85, n1.g) * 0.8 + (n2.b - 0.5) * 0.35);
+  col = mix(col, PAPER_D * 0.96, ss(0.6, 0.85, N(p + 500.0, 1400.0).r) * 0.35);
+  // the clear plains around the icons: lighter, with a soft stippled edge
+  float plain = 1.0 - ss(-8.0, 2.0, sp);
+  col = mix(col, PAPER_L * (0.985 + 0.03 * n2.r), plain * 0.45);
+  // tea stains
+  float st = N(p + 1000.0, 1300.0).b * 0.85 + N(p + 40.0, 400.0).a * 0.15;
+  col *= 1.0 - 0.035 * ss(0.66, 0.74, st) - 0.045 * ss(0.65, 0.67, st) * ss(0.69, 0.67, st);
+  col = mix(col, col * vec3(0.97, 0.92, 0.84), ss(0.6, 0.75, st) * 0.45);
+  // fibres and grain
+  float fib = texture(uNoise, vec2(p.x / 300.0, p.y / 36.0) + 0.37).r;
+  col *= 1.0 - 0.025 * ss(0.62, 0.72, fib) + 0.015 * ss(0.4, 0.3, fib);
+  col *= 1.0 + (hash2(floor(fc)) - 0.5) * 0.035;
+
+  // ---------- faint graticule ----------
+  const float GS = 200.0;
+  vec2 gq = abs(mod(p - uRes * 0.5 + GS * 0.5, GS) - GS * 0.5);
+  float grid = max(stroke(gq.x, 0.3), stroke(gq.y, 0.3));
+  float ink = grid * mix(0.13, 0.05, plain);
+
+  // stippled edge of the plains
+  float sdens = ss(26.0, 3.0, sp) * ss(-4.0, 2.0, sp) * (0.55 + 0.6 * n2.g) * lfP;
+  ink = max(ink, stipple(p, sdens * 0.75, 4.6) * 0.7);
+  col = mix(col, col * 0.93, ss(14.0, 2.0, sp) * ss(-6.0, 1.0, sp) * lfP * 0.6);
+
+  // ---------- ink layer (symbols, rivers, roads, towns, labels): hidden in the plains and the lakes ----------
+  vec2 uv = fc / uCv;
+  vec3 ov = mix(texture(uOA, uv).rgb, texture(uOB, uv).rgb, uMix);
+  float vis = ss(-12.0, -2.0, f.x) * ss(0.0, 4.0, f.y);
+  col = mix(col, col * SHADE / PAPER, ov.b * vis * 0.55);
+  col = mix(col, mix(col, PAPER_L, 0.45), ov.g * vis);
+  ink = max(ink * (1.0 - ov.g * vis), ov.r * vis);
+
+  // ---------- lakes ----------
+  float softL = AA + 8.0 * (1.0 - lfL);
+  float lake = 1.0 - ss(-softL, softL, sl);
+  vec3 water = mix(WATER_D, WATER, ss(-1.0, -12.0, sl));
+  water *= 1.0 + (n2.r - 0.5) * 0.04;
+  col = mix(col, water, lake);
+  float wl = stroke(sl + 4.8, 0.42) * 0.75;
+  wl = max(wl, stroke(sl + 9.8, 0.36) * 0.5);
+  wl = max(wl, stroke(sl + 16.0, 0.32) * 0.3);
+  wl *= ss(0.0, -2.5, sl) * lfL;
+  float rip = ripples(p, ss(-24.0, -40.0, sl) * ss(14.0, 30.0, f.z));
+  ink = max(ink * (1.0 - lake), max(wl, rip * lake));
+  // the shore: a firm swelling line with a thin outer echo
+  ink = max(ink, stroke(sl, 0.7 + 0.3 * n3.r) * lfL);
+  ink = max(ink, stroke(sl - 2.6, 0.32) * 0.7 * lfL);
+  col = mix(col, INK, ink);
+
+  // ---------- compass rose ----------
+  for (int k = 0; k < 2; k++) {
+    vec4 C = k == 0 ? uCompA : uCompB;
+    if (C.w <= 0.0) continue;
+    vec2 cq = (p - C.xy) / C.z;
+    if (max(abs(cq.x), abs(cq.y)) > 1.12) continue;
+    vec4 cr = texture(uComp, cq / 2.24 + 0.5);
+    col = mix(col, cr.rgb, cr.a * C.w);
+  }
+
+  // ---------- carriages ----------
+  for (int k = 0; k < ${MAX_CARS}; k++) carriage(col, p, uCar[k], uCarB[k]);
+
+  // ---------- folds, vignette, burnt edges ----------
+  float e = min(min(p.x, p.y), min(uRes.x - p.x, uRes.y - p.y));
+  vec2 fd = p - uRes * 0.5 + (vec2(N(p, 300.0).g, N(p, 300.0).b) - 0.5) * 3.0;
+  float wear = 0.5 + 0.5 * N(p, 120.0).a;
+  for (int k = 0; k < 2; k++) {
+    float x = k == 0 ? fd.x : fd.y;
+    col *= 1.0 + (0.045 * ss(2.0, 0.0, x) * ss(-0.5, 0.5, x) - 0.055 * ss(-2.4, 0.0, x) * ss(0.5, -0.5, x)) * wear;
+    col *= 1.0 - 0.02 * (1.0 - ss(0.0, 30.0, abs(x)));
+  }
+  vec2 vq = (p / uRes - 0.5) * vec2(1.25, 1.45);
+  col *= 1.0 - 0.2 * ss(0.35, 1.0, length(vq));
+  float eb = e + (N(p, 220.0).g - 0.5) * 22.0 + (N(p, 70.0).r - 0.5) * 5.0;
+  col = mix(col, col * vec3(0.80, 0.64, 0.46), ss(30.0, 3.0, eb) * 0.7);
+  col = mix(col, BURN, ss(5.0, 0.5, eb));
+  o = vec4(col, 1.0);
+}`;
+
+/* ======================================================================
+   WebGL
+   ====================================================================== */
+const cv = document.getElementById('art');
+const gl = cv.getContext('webgl2', { antialias: false });
+if (!gl) document.getElementById('nogl').style.display = 'grid';
+function program(fs) {
+  const mk = (type, src) => {
+    const s = gl.createShader(type);
+    gl.shaderSource(s, src); gl.compileShader(s);
+    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) { console.error(gl.getShaderInfoLog(s)); throw new Error('shader: ' + gl.getShaderInfoLog(s)); }
+    return s;
+  };
+  const p = gl.createProgram();
+  gl.attachShader(p, mk(gl.VERTEX_SHADER, VS));
+  gl.attachShader(p, mk(gl.FRAGMENT_SHADER, fs));
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) console.error(gl.getProgramInfoLog(p));
+  const U = {};
+  const n = gl.getProgramParameter(p, gl.ACTIVE_UNIFORMS);
+  for (let i = 0; i < n; i++) { const nm = gl.getActiveUniform(p, i).name.replace(/\[0\]$/, ''); U[nm] = gl.getUniformLocation(p, nm); }
+  return { p, U };
+}
+const PR = program(FS);
+gl.bindVertexArray(gl.createVertexArray());
+
+function texParams(wrap, mip) {
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, mip ? gl.LINEAR_MIPMAP_LINEAR : gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, wrap);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, wrap);
+}
+let noiseTex = null;
+function buildNoiseTex() {
+  const { S, d } = makeNoiseImage();
+  noiseTex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, noiseTex);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, S, S, 0, gl.RGBA, gl.UNSIGNED_BYTE, d);
+  gl.generateMipmap(gl.TEXTURE_2D);
+  texParams(gl.REPEAT, true);
+}
+const f32 = new Float32Array(1), u32 = new Uint32Array(f32.buffer);
+function toHalf(v) {
+  f32[0] = v; const x = u32[0];
+  const sign = (x >>> 16) & 0x8000, e = ((x >>> 23) & 0xff) - 112, m = x & 0x7fffff;
+  if (e <= 0) return sign;
+  if (e >= 31) return sign | 0x7c00;
+  return sign | (e << 10) | (m >>> 13);
+}
+
+/* ---------- compass rose: drawn once into its own texture ---------- */
+let compTex = null;
+function buildCompass() {
+  const k = Math.min(Math.max(cv._scale || 1, 1), 2), half = ROSE * 1.12, S = Math.ceil(half * 2 * k);
+  const c = document.createElement('canvas'); c.width = c.height = S;
+  const x = c.getContext('2d');
+  x.setTransform(S / (half * 2), 0, 0, S / (half * 2), S / 2, S / 2);
+  const R = ROSE, ink = '#3a2516', red = '#94402a', paperS = '#efdfba';
+  x.rotate(0.09);
+  x.fillStyle = 'rgba(240,226,192,0.88)'; x.beginPath(); x.arc(0, 0, R * 0.97, 0, 7); x.fill();
+  x.strokeStyle = ink; x.lineWidth = 1.6; x.beginPath(); x.arc(0, 0, R * 0.97, 0, 7); x.stroke();
+  x.lineWidth = 0.6; x.beginPath(); x.arc(0, 0, R * 0.9, 0, 7); x.stroke();
+  x.beginPath(); x.arc(0, 0, R * 0.55, 0, 7); x.stroke();
+  x.setLineDash([1.5, 2.5]); x.beginPath(); x.arc(0, 0, R * 0.62, 0, 7); x.stroke(); x.setLineDash([]);
+  for (let i = 0; i < 64; i++) {
+    const a = i * Math.PI / 32, l = i % 8 === 0 ? 0.88 : i % 2 === 0 ? 0.92 : 0.94;
+    x.lineWidth = i % 8 === 0 ? 1 : 0.5;
+    x.beginPath(); x.moveTo(Math.cos(a) * R * l, Math.sin(a) * R * l); x.lineTo(Math.cos(a) * R * 0.97, Math.sin(a) * R * 0.97); x.stroke();
+  }
+  const point = (a, len, wd, dark, light) => {
+    const tx = Math.cos(a) * len, ty = Math.sin(a) * len, nx = -Math.sin(a) * wd, ny = Math.cos(a) * wd;
+    x.fillStyle = dark; x.beginPath(); x.moveTo(0, 0); x.lineTo(nx, ny); x.lineTo(tx, ty); x.closePath(); x.fill();
+    x.fillStyle = light; x.beginPath(); x.moveTo(0, 0); x.lineTo(-nx, -ny); x.lineTo(tx, ty); x.closePath(); x.fill();
+    x.strokeStyle = ink; x.lineWidth = 0.75;
+    x.beginPath(); x.moveTo(nx, ny); x.lineTo(tx, ty); x.lineTo(-nx, -ny); x.stroke();
+    x.beginPath(); x.moveTo(0, 0); x.lineTo(tx, ty); x.stroke();
+  };
+  for (let i = 0; i < 4; i++) point(Math.PI / 4 + i * Math.PI / 2, R * 0.62, R * 0.1, ink, paperS);
+  for (let i = 0; i < 4; i++) point(-Math.PI / 2 + i * Math.PI / 2, R * 0.9, R * 0.15, i === 0 ? red : ink, paperS);
+  x.fillStyle = paperS; x.beginPath(); x.arc(0, 0, R * 0.08, 0, 7); x.fill();
+  x.strokeStyle = ink; x.lineWidth = 0.8; x.stroke();
+  x.fillStyle = ink; x.beginPath(); x.arc(0, 0, R * 0.03, 0, 7); x.fill();
+  x.fillStyle = ink; x.textAlign = 'center'; x.textBaseline = 'middle';
+  x.font = `italic 600 ${R * 0.17}px Georgia, "Times New Roman", serif`;
+  const lab = (t, a) => { x.save(); x.rotate(a); x.translate(0, -R * 1.06); x.fillText(t, 0, 0); x.restore(); };
+  lab('N', 0); lab('E', Math.PI / 2); lab('S', Math.PI); lab('O', -Math.PI / 2);
+  if (!compTex) compTex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, compTex);
+  gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, c);
+  gl.generateMipmap(gl.TEXTURE_2D);
+  texParams(gl.CLAMP_TO_EDGE, true);
+}
+
+/* ---------- ink layer ---------- */
+const ovCanvas = document.createElement('canvas');
+const ovCtx = ovCanvas.getContext('2d');
+let ovMs = 0;
+const C_INK = 'rgb(255,0,0)', C_KO = 'rgb(0,255,0)';
+const shadeC = v => `rgb(0,0,${v | 0})`;
+const inkC = v => `rgb(${v | 0},0,0)`;
+// glyph helpers: knock out the silhouette (erasing whatever is behind), then shade and ink with 'lighter'
+function knock(x, path) { x.globalCompositeOperation = 'source-over'; x.fillStyle = C_KO; path(); x.fill(); x.globalCompositeOperation = 'lighter'; }
+function drawConifer(x, cx, cy, s, h) {
+  const ht = s * 1.45, r = s * 0.42;
+  const sil = () => { x.beginPath(); x.moveTo(cx, cy - ht); x.lineTo(cx - r, cy - s * 0.32); x.lineTo(cx + r, cy - s * 0.32); x.closePath(); };
+  knock(x, sil);
+  x.fillStyle = shadeC(110); x.beginPath(); x.moveTo(cx, cy - ht); x.lineTo(cx + r, cy - s * 0.32); x.lineTo(cx + r * 0.15, cy - s * 0.32); x.closePath(); x.fill();
+  x.strokeStyle = C_INK; x.lineWidth = 0.85; sil(); x.stroke();
+  x.beginPath(); x.moveTo(cx, cy - s * 0.32); x.lineTo(cx, cy); x.stroke();
+  if (h > 0.5) { x.lineWidth = 0.5; x.beginPath(); x.moveTo(cx - r * 0.55, cy - s * 0.75); x.lineTo(cx + r * 0.55, cy - s * 0.75); x.stroke(); }
+}
+function drawRoundTree(x, cx, cy, s, h) {
+  const r = s * 0.42, ty = cy - s * 0.95;
+  const sil = () => {
+    x.beginPath();
+    x.arc(cx - r * 0.35, ty + r * 0.15, r * 0.7, Math.PI * 0.5, Math.PI * 1.5);
+    x.arc(cx, ty - r * 0.25, r * 0.72, Math.PI * 1.0, Math.PI * 2.0);
+    x.arc(cx + r * 0.35, ty + r * 0.15, r * 0.7, Math.PI * 1.5, Math.PI * 0.5);
+    x.closePath();
+  };
+  knock(x, sil);
+  x.fillStyle = shadeC(100); x.beginPath(); x.arc(cx + r * 0.35, ty + r * 0.15, r * 0.66, -1.2, 1.6); x.fill();
+  x.strokeStyle = C_INK; x.lineWidth = 0.85; sil(); x.stroke();
+  x.beginPath(); x.moveTo(cx, ty + r * 0.75); x.lineTo(cx, cy); x.stroke();
+  if (h > 0.6) { x.lineWidth = 0.5; x.beginPath(); x.arc(cx + r * 0.1, ty, r * 0.35, 0.1, 1.5); x.stroke(); }
+}
+function drawMountain(x, cx, cy, s, h) {
+  const ht = s * (1.05 + 0.3 * h), lx = cx - s, rx = cx + s, tx = cx + (h - 0.5) * s * 0.3;
+  const sil = () => { x.beginPath(); x.moveTo(lx, cy); x.lineTo(tx - s * 0.1, cy - ht); x.lineTo(tx + s * 0.08, cy - ht * 0.96); x.lineTo(rx, cy); x.closePath(); };
+  knock(x, sil);
+  x.fillStyle = shadeC(150);
+  x.beginPath(); x.moveTo(tx + s * 0.08, cy - ht * 0.96); x.lineTo(rx, cy); x.lineTo(tx + s * 0.05, cy); x.closePath(); x.fill();
+  x.strokeStyle = C_INK; x.lineWidth = 1.05;
+  x.beginPath(); x.moveTo(lx, cy); x.lineTo(tx - s * 0.1, cy - ht); x.lineTo(tx + s * 0.08, cy - ht * 0.96); x.lineTo(rx, cy); x.stroke();
+  // hachures on the shadow side, a ridge line and a snow cap notch
+  x.lineWidth = 0.55; x.beginPath();
+  const n = 4 + Math.round(s / 6);
+  for (let i = 1; i <= n; i++) {
+    const t = i / (n + 1), sx = tx + s * 0.08 + (rx - tx - s * 0.08) * t, sy = cy - ht * 0.96 * (1 - t);
+    x.moveTo(sx, sy + 0.6); x.lineTo(sx - s * 0.22 * (1 - t) - 0.8, cy - 0.6);
+  }
+  x.moveTo(tx - s * 0.1, cy - ht); x.lineTo(tx - s * 0.02, cy - ht * 0.55); x.lineTo(tx + s * 0.06, cy - ht * 0.3);
+  x.stroke();
+}
+function drawHill(x, cx, cy, s) {
+  const sil = () => { x.beginPath(); x.moveTo(cx - s * 1.2, cy); x.quadraticCurveTo(cx, cy - s * 1.25, cx + s * 1.2, cy); x.closePath(); };
+  knock(x, sil);
+  x.strokeStyle = C_INK; x.lineWidth = 0.9;
+  x.beginPath(); x.moveTo(cx - s * 1.2, cy); x.quadraticCurveTo(cx, cy - s * 1.25, cx + s * 1.2, cy); x.stroke();
+  x.lineWidth = 0.5; x.beginPath();
+  for (let i = 1; i <= 3; i++) { const t = i / 4, sx = cx + s * 1.1 * t * 0.85, sy = cy - s * 0.62 * (1 - t * t); x.moveTo(sx, sy + 1); x.lineTo(sx + 0.4, cy - 0.5); }
+  x.stroke();
+}
+function drawTuft(x, cx, cy, s) {
+  x.strokeStyle = inkC(170); x.lineWidth = 0.6; x.beginPath();
+  for (let i = -1; i <= 1; i++) { x.moveTo(cx + i * s * 0.35, cy); x.lineTo(cx + i * s * 0.55, cy - s * (i ? 0.6 : 0.85)); }
+  x.stroke();
+}
+function drawBuilding(x, cx, cy, b) {
+  const L = cx + b.x - b.w / 2, R = cx + b.x + b.w / 2, base = cy + b.y, top = base - b.h, mid = cx + b.x;
+  x.lineWidth = 0.75; x.strokeStyle = C_INK;
+  if (b.t === 'tower') {
+    const sil = () => { x.beginPath(); x.rect(L, top, b.w, b.h); };
+    knock(x, sil);
+    x.fillStyle = shadeC(110); x.fillRect(mid + 0.5, top, b.w / 2 - 0.5, b.h);
+    sil(); x.stroke();
+    x.beginPath();                       // crenellations
+    for (let i = 0; i < 3; i++) { const q = L + (i * 2) * b.w / 5; x.rect(q, top - 1.6, b.w / 5, 1.6); }
+    x.stroke();
+    x.fillStyle = C_INK; x.fillRect(mid - 0.5, top + 2.5, 1, 1.6); x.fillRect(mid - 0.7, base - 2.4, 1.4, 2.4);
+    return;
+  }
+  const sil = () => { x.beginPath(); x.moveTo(L, base); x.lineTo(L, top); x.lineTo(L - 0.7, top); x.lineTo(mid, top - b.r); x.lineTo(R + 0.7, top); x.lineTo(R, top); x.lineTo(R, base); x.closePath(); };
+  if (b.t === 'church') {
+    // nave + a tower with a spire on its left end
+    const tw = 4, tl = L - tw + 1, th = b.h + 6;
+    const tsil = () => { x.beginPath(); x.moveTo(tl, base); x.lineTo(tl, base - th); x.lineTo(tl + tw / 2, base - th - 6); x.lineTo(tl + tw, base - th); x.lineTo(tl + tw, base); x.closePath(); };
+    knock(x, sil);
+    x.fillStyle = shadeC(130); x.beginPath(); x.moveTo(mid, top - b.r); x.lineTo(R + 0.7, top); x.lineTo(mid, top); x.closePath(); x.fill();
+    sil(); x.stroke();
+    knock(x, tsil);
+    x.fillStyle = shadeC(130); x.beginPath(); x.moveTo(tl + tw / 2, base - th - 6); x.lineTo(tl + tw, base - th); x.lineTo(tl + tw / 2, base - th); x.closePath(); x.fill();
+    x.strokeStyle = C_INK; tsil(); x.stroke();
+    x.beginPath(); x.moveTo(tl, base - th); x.lineTo(tl + tw, base - th);
+    x.moveTo(tl + tw / 2, base - th - 6); x.lineTo(tl + tw / 2, base - th - 8.5); x.moveTo(tl + tw / 2 - 1, base - th - 7.6); x.lineTo(tl + tw / 2 + 1, base - th - 7.6);
+    x.stroke();
+    x.fillStyle = C_INK; x.beginPath(); x.arc(tl + tw / 2, base - th + 2.5, 0.7, 0, 7); x.fill();
+    x.fillRect(mid - 0.6, base - 2.6, 1.2, 2.6);
+    for (let i = 0; i < 2; i++) x.fillRect(L + 1.4 + i * (b.w - 3.8), top + 1.5, 1, 1.6);
+    return;
+  }
+  knock(x, sil);
+  x.fillStyle = shadeC(120); x.beginPath(); x.moveTo(mid, top - b.r); x.lineTo(R + 0.7, top); x.lineTo(mid, top); x.closePath(); x.fill();
+  x.strokeStyle = C_INK; sil(); x.stroke();
+  x.beginPath(); x.moveTo(L, top); x.lineTo(R, top); x.stroke();
+  x.fillStyle = C_INK; x.fillRect(mid - 0.55, base - 2.1, 1.1, 2.1);
+  if (b.w > 7.2) x.fillRect(L + 1.1, top + 1.2, 0.9, 1.0);
+}
+function renderOverlay(F) {
+  const t0 = performance.now();
+  const k = cv._scale;
+  if (ovCanvas.width !== cv.width || ovCanvas.height !== cv.height) { ovCanvas.width = cv.width; ovCanvas.height = cv.height; }
+  const x = ovCtx;
+  x.setTransform(1, 0, 0, 1, 0, 0);
+  x.globalCompositeOperation = 'source-over';
+  x.fillStyle = '#000'; x.fillRect(0, 0, ovCanvas.width, ovCanvas.height);
+  if (F.blank || !WORLD) { ovMs = performance.now() - t0; return; }
+  x.setTransform(k, 0, 0, k, 0, 0);
+  x.lineCap = 'round'; x.lineJoin = 'round';
+  x.globalCompositeOperation = 'lighter';
+  const Wd = WORLD, ko = Wd.ko, comp = F.compass;
+  const free = (cx, cy, w, h, m) => {
+    const pts = [[cx, cy], [cx, cy - h], [cx - w, cy - h * 0.4], [cx + w, cy - h * 0.4], [cx - w * 0.6, cy], [cx + w * 0.6, cy]];
+    for (const [px, py] of pts) {
+      if (px < 18 || py < 18 || px > W - 18 || py > H - 16) return false;
+      const gi = Math.round(py / STEP) * Gw + Math.round(px / STEP);
+      if (ko[gi]) return false;
+      if (sampleArr(F.sP, px, py) < m || sampleArr(F.sL, px, py) < m + 4 || sampleArr(F.d, px, py) < m + 6) return false;
+    }
+    if (comp && Math.hypot(cx - comp.x, cy - h / 2 - comp.y) < comp.r * 1.12 + w + 4) return false;
+    return true;
+  };
+  // ---- terrain symbols (collected, then drawn back to front) ----
+  const S = [];
+  const det = P.details, fo = P.forest, mthr = 0.98 - 0.26 * det;
+  if (det > 0.001) {
+    const CM = 22;
+    for (let gy = 0; gy * CM < H + CM; gy++) for (let gx = 0; gx * CM < W + CM; gx++) {
+      const cx = (gx + 0.5 + (gy % 2) * 0.5) * CM + (hash2(gx, gy, 302) - 0.5) * 16, cy = (gy + 0.5) * CM + (hash2(gx, gy, 303) - 0.5) * 12;
+      const m = mountVal(cx, cy), h = hash2(gx, gy, 301);
+      if (m > mthr) {
+        if (h > 0.92) continue;
+        const s = 10 + Math.min(1, (m - mthr) * 4) * 8 + hash2(gx, gy, 304) * 3;
+        if (free(cx, cy, s, s * 1.3, 8)) S.push([1, cx, cy, s, hash2(gx, gy, 305)]);
+      } else if (m > mthr - 0.2 && h < det * 0.55) {
+        const s = 6 + hash2(gx, gy, 304) * 3;
+        if (free(cx, cy, s * 1.2, s, 6)) S.push([2, cx, cy, s, 0]);
+      }
+    }
+  }
+  if (fo > 0.001) {
+    const CT = 11, thr = 0.61 - 0.2 * fo;
+    for (let gy = 0; gy * CT < H + CT; gy++) for (let gx = 0; gx * CT < W + CT; gx++) {
+      const cx = (gx + 0.5) * CT + (hash2(gx, gy, 312) - 0.5) * 8 + (gy % 2) * CT * 0.5, cy = (gy + 0.5) * CT + (hash2(gx, gy, 313) - 0.5) * 6;
+      const fv = forestVal(cx, cy), h = hash2(gx, gy, 311);
+      const pr = fv > thr ? 0.25 + 0.7 * sstep(thr, thr + 0.035, fv) : 0.012 * fo;
+      if (h > pr) continue;
+      if (mountVal(cx, cy) > mthr - 0.03 && det > 0.001) continue;
+      const s = 6.4 + hash2(gx, gy, 314) * 2.6;
+      if (!free(cx, cy, s * 0.45, s * 1.45, 5)) continue;
+      const con = conVal(cx, cy) + (hash2(gx, gy, 315) - 0.5) * 0.12 > 0.5;
+      S.push([con ? 3 : 4, cx, cy, s, hash2(gx, gy, 316)]);
+    }
+  }
+  if (det > 0.001) {
+    const CG = 34;
+    for (let gy = 0; gy * CG < H; gy++) for (let gx = 0; gx * CG < W; gx++) {
+      if (hash2(gx, gy, 321) > det * 0.22) continue;
+      const cx = (gx + 0.5) * CG + (hash2(gx, gy, 322) - 0.5) * 20, cy = (gy + 0.5) * CG + (hash2(gx, gy, 323) - 0.5) * 20;
+      if (forestVal(cx, cy) > 0.6 - 0.2 * fo - 0.02 || mountVal(cx, cy) > mthr - 0.2) continue;
+      if (free(cx, cy, 4, 5, 4)) S.push([5, cx, cy, 5 + hash2(gx, gy, 324) * 2, 0]);
+    }
+  }
+  S.sort((a, b) => a[2] - b[2]);
+  for (const [kind, cx, cy, s, h] of S) {
+    if (kind === 1) drawMountain(x, cx, cy, s, h);
+    else if (kind === 2) drawHill(x, cx, cy, s);
+    else if (kind === 3) drawConifer(x, cx, cy, s, h);
+    else if (kind === 4) drawRoundTree(x, cx, cy, s, h);
+    else drawTuft(x, cx, cy, s);
+  }
+  // ---- farm plots of the visible towns ----
+  for (const pl of Wd.plots) {
+    if (!F.alive[pl.town]) continue;
+    x.save(); x.translate(pl.x, pl.y); x.rotate(pl.rot);
+    x.strokeStyle = inkC(150); x.lineWidth = 0.6;
+    x.strokeRect(-pl.w / 2, -pl.h / 2, pl.w, pl.h);
+    x.beginPath();
+    if (pl.kind === 0) for (let yy = -pl.h / 2 + 2; yy < pl.h / 2 - 0.5; yy += 2) { x.moveTo(-pl.w / 2 + 1, yy); x.lineTo(pl.w / 2 - 1, yy); }
+    x.stroke();
+    if (pl.kind === 1) {
+      x.fillStyle = inkC(170);
+      for (let yy = -pl.h / 2 + 2; yy < pl.h / 2 - 1; yy += 2.6) for (let xx = -pl.w / 2 + 2; xx < pl.w / 2 - 1; xx += 2.4) x.fillRect(xx - 0.45, yy - 0.45, 0.9, 0.9);
+    }
+    x.restore();
+  }
+  // ---- rivers: ink banks, then the water knocked out between them (skipped right next to the icons) ----
+  const runs = [];
+  for (const r of Wd.rivers) {
+    let cur = [];
+    for (const q of r) {
+      if (sampleArr(F.d, q[0], q[1]) > 12 + q[2]) cur.push(q);
+      else { if (cur.length > 1) runs.push(cur); cur = []; }
+    }
+    if (cur.length > 1) runs.push(cur);
+  }
+  const strokeRuns = (extra, col, op) => {
+    x.globalCompositeOperation = op; x.strokeStyle = col;
+    for (const run of runs) for (let i = 0; i < run.length - 1; i += 4) {
+      const j = Math.min(i + 5, run.length - 1);
+      x.lineWidth = run[i][2] + extra;
+      x.beginPath(); x.moveTo(run[i][0], run[i][1]);
+      for (let m = i + 1; m <= j; m++) x.lineTo(run[m][0], run[m][1]);
+      x.stroke();
+    }
+  };
+  strokeRuns(2.0, C_INK, 'source-over');
+  strokeRuns(0, C_KO, 'source-over');
+  x.globalCompositeOperation = 'lighter';
+  // a faint flow line in the wider parts
+  x.strokeStyle = inkC(70); x.lineWidth = 0.45; x.setLineDash([6, 9]);
+  for (const run of runs) {
+    x.beginPath(); let on = false;
+    for (const q of run) { if (q[2] > 2.6) { if (!on) { x.moveTo(q[0], q[1]); on = true; } else x.lineTo(q[0], q[1]); } }
+    x.stroke();
+  }
+  x.setLineDash([]);
+  // ---- dotted roads ----
+  x.strokeStyle = inkC(215); x.lineWidth = 1.05; x.setLineDash([2.6, 3.4]);
+  Wd.roads.forEach((r, i) => {
+    if (!F.open[i]) return;
+    const A = Wd.towns[r.a], B = Wd.towns[r.b];
+    x.beginPath(); let on = false;
+    for (const q of r.pts) {
+      if (Math.hypot(q[0] - A.x, q[1] - A.y) < 22 || Math.hypot(q[0] - B.x, q[1] - B.y) < 22) { on = false; continue; }
+      if (!on) { x.moveTo(q[0], q[1]); on = true; } else x.lineTo(q[0], q[1]);
+    }
+    x.stroke();
+  });
+  x.setLineDash([]);
+  // ---- towns and their names ----
+  x.textAlign = 'center'; x.textBaseline = 'alphabetic';
+  Wd.towns.forEach((t, i) => {
+    if (!F.alive[i]) return;
+    x.save(); x.translate(t.x, t.y); x.scale(TS, TS);
+    for (const b of t.b) drawBuilding(x, 0, 0, b);
+    x.strokeStyle = inkC(120); x.lineWidth = 0.45; x.beginPath();
+    x.moveTo(-(t.big ? 19 : 15), 3.6); x.lineTo(t.big ? 19 : 15, 3.6); x.stroke();
+    x.restore();
+    // a light cartouche behind the name: erases road dots / trees under the letters
+    x.globalCompositeOperation = 'source-over'; x.fillStyle = 'rgb(0,90,0)';
+    x.fillRect(t.x - t.lw / 2 - 3, t.y + t.labDy - 12, t.lw + 6, 16);
+    x.font = 'italic 14px Georgia, "Times New Roman", serif';
+    x.globalCompositeOperation = 'source-over'; x.strokeStyle = C_KO; x.lineWidth = 3.5; x.strokeText(t.name, t.x, t.y + t.labDy);
+    x.globalCompositeOperation = 'lighter'; x.fillStyle = inkC(240); x.fillText(t.name, t.x, t.y + t.labDy);
+  });
+  // ---- region names (spaced capitals) ----
+  x.font = '600 15px Georgia, "Times New Roman", serif';
+  Wd.regions.forEach((r, i) => {
+    if (!F.regAlive[i]) return;
+    const ch = [...r.text], step = r.w / ch.length;
+    ch.forEach((c, j) => {
+      const cx = r.x - r.w / 2 + (j + 0.5) * step;
+      x.globalCompositeOperation = 'source-over'; x.strokeStyle = C_KO; x.lineWidth = 3; x.strokeText(c, cx, r.y + 5);
+      x.globalCompositeOperation = 'lighter'; x.fillStyle = inkC(185); x.fillText(c, cx, r.y + 5);
+    });
+  });
+  x.globalCompositeOperation = 'source-over';
+  ovMs = performance.now() - t0;
+}
+
+/* ---------- two field textures (RGBA16F: plain, lake, icon distance) + two ink layers ---------- */
+const ftex = [null, null], otex = [null, null], slotF = [null, null];
+let fromI = 0, toI = 0, FA = null, FB = null;
+let morphT0 = -1e9, morphDur = MORPH_MS, curMix = 1;
+function allocField() {
+  for (let i = 0; i < 2; i++) {
+    if (ftex[i]) gl.deleteTexture(ftex[i]);
+    ftex[i] = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, ftex[i]);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA16F, Gw, Gh, 0, gl.RGBA, gl.HALF_FLOAT, null);
+    texParams(gl.CLAMP_TO_EDGE, false);
+    if (!otex[i]) otex[i] = gl.createTexture();
+    slotF[i] = null;
+  }
+}
+function uploadOverlay(i, Fd) {
+  renderOverlay(Fd);
+  gl.bindTexture(gl.TEXTURE_2D, otex[i]);
+  gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, ovCanvas);
+  texParams(gl.CLAMP_TO_EDGE, false);
+}
+// ink layer currently on screen = mix(from, to, m): blended on the GPU into the spare texture, which becomes slot i
+const BLIT = `#version 300 es
+precision highp float;
+uniform sampler2D uA, uB;
+uniform float uM;
+uniform vec2 uSize;
+out vec4 o;
+void main() { vec2 uv = gl_FragCoord.xy / uSize; o = mix(texture(uA, uv), texture(uB, uv), uM); }`;
+let BP = null, fbo = null, spare = null;
+function blendOverlay(i, m) {
+  if (!BP) { BP = program(BLIT); fbo = gl.createFramebuffer(); }
+  if (!spare) spare = gl.createTexture();
+  const w = ovCanvas.width, h = ovCanvas.height;
+  gl.bindTexture(gl.TEXTURE_2D, spare);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+  texParams(gl.CLAMP_TO_EDGE, false);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, spare, 0);
+  gl.viewport(0, 0, w, h);
+  gl.useProgram(BP.p);
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, otex[fromI]); gl.uniform1i(BP.U.uA, 0);
+  gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, otex[toI]); gl.uniform1i(BP.U.uB, 1);
+  gl.uniform1f(BP.U.uM, m); gl.uniform2f(BP.U.uSize, w, h);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  const old = otex[i]; otex[i] = spare; spare = old;
+}
+function uploadField(i, Fd, blendM) {
+  const n = Gw * Gh, d = new Uint16Array(n * 4);
+  for (let k = 0; k < n; k++) {
+    d[k * 4] = toHalf(Math.max(-S_CLAMP, Math.min(Fd.sP[k], S_CLAMP)));
+    d[k * 4 + 1] = toHalf(Math.max(-S_CLAMP, Math.min(Fd.sL[k], S_CLAMP)));
+    d[k * 4 + 2] = toHalf(Fd.d[k]);
+  }
+  gl.bindTexture(gl.TEXTURE_2D, ftex[i]);
+  gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, Gw, Gh, gl.RGBA, gl.HALF_FLOAT, d);
+  if (blendM !== undefined && otex[fromI] && otex[toI]) blendOverlay(i, blendM);
+  else uploadOverlay(i, Fd);
+  slotF[i] = Fd;
+}
+
+let icons = [];
+const iconRects = () => icons.map(ic => ({ cx: ic.x + ic.w / 2, cy: ic.y + ic.h / 2, hw: ic.w / 2 - 4, hh: ic.h / 2 - 2 }));
+// Field currently on screen (from -> to blended by curMix): a new transition must start from it, not from the
+// previous target, or the scenery jumps when icons move again while a transition is still running.
+function blendFields(A, B, m) {
+  const out = {};
+  for (const k in B) {
+    const a = A && A[k], b = B[k];
+    if (!(b instanceof Float32Array)) continue;                  // towns / roads / compass are rebuilt below
+    if (!(a instanceof Float32Array) || a.length !== b.length) return null;
+    const r = new Float32Array(b.length);
+    if (k === 'sP' || k === 'sL') {   // blend what the shader blends: the clamped channels
+      const C = S_CLAMP, cl = v => v > C ? C : v < -C ? -C : v;
+      for (let i = 0; i < b.length; i++) { const x = cl(a[i]); r[i] = x + (cl(b[i]) - x) * m; }
+    } else for (let i = 0; i < b.length; i++) r[i] = a[i] + (b[i] - a[i]) * m;
+    out[k] = r;
+  }
+  if (!out.sP) return null;
+  // its ink layer is blended on the GPU (blendOverlay); visibility flags from the blend, compass: the more visible one
+  derive(out, null);
+  out.compass = m < 0.5 ? A.compass : B.compass;
+  return out;
+}
+function commit(fromEmpty = false) {
+  const nf = computeField(iconRects());
+  if (fromEmpty || !WORLD) { buildWorld(nf); resetCars(); }
+  derive(nf, FB);
+  const target = 1 - toI;
+  if (fromEmpty) { FA = blankField(); FA.compass = nf.compass; uploadField(toI, FA); }
+  else if (FA && FB && curMix < 0.999 && (FA = blendFields(FA, FB, Math.max(0, curMix)))) uploadField(toI, FA, Math.max(0, curMix));
+  else FA = FB || nf;
+  FB = nf;
+  uploadField(target, FB);
+  fromI = toI; toI = target;
+  morphT0 = performance.now();
+  morphDur = fromEmpty ? 2600 : MORPH_MS;
+  curMix = 0;
+}
+function refresh() {
+  if (iconsSeen) { FB = computeField(iconRects()); buildWorld(FB); derive(FB, null); }
+  else FB = blankField();
+  FA = FB;
+  uploadField(toI, FB);
+  fromI = toI; morphT0 = -1e9; curMix = 1;
+  resetCars();
+}
+
+/* ======================================================================
+   Life: horse carriages on the open roads
+   ====================================================================== */
+const carU = new Float32Array(MAX_CARS * 4), carBU = new Float32Array(MAX_CARS * 4);
+let cars = [], spawnT = 1.5;
+function resetCars() { cars = []; spawnT = 1.5; }
+function roadAt(r, t) {
+  t = Math.min(Math.max(t, 0), r.len);
+  let lo = 1, hi = r.cum.length - 1;
+  while (lo < hi) { const m = (lo + hi) >> 1; if (r.cum[m] < t) lo = m + 1; else hi = m; }
+  const i = lo, a = r.pts[i - 1], b = r.pts[i], seg = r.cum[i] - r.cum[i - 1] || 1, u = (t - r.cum[i - 1]) / seg;
+  // a smoother tangent over a few points
+  const p0 = r.pts[Math.max(0, i - 3)], p1 = r.pts[Math.min(r.pts.length - 1, i + 2)];
+  return [a[0] + (b[0] - a[0]) * u, a[1] + (b[1] - a[1]) * u, p1[0] - p0[0], p1[1] - p0[1]];
+}
+const END = 34;     // carriages stop this far from a town's centre
+function openRoads() { return FB && FB.open ? WORLD.roads.map((r, i) => i).filter(i => FB.open[i]) : []; }
+function spawnCar() {
+  const open = openRoads().filter(i => !cars.some(c => c.road === i));
+  if (!open.length) return false;
+  const ri = open[Math.floor(Math.random() * open.length)], r = WORLD.roads[ri];
+  const dir = Math.random() < 0.5 ? 1 : -1;
+  const c = { road: ri, dir, t: dir > 0 ? END : r.len - END, wait: 1 + Math.random() * 2, alpha: 0, out: false,
+    x: 0, y: 0, ang: 0, face: 1, faceS: 1, gait: Math.random() * 6, wheel: 0, init: false };
+  cars.push(c);
+  return true;
+}
+function stepLife(t, dt) {
+  const show = P.carriages >= 0.5 && WORLD && FB && !FB.blank;
+  const open = show ? openRoads() : [];
+  const want = show ? Math.min(open.length >= 5 ? 3 : 2, open.length) : 0;
+  // fade out the extra ones, or those whose road closed (an icon came over it)
+  let active = 0;
+  for (const c of cars) { if (!show || !FB.open[c.road]) c.out = true; if (!c.out && ++active > want) c.out = true; }
+  if (active < want && curMix > 0.99) {
+    spawnT -= dt;
+    if (spawnT <= 0) { spawnCar(); spawnT = 5 + Math.random() * 6; }
+  }
+  for (const c of cars) {
+    const r = WORLD && WORLD.roads[c.road];
+    if (!r) { c.alpha = 0; c.out = true; continue; }
+    c.alpha = c.out ? Math.max(0, c.alpha - dt / 1.2) : Math.min(1, c.alpha + dt / 1.5);
+    let moving = false;
+    if (c.wait > 0) {
+      c.wait -= dt;
+      if (c.wait <= 0 && !c.out) {
+        // in town: take another open road from here (not the same one if there is a choice), else turn back
+        const town = c.dir > 0 ? r.b : r.a;
+        const opts = openRoads().filter(i => i !== c.road && (WORLD.roads[i].a === town || WORLD.roads[i].b === town) && !cars.some(o => o !== c && o.road === i && !o.out));
+        if (opts.length && Math.random() < 0.8) {
+          const ni = opts[Math.floor(Math.random() * opts.length)], nr = WORLD.roads[ni];
+          c.road = ni; c.dir = nr.a === town ? 1 : -1; c.t = c.dir > 0 ? END : nr.len - END;
+        } else c.dir = -c.dir;
+      }
+    } else {
+      const v = 9;
+      c.t += c.dir * v * dt; moving = true;
+      c.gait += dt * 5.5; c.wheel += dt * v / 2.7;
+      if (c.t <= END || c.t >= r.len - END) { c.t = Math.min(Math.max(c.t, END), r.len - END); c.wait = 3 + Math.random() * 4; }
+    }
+    const rr = WORLD.roads[c.road], q = roadAt(rr, c.t);
+    const vx = q[2] * c.dir, vy = q[3] * c.dir, vl = Math.hypot(vx, vy) || 1;
+    if (Math.abs(vx) > 0.25 * vl) c.face = vx > 0 ? 1 : -1;
+    // turn smoothly: the side view squashes through zero when it flips, the tilt follows the road gently
+    const k = Math.min(1, dt * 2.2);
+    c.faceS += Math.max(-dt * 1.6, Math.min(dt * 1.6, c.face - c.faceS));
+    let ta = Math.atan2(vy * c.face, vx * c.face);
+    ta = Math.max(-0.38, Math.min(0.38, ta));
+    if (!c.init) { c.ang = ta; c.faceS = c.face; c.init = true; }
+    c.ang += (ta - c.ang) * k;
+    c.x = q[0]; c.y = q[1] + 1;
+    if (!moving) c.gait += 0;
+  }
+  cars = cars.filter(c => !(c.out && c.alpha <= 0));
+  carU.fill(0); carBU.fill(0);
+  cars.slice(0, MAX_CARS).forEach((c, i) => {
+    carU.set([c.x, c.y, c.ang, c.alpha], i * 4);
+    carBU.set([c.faceS, c.gait, c.wheel, 0], i * 4);
+  });
+}
+
+/* ======================================================================
+   Frame loop
+   ====================================================================== */
+function resize() {
+  W = innerWidth; H = innerHeight;
+  const scale = PREVIEW ? 0.45 : Math.min(devicePixelRatio || 1, P.quality);
+  const box = cv.getBoundingClientRect();
+  cv.width = Math.round((box.width || W) * scale); cv.height = Math.round((box.height || H) * scale); cv._scale = scale;
+  Gw = Math.ceil(W / STEP) + 2; Gh = Math.ceil(H / STEP) + 2;
+  buildNoise();
+  allocField();
+  buildCompass();
+  WORLD = null;
+  resetCars();
+}
+
+const T0 = performance.now();
+let lastT = 0, fpsEMA = 0, frameN = 0, frameMs = 0, lifeT = 0;
+let paused = false;
+function frame(now) {
+  requestAnimationFrame(frame);
+  if (paused) { lastT = 0; return; }
+  if (P.cap30 && now - lastT < 31) return;
+  const dt = lastT ? Math.min((now - lastT) / 1000, 0.1) : 0.03;
+  if (lastT) fpsEMA = fpsEMA ? fpsEMA * 0.9 + (1 / dt) * 0.1 : 1 / dt;
+  lastT = now;
+  const sdt = dt * P.speed;
+  lifeT += sdt;
+  stepLife(lifeT, sdt);
+  draw(now);
+  frameN++;
+}
+function draw(now) {
+  const t0 = performance.now();
+  const e = Math.min(Math.max((now - morphT0) / morphDur, 0), 1);
+  curMix = e < 0.5 ? 2 * e * e : 1 - Math.pow(-2 * e + 2, 2) / 2;
+  const { p, U } = PR;
+  gl.useProgram(p);
+  gl.viewport(0, 0, cv.width, cv.height);
+  const tex = [noiseTex, ftex[fromI], ftex[toI], otex[fromI], otex[toI], compTex];
+  ['uNoise', 'uFA', 'uFB', 'uOA', 'uOB', 'uComp'].forEach((nm, i) => {
+    gl.activeTexture(gl.TEXTURE0 + i); gl.bindTexture(gl.TEXTURE_2D, tex[i]); gl.uniform1i(U[nm], i);
+  });
+  gl.uniform2f(U.uRes, cv.width / cv._scale, cv.height / cv._scale);
+  gl.uniform2f(U.uCv, cv.width, cv.height);
+  gl.uniform2f(U.uGrid, Gw, Gh);
+  gl.uniform1f(U.uScale, cv._scale);
+  gl.uniform1f(U.uSeed, (seed % 997) * 0.37);
+  gl.uniform1f(U.uStep, STEP);
+  gl.uniform1f(U.uMix, curMix);
+  const ca = slotF[fromI] && slotF[fromI].compass, cb = slotF[toI] && slotF[toI].compass;
+  const same = ca && cb && Math.abs(ca.x - cb.x) + Math.abs(ca.y - cb.y) + Math.abs(ca.r - cb.r) < 0.5;
+  gl.uniform4f(U.uCompA, ca ? ca.x : 0, ca ? ca.y : 0, ca ? ca.r : 1, ca && !same ? 1 - curMix : 0);
+  gl.uniform4f(U.uCompB, cb ? cb.x : 0, cb ? cb.y : 0, cb ? cb.r : 1, cb ? (same ? 1 : curMix) : 0);
+  gl.uniform4fv(U.uCar, carU);
+  gl.uniform4fv(U.uCarB, carBU);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+  frameMs = performance.now() - t0;
+}
+
+/* ======================================================================
+   Settings / hosted mode
+   ====================================================================== */
+let iconsSeen = !(WALL || PREVIEW);
+function reseed(v) {
+  seed = v; buildNoise();
+  if (!iconsSeen) { refresh(); return; }
+  commit(true);
+}
+function applySettings(v) {
+  if (typeof v.seed === 'number' && v.seed !== seed) reseed(v.seed);
+  let field = false, over = false;
+  for (const k in v) {
+    if (!KEYS[k] || typeof v[k] !== 'number' || !isFinite(v[k]) || P[k] === v[k]) continue;
+    const [lo, hi] = KEYS[k];
+    P[k] = Math.min(Math.max(v[k], lo), hi);
+    if (k === 'sigma') field = true;
+    if (k === 'forest' || k === 'details') over = true;
+  }
+  if (field && FB && !FB.blank) commit();             // plain / lake size: smooth transition (towns stay put)
+  else if (over) for (let i = 0; i < 2; i++) if (slotF[i]) uploadOverlay(i, slotF[i]);
+}
+function drawGhosts() {
+  const box = document.getElementById('ghosts');
+  if (box) box.innerHTML = icons.map(ic => `<div class="ghost" style="left:${ic.x}px;top:${ic.y}px;width:${ic.w}px;height:${ic.h}px"><i></i><b></b></div>`).join('');
+}
+function startHostedMode() {
+  if (PREVIEW) {
+    document.body.classList.add('preview');
+    const g = document.createElement('div'); g.id = 'ghosts'; document.body.appendChild(g);
+  }
+  icons = [];
+  refresh();                                     // blank parchment until we know where the icons are
+  let first = true;
+  const handle = m => {
+    if (!m || typeof m !== 'object') return;
+    if (m.t === 'pause') { paused = PREVIEW ? false : !!m.v; return; }
+    if (m.t === 'settings') { applySettings(m.v || {}); return; }
+    if (m.t === 'reset') { applySettings(Object.assign({}, DEFAULTS, m.v || {})); return; }
+    if (m.t !== 'icons') return;
+    const k = window.devicePixelRatio || 1;
+    icons = m.vis && Array.isArray(m.r) ? m.r.map(([l, t, r, b]) => ({ x: l / k, y: t / k, w: (r - l) / k, h: (b - t) / k })) : [];
+    if (PREVIEW) drawGhosts();
+    iconsSeen = true;
+    commit(first);                                // first time: the map draws itself in; later: smooth transition
+    first = false;
+  };
+  if (PREVIEW) {
+    addEventListener('message', ev => { if (ev.source === parent) { try { handle(typeof ev.data === 'string' ? JSON.parse(ev.data) : ev.data); } catch (e) {} } });
+    parent.postMessage(JSON.stringify({ t: 'ready' }), '*');
+    return;
+  }
+  const host = window.chrome && window.chrome.webview;
+  if (!host) return;
+  host.addEventListener('message', ev => { try { handle(JSON.parse(ev.data)); } catch (e) { console.error(e); } });
+  host.postMessage('ready');
+}
+function startDemo() {
+  const list = [];
+  for (let r = 0; r < 6; r++) list.push({ x: W - 90, y: 10 + r * 100, w: 76, h: 92 });
+  list.push({ x: W * 0.22, y: H * 0.3, w: 76, h: 92 }, { x: W * 0.45, y: H * 0.62, w: 76, h: 92 }, { x: W * 0.52, y: H * 0.18, w: 76, h: 92 });
+  icons = list;
+  commit(true);
+}
+
+let resizeT = 0;
+addEventListener('resize', () => {
+  clearTimeout(resizeT);
+  resizeT = setTimeout(() => { resize(); refresh(); }, 100);
+});
+
+window.__dbg = { P, stats: () => ({ fieldMs, ovMs, worldMs, frameMs, fps: fpsEMA, towns: WORLD && WORLD.towns.length, roads: WORLD && WORLD.roads.length, cars: cars.map(c => [Math.round(c.x), Math.round(c.y), c.wait > 0 ? 'w' : 'm']) }) };
+resize();
+buildNoiseTex();
+if (WALL || PREVIEW) startHostedMode();
+else startDemo();
+requestAnimationFrame(frame);
+</script>
+<script src="share.js"></script>
+</body>
+</html>

@@ -1,0 +1,963 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Iconland · Pond</title>
+<!--
+  Iconland · Pond theme (top-down soft watercolor pond; pure WebGL2, one full-screen pass)
+  - Land field (CPU, only when icons change): gaussian metaballs + noise warp -> signed distance s (<0 = grassy land
+    around the icons, >0 = pond). The texture carries s clamped near the shore (for even cross-fades) and an
+    unclamped copy used as water depth.
+  - Water: sandy / pebbly bottom seen through clear green-teal shallows, darker glazes toward the middle,
+    caustics, wind ripples, reflections of drifting clouds, ring ripples.
+  - Lily pads (with occasional flowers) are procedural on a cell grid and shrink away from the shore.
+  - Reed tufts along the shore (CPU picks spots on the shoreline, passed as a uniform array).
+  - Life: water striders gliding with little rings, dragonflies darting and hovering, the odd fish "plop".
+-->
+<style>
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #3f7a6a; }
+  #art { position: fixed; inset: 0; width: 100vw; height: 100vh; display: block; }
+  /* preview mode (?preview=1, settings window): translucent boxes show where the real icons are */
+  #ghosts { position: fixed; inset: 0; pointer-events: none; display: none; }
+  body.preview #ghosts { display: block; }
+  .ghost { position: absolute; }
+  .ghost i { position: absolute; left: 50%; top: 4px; width: 48px; height: 48px; margin-left: -24px; border-radius: 9px;
+    background: rgba(255,255,255,.55); box-shadow: 0 1px 3px rgba(0,0,0,.25); }
+  .ghost b { position: absolute; left: 14%; right: 14%; top: 60px; height: 10px; border-radius: 5px; background: rgba(255,255,255,.75); }
+  #nogl { position: fixed; inset: 0; display: none; place-items: center; color: #fff; font: 16px system-ui, sans-serif; }
+</style>
+</head>
+<body>
+<canvas id="art"></canvas>
+<div id="nogl">WebGL2 is not available.</div>
+<script>
+'use strict';
+
+/* ======================================================================
+   Parameters
+   ====================================================================== */
+const CELL_W = 76, CELL_H = 100, GRID_X0 = 4, GRID_Y0 = 6, TASKBAR = 0;
+const STEP = 5;
+const MORPH_MS = 1800;
+const S_CLAMP = 60, D_CLAMP = 600;        // shore channel clamp / depth channel clamp (px)
+
+const QS = new URLSearchParams(location.search);
+const WALL = QS.has('wallpaper');        // real desktop: messages from the host
+const PREVIEW = QS.has('preview');       // settings window preview (iframe): messages from the parent page
+// Defaults must match themes.json
+const P = {
+  sigma: 70, warp: 40, lilies: 1, speed: 1,
+  quality: 2, cap30: true,
+};
+const DEFAULTS = Object.assign({}, P);
+const KEYS = { sigma: [40, 200], warp: [0, 100], lilies: [0, 2], speed: [0, 3] };
+
+/* ======================================================================
+   Random / noise helpers (CPU)
+   ====================================================================== */
+let seed = (Math.random() * 1e6) | 0;
+function hash2(x, y, k = 0) {
+  let h = Math.imul(x | 0, 374761393) ^ Math.imul(y | 0, 668265263) ^ Math.imul(seed + k, 2246822519);
+  h = Math.imul(h ^ (h >>> 13), 1274126177);
+  return ((h ^ (h >>> 16)) >>> 0) / 4294967296;
+}
+function vnoise(x, y, k = 0) {
+  const ix = Math.floor(x), iy = Math.floor(y), fx = x - ix, fy = y - iy;
+  const ux = fx * fx * (3 - 2 * fx), uy = fy * fy * (3 - 2 * fy);
+  const a = hash2(ix, iy, k), b = hash2(ix + 1, iy, k), c = hash2(ix, iy + 1, k), d = hash2(ix + 1, iy + 1, k);
+  return a + (b - a) * ux + (c - a) * uy + (a - b - c + d) * ux * uy;
+}
+function fbm(x, y, k = 0) {
+  let a = 0.5, s = 0;
+  for (let i = 0; i < 4; i++) { s += a * vnoise(x, y, k + i * 7); x = x * 2.03 + 17.1; y = y * 2.03 + 17.1; a *= 0.5; }
+  return s;
+}
+// Tileable noise texture (fixed, does not depend on the seed): 4 channels of fbm at different scales
+function tileNoise(x, y, px, py, k) {
+  const ix = Math.floor(x), iy = Math.floor(y), fx = x - ix, fy = y - iy;
+  const ux = fx * fx * (3 - 2 * fx), uy = fy * fy * (3 - 2 * fy);
+  const m = (v, p) => ((v % p) + p) % p;
+  const x0 = m(ix, px), x1 = m(ix + 1, px), y0 = m(iy, py), y1 = m(iy + 1, py);
+  const h = (a, b) => { let v = Math.imul(a, 374761393) ^ Math.imul(b, 668265263) ^ Math.imul(k, 2246822519); v = Math.imul(v ^ (v >>> 13), 1274126177); return ((v ^ (v >>> 16)) >>> 0) / 4294967296; };
+  const a = h(x0, y0), b = h(x1, y0), c = h(x0, y1), d = h(x1, y1);
+  return a + (b - a) * ux + (c - a) * uy + (a - b - c + d) * ux * uy;
+}
+function makeNoiseImage() {
+  const S = 256, d = new Uint8Array(S * S * 4);
+  const chans = [[8, 16, 32, 64], [8, 16, 32, 64], [4, 8, 16, 32], [16, 32, 64, 128]];
+  for (let y = 0; y < S; y++) for (let x = 0; x < S; x++) {
+    const u = x / S, v = y / S, i = (y * S + x) * 4;
+    for (let c = 0; c < 4; c++) {
+      let s = 0, w = 0.5, tw = 0;
+      for (let j = 0; j < chans[c].length; j++) { const p = chans[c][j]; s += w * tileNoise(u * p, v * p, p, p, 100 + c * 50 + j * 13); tw += w; w *= 0.5; }
+      d[i + c] = Math.min(Math.max((s / tw - 0.5) * 1.9 + 0.5, 0), 1) * 255;
+    }
+  }
+  return { S, d };
+}
+const sstep = (a, b, x) => { const t = Math.min(Math.max((x - a) / (b - a), 0), 1); return t * t * (3 - 2 * t); };
+
+/* ======================================================================
+   Land field (CPU): s = signed distance to the shoreline (<0 land around icons, >0 pond)
+   ====================================================================== */
+let W = innerWidth, H = innerHeight, Gw = 1, Gh = 1, NZ = null;
+function buildNoise() {
+  const N = Gw * Gh;
+  NZ = { wx: new Float32Array(N), wy: new Float32Array(N) };
+  for (let gy = 0; gy < Gh; gy++) for (let gx = 0; gx < Gw; gx++) {
+    const i = gy * Gw + gx, x = gx * STEP, y = gy * STEP;
+    NZ.wx[i] = fbm(x * 0.0028, y * 0.0028, 1) - 0.47;
+    NZ.wy[i] = fbm(x * 0.0028, y * 0.0028, 2) - 0.47;
+  }
+}
+let fieldMs = 0;
+function computeField(rects) {
+  const t0 = performance.now();
+  const N = Gw * Gh, f1 = new Float32Array(N);
+  const sig = P.sigma, is1 = 1 / (sig * sig);
+  const wa = P.warp * 2.2, wmax = wa * 0.5;
+  for (const r of rects) {
+    // stamp only as far as the water colour still changes (the deep glazes saturate around 330px of depth)
+    const Rf = sig * Math.min(5.5, 380 / sig + 1.1), Rf2 = Rf * Rf;
+    const R = Rf + Math.max(r.hw, r.hh) * 0.5 + wmax;
+    const gx0 = Math.max(0, Math.floor((r.cx - R) / STEP)), gx1 = Math.min(Gw - 1, Math.ceil((r.cx + R) / STEP));
+    const gy0 = Math.max(0, Math.floor((r.cy - R) / STEP)), gy1 = Math.min(Gh - 1, Math.ceil((r.cy + R) / STEP));
+    const chw = r.hw * 0.5, chh = r.hh * 0.5;
+    for (let gy = gy0; gy <= gy1; gy++) for (let gx = gx0; gx <= gx1; gx++) {
+      const i = gy * Gw + gx;
+      const qx = gx * STEP + NZ.wx[i] * wa, qy = gy * STEP + NZ.wy[i] * wa;
+      let dx = Math.abs(qx - r.cx) - chw, dy = Math.abs(qy - r.cy) - chh;
+      if (dx < 0) dx = 0; if (dy < 0) dy = 0;
+      const d2 = dx * dx + dy * dy;
+      if (d2 < Rf2) f1[i] += Math.exp(-d2 * is1);
+    }
+  }
+  const c0 = Math.sqrt(-Math.log(0.35)), s = new Float32Array(N), fMin = Math.exp(-60);
+  for (let i = 0; i < N; i++) {
+    const g = Math.log(Math.max(f1[i], fMin));
+    s[i] = Math.min(D_CLAMP, sig * (Math.sqrt(Math.max(-g, 0)) - c0) - sig * 0.6 * Math.max(g, 0));
+  }
+  const reeds = computeReeds(s);
+  fieldMs = performance.now() - t0;
+  return { s, reeds };
+}
+function sampleArr(a, x, y) {
+  const fx = Math.min(Math.max(x / STEP, 0), Gw - 1.001), fy = Math.min(Math.max(y / STEP, 0), Gh - 1.001);
+  const ix = Math.floor(fx), iy = Math.floor(fy), tx = fx - ix, ty = fy - iy, i = iy * Gw + ix;
+  return (a[i] * (1 - tx) + a[i + 1] * tx) * (1 - ty) + (a[i + Gw] * (1 - tx) + a[i + Gw + 1] * tx) * ty;
+}
+// Reed tufts: spots on the shoreline, grouped into stands by a low-frequency noise
+const REED_MAX = 28;
+function computeReeds(s) {
+  const out = [], L = 30;
+  for (let y = L / 2; y < H + L; y += L) for (let x = L / 2; x < W + L; x += L) {
+    const jx = x + (hash2(x, y, 61) - 0.5) * L, jy = y + (hash2(x, y, 62) - 0.5) * L;
+    const v = sampleArr(s, jx, jy);
+    if (Math.abs(v) > L) continue;
+    const gx = sampleArr(s, jx + 4, jy) - sampleArr(s, jx - 4, jy), gy = sampleArr(s, jx, jy + 4) - sampleArr(s, jx, jy - 4);
+    const gl = Math.hypot(gx, gy);
+    if (gl < 1e-3) continue;
+    const nx = gx / gl, ny = gy / gl;
+    const px = jx - nx * (v - 3), py = jy - ny * (v - 3);   // step onto the shoreline, a little into the water
+    if (px < -10 || py < -10 || px > W + 10 || py > H + 10) continue;
+    const stand = fbm(px * 0.006, py * 0.006, 41);
+    if (hash2(x, y, 63) > sstep(0.5, 0.66, stand) * 0.7) continue;
+    if (out.some(r => Math.hypot(r[0] - px, r[1] - py) < 40)) continue;
+    out.push([px, py, 0.7 + 0.35 * hash2(x, y, 64), hash2(x, y, 65) * 50 + 1, nx, ny]);
+    if (out.length >= REED_MAX) return out;
+  }
+  return out;
+}
+
+/* ======================================================================
+   Shaders
+   ====================================================================== */
+const VS = `#version 300 es
+void main() {
+  vec2 p = vec2(float((gl_VertexID << 1) & 2), float(gl_VertexID & 2));
+  gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);
+}`;
+
+const FS = `#version 300 es
+precision highp float;
+uniform sampler2D uNoise, uFA, uFB;
+uniform vec2 uRes, uGrid;
+uniform float uScale, uSeed, uStep, uMix, uTime, uLily;
+uniform vec4 uRip[12];           // ring ripples: x, y, age (s), amplitude (0 = none)
+uniform vec4 uStr[4];            // water striders: x, y, heading, stroke (0..1)
+uniform float uStrN;
+uniform vec4 uDf[2];             // dragonflies: x, y, heading, wing phase
+uniform vec4 uDfB[2];            // dragonflies: height (shadow offset), colour kind, visibility, -
+uniform vec4 uReed[28];          // reed tufts: x, y, size (0 = none), seed
+out vec4 o;
+
+// ---- palette (soft watercolor) ----
+const vec3 G_SUN = vec3(0.58, 0.72, 0.36), G_MID = vec3(0.45, 0.63, 0.31), G_DEEP = vec3(0.35, 0.53, 0.27);
+const vec3 INK = vec3(0.22, 0.38, 0.18);
+const vec3 SAND = vec3(0.86, 0.78, 0.60), SAND_W = vec3(0.70, 0.62, 0.46);
+const vec3 BED0 = vec3(0.80, 0.76, 0.56), BED1 = vec3(0.55, 0.56, 0.38);       // pond bottom: sand -> silt
+const vec3 W_SHAL = vec3(0.80, 0.92, 0.84), W_MID = vec3(0.30, 0.60, 0.54), W_DEEP = vec3(0.19, 0.45, 0.46), W_ABYSS = vec3(0.14, 0.35, 0.40);
+const vec3 SKY = vec3(0.70, 0.86, 0.90), CLOUD = vec3(0.97, 0.98, 0.98);
+const vec3 SHADE = vec3(0.55, 0.62, 0.70);
+const vec2 LIGHT = vec2(-0.6, -0.8);
+const vec2 SHDIR = vec2(0.58, 0.81);
+
+float hash2(vec2 p) {
+  vec3 p3 = fract(vec3(p.xyx) * 0.1031);
+  p3 += dot(p3, p3.yzx + 33.33);
+  return fract((p3.x + p3.y) * p3.z);
+}
+float ss(float a, float b, float x) { float t = clamp((x - a) / (b - a), 0.0, 1.0); return t * t * (3.0 - 2.0 * t); }
+vec4 N(vec2 p, float scale) { return texture(uNoise, p / scale + uSeed * 0.013); }
+vec2 field(vec2 p) {
+  vec2 uv = (p / uStep + 0.5) / uGrid;
+  return mix(texture(uFA, uv).rg, texture(uFB, uv).rg, uMix);
+}
+// depth (px from the shore) that stays continuous while the clamped and unclamped channels cross-fade
+float depthOf(vec2 f) { return min(f.y, f.x + ss(40.0, 59.0, f.x) * max(f.y - f.x, 0.0)); }
+float segD(vec2 p, vec2 a, vec2 b) { vec2 pa = p - a, ba = b - a; return length(pa - ba * clamp(dot(pa, ba) / dot(ba, ba), 0.0, 1.0)); }
+float segT(vec2 p, vec2 a, vec2 b) { vec2 pa = p - a, ba = b - a; return clamp(dot(pa, ba) / dot(ba, ba), 0.0, 1.0); }
+float ellD(vec2 p, vec2 r) { return (length(p / r) - 1.0) * min(r.x, r.y); }
+mat2 rot(float a) { float c = cos(a), s = sin(a); return mat2(c, s, -s, c); }
+
+// brush strokes in the grass (as in the meadow theme): short parallel dashes in patches
+float grassInk(vec2 p) {
+  const vec2 G = vec2(11.0, 6.0);
+  vec2 c0 = floor(p / G);
+  float ink = 0.0;
+  for (int j = -1; j <= 1; j++) {
+    vec2 c = c0 + vec2(0.0, float(j));
+    vec2 cp = (c + 0.5) * G;
+    float h = hash2(c + 3.1);
+    float dens = 0.7 * ss(0.40, 0.72, N(cp, 900.0).r) * ss(0.33, 0.6, N(cp + 50.0, 380.0).g) + 0.03;
+    if (h > dens) continue;
+    float ang = (N(cp, 1400.0).g - 0.5) * 0.8 + (hash2(c + 7.7) - 0.5) * 0.3 - 0.3;
+    float len = 2.5 + 3.0 * hash2(c + 1.9);
+    vec2 ctr = cp + (vec2(hash2(c + 4.3), hash2(c + 5.9)) - 0.5) * vec2(2.0, 3.0);
+    vec2 dir = vec2(cos(ang), sin(ang)) * len;
+    float d = segD(p, ctr - dir, ctr + dir);
+    ink = max(ink, (1.0 - ss(0.2, 0.9, d)) * (0.35 + 0.45 * hash2(c + 9.1)));
+  }
+  return ink;
+}
+// tiny meadow flowers (white / yellow dots with a centre)
+vec4 flower(vec2 p) {
+  const float G = 17.0;
+  vec2 c = floor(p / G);
+  float h = hash2(c + 11.3);
+  float dens = 0.02 + 0.16 * ss(0.5, 0.8, N(c * G, 500.0).b);
+  if (h > dens) return vec4(0.0);
+  vec2 q = p - (c + 0.2 + 0.6 * vec2(hash2(c + 2.2), hash2(c + 6.1))) * G;
+  float k = hash2(c + 8.8);
+  vec3 pc = k < 0.55 ? vec3(0.99, 0.98, 0.94) : k < 0.85 ? vec3(0.99, 0.86, 0.32) : vec3(0.80, 0.70, 0.98);
+  float a = atan(q.y, q.x), r = length(q);
+  float m = ss(0.5, -0.5, r - (1.6 + 0.6 * cos(a * 5.0 + k * 30.0)));
+  return vec4(mix(pc, vec3(0.97, 0.70, 0.20), ss(0.9, 0.5, r)), m);
+}
+// pebbles and stones: on the sandy shore band and the pond bottom; returns colour + coverage
+vec4 pebbles(vec2 p, float s) {
+  vec4 res = vec4(0.0);
+  float near = ss(-26.0, -10.0, s) * ss(140.0, 20.0, s);       // most of them around the waterline
+  if (near <= 0.0) return res;
+  for (int layer = 0; layer < 2; layer++) {
+    float G = layer == 0 ? 11.0 : 30.0;
+    vec2 c0 = floor(p / G);
+    for (int j = -1; j <= 1; j++) for (int i = -1; i <= 1; i++) {
+      vec2 c = c0 + vec2(i, j) + float(layer) * 91.0;
+      vec2 cc = c0 + vec2(i, j);
+      float h = hash2(c + 0.7);
+      float dens = (layer == 0 ? 0.42 : 0.16) * near * (0.4 + 0.9 * ss(0.35, 0.7, N(cc * G, 300.0).a));
+      if (h > dens) continue;
+      vec2 ctr = (cc + 0.5 + (vec2(hash2(c + 1.3), hash2(c + 2.1)) - 0.5) * 0.7) * G;
+      float rr = layer == 0 ? 1.6 + 2.2 * hash2(c + 3.7) : 4.0 + 6.0 * hash2(c + 3.7);
+      vec2 q = rot(hash2(c + 4.9) * 6.283) * (p - ctr);
+      float d = ellD(q, vec2(rr, rr * (0.62 + 0.3 * hash2(c + 5.3))));
+      float k = hash2(c + 6.1);
+      vec3 pc = k < 0.35 ? vec3(0.62, 0.60, 0.56) : k < 0.6 ? vec3(0.70, 0.60, 0.48) : k < 0.8 ? vec3(0.50, 0.52, 0.52) : vec3(0.78, 0.74, 0.66);
+      vec2 lq = (p - ctr) / rr;
+      pc *= 0.85 + 0.3 * ss(0.6, -0.8, dot(lq, -LIGHT) + 0.2);   // lit from the upper left
+      pc = mix(pc, pc * 0.72, ss(-1.6, 0.0, d) * 0.6);             // painted rim
+      float m = ss(0.6, -0.6, d);
+      res.rgb = mix(res.rgb, pc, m);
+      res.a = max(res.a, m);
+    }
+  }
+  return res;
+}
+
+// lily pads: one at most per 64px cell, grouped by noise, shrinking away from the shore
+const float LC = 64.0;
+vec4 lilies(vec2 p, out float shad) {
+  shad = 0.0;
+  vec4 res = vec4(0.0);
+  vec2 c0 = floor(p / LC);
+  for (int j = -1; j <= 1; j++) for (int i = -1; i <= 1; i++) {
+    vec2 c = c0 + vec2(i, j);
+    float h = hash2(c + 0.37);
+    float dens = uLily * (0.55 * ss(0.52, 0.75, N(c * LC + 37.0, 900.0).b) + 0.02);
+    if (h > dens) continue;
+    vec2 ctr = (c + 0.5 + (vec2(hash2(c + 1.7), hash2(c + 2.9)) - 0.5) * 0.5) * LC;
+    ctr += vec2(sin(uTime * 0.21 + h * 40.0), cos(uTime * 0.17 + h * 30.0)) * 2.5;
+    float R = 12.0 + 11.0 * hash2(c + 3.3);
+    float dc = depthOf(field(ctr));
+    float g = ss(R + 6.0, R + 28.0, dc);
+    if (g <= 0.02) continue;
+    float r = R * (0.3 + 0.7 * g);
+    vec2 q = p - ctr;
+    shad = max(shad, ss(2.0, -3.0, length(q - SHDIR * 4.0) - r) * g);
+    float l = length(q);
+    if (l > r + 1.5) continue;
+    float ang = hash2(c + 5.1) * 6.283 + sin(uTime * 0.13 + h * 20.0) * 0.2;
+    vec2 qr = rot(-ang) * q;
+    float wedge = (abs(qr.y) - 0.36 * qr.x) * 0.94;               // the notch
+    float sd = max(l - r, -wedge);
+    float a = ss(0.6, -0.6, sd * uScale) * ss(0.02, 0.2, g);
+    if (a <= 0.0) continue;
+    float k = hash2(c + 8.3);
+    vec3 pc = k < 0.5 ? vec3(0.34, 0.58, 0.26) : k < 0.8 ? vec3(0.42, 0.62, 0.24) : vec3(0.30, 0.50, 0.30);
+    pc *= 0.92 + 0.14 * hash2(c + 9.9);
+    vec2 lq = q / r;
+    pc = mix(pc, pc * 1.25 + 0.04, ss(0.3, 1.0, dot(lq, -LIGHT)) * 0.5);       // sunny side
+    // radiating veins from the notch point
+    float va = atan(qr.y, qr.x);
+    float vein = 1.0 - ss(0.0, 0.10, abs(fract(va * 13.0 / 6.2832 + 0.5) - 0.5));
+    pc = mix(pc, pc * 1.18, vein * ss(0.15, 0.5, l / r) * 0.6);
+    // up-turned rim: a lighter band with a darker inner line; some pads have a reddish edge
+    float rimc = k > 0.93 ? 0.6 : 0.0;
+    pc = mix(pc, mix(pc * 0.78, vec3(0.62, 0.32, 0.26), rimc), ss(-4.0, -1.4, sd) * 0.6);
+    pc = mix(pc, pc * 1.25 + 0.05, ss(-1.4, -0.3, sd) * 0.7);
+    pc *= 0.92 + 0.14 * N(q + c * 17.0, 60.0).r;                 // pigment granulation (pad-relative: no swimming)
+    // flower on some pads
+    if (hash2(c + 7.7) < 0.28) {
+      vec2 fq = q - rot(ang + 2.4) * vec2(r * 0.3, 0.0);
+      float fr = clamp(r * 0.48, 5.0, 8.5);
+      float fa = atan(fq.y, fq.x), fl = length(fq);
+      float fk = hash2(c + 6.6);
+      vec3 petal = fk < 0.6 ? vec3(0.97, 0.66, 0.78) : vec3(0.98, 0.96, 0.93);
+      // drop shadow of the flower on the pad
+      pc = mix(pc, pc * 0.7, ss(1.5, -1.5, length(fq - SHDIR * 2.5) - fr) * 0.6);
+      float p1 = fr * (0.55 + 0.45 * pow(abs(cos(fa * 4.0 + fk * 9.0)), 0.6));
+      float p2 = fr * 0.72 * (0.55 + 0.45 * pow(abs(cos(fa * 4.0 + fk * 9.0 + 0.785)), 0.6));
+      float m1 = ss(0.6, -0.6, (fl - p1) * uScale);
+      vec3 c1 = mix(petal * 0.82, petal, ss(0.2, 1.0, fl / fr));
+      c1 = mix(c1, c1 * 1.08, ss(0.0, 1.0, dot(fq / fr, -LIGHT)));
+      pc = mix(pc, c1, m1);
+      float m2 = ss(0.6, -0.6, (fl - p2) * uScale);
+      vec3 c2 = mix(vec3(1.0, 0.97, 0.95), petal, 0.35);
+      c2 = mix(c2 * 0.9, c2, ss(0.0, 0.8, fl / (fr * 0.72)));
+      pc = mix(pc, c2, m2);
+      pc = mix(pc, vec3(0.98, 0.80, 0.25), ss(0.5, -0.5, fl - fr * 0.24));
+      pc = mix(pc, vec3(0.92, 0.62, 0.15), ss(0.5, -0.5, fl - fr * 0.11) * 0.7);
+    }
+    res = vec4(mix(res.rgb, pc, a), max(res.a, a));
+  }
+  return res;
+}
+
+// water strider seen from above (forward = +x); dimple = darkening of the little leg dimples
+vec4 strider(vec2 p, vec4 s, out float dimple) {
+  vec2 q = rot(-s.z) * (p - s.xy);
+  dimple = 0.0;
+  float sw = s.w;                                  // 0..1 stroke of the rowing legs
+  vec2 tips[6];
+  vec2 roots[6];
+  roots[0] = vec2(3.0, 0.8);  tips[0] = vec2(8.0, 4.0);
+  roots[1] = vec2(3.0, -0.8); tips[1] = vec2(8.0, -4.0);
+  roots[2] = vec2(1.0, 0.8);  tips[2] = vec2(-1.0 - 6.0 * sw, 13.0 - 2.0 * sw);
+  roots[3] = vec2(1.0, -0.8); tips[3] = vec2(-1.0 - 6.0 * sw, -13.0 + 2.0 * sw);
+  roots[4] = vec2(-1.0, 0.8); tips[4] = vec2(-14.0, 7.0);
+  roots[5] = vec2(-1.0, -0.8); tips[5] = vec2(-14.0, -7.0);
+  float leg = 1e9;
+  for (int i = 0; i < 6; i++) {
+    vec2 knee = mix(roots[i], tips[i], 0.4) + normalize(vec2(-(tips[i].y - roots[i].y), tips[i].x - roots[i].x)) * (i < 2 ? 0.0 : 1.2) * sign(roots[i].y);
+    leg = min(leg, min(segD(q, roots[i], knee), segD(q, knee, tips[i])));
+    float dl = length(q - tips[i]);
+    dimple = max(dimple, (1.0 - ss(0.0, 1.0, abs(dl - 2.4))) * 0.55);
+  }
+  float body = min(ellD(q, vec2(5.5, 1.4)), length(q - vec2(5.5, 0.0)) - 1.1);
+  float m = max(ss(0.55, 0.0, leg - 0.25), ss(0.6, -0.6, body));
+  vec3 col = vec3(0.17, 0.15, 0.13);
+  col = mix(col, vec3(0.32, 0.28, 0.24), ss(0.6, -0.6, ellD(q - vec2(-0.5, -0.4), vec2(3.0, 0.6))) * 0.8);
+  return vec4(col, m);
+}
+
+// dragonfly seen from above (forward = +x)
+vec4 dragonfly(vec2 p, vec4 d, float kind) {
+  vec2 q = rot(-d.z) * (p - d.xy);
+  if (dot(q, q) > 520.0) return vec4(0.0);
+  float fl = 0.80 + 0.20 * sin(d.w);                // wing shimmer
+  vec3 bodyC = kind < 0.5 ? vec3(0.18, 0.45, 0.78) : vec3(0.82, 0.26, 0.18);
+  vec3 col = vec3(0.0); float a = 0.0;
+  // wings: two pairs spread sideways, translucent
+  for (int s = -1; s <= 1; s += 2) {
+    float sg = float(s);
+    vec2 w1 = rot(-0.30 * sg) * (q - vec2(4.6, sg * 8.0 * fl));
+    vec2 w2 = rot(0.32 * sg) * (q - vec2(-1.6, sg * 8.4 * fl));
+    float dw = min(ellD(w1, vec2(1.7, 8.0 * fl)), ellD(w2, vec2(2.1, 8.4 * fl)));
+    float stig = min(length(w1 - vec2(0.0, sg * 6.0 * fl)), length(w2 - vec2(0.0, sg * 6.4 * fl)));
+    float mw = ss(0.5, -0.5, dw);
+    vec3 wc = mix(vec3(0.85, 0.93, 0.98), vec3(1.0), ss(0.0, 1.0, sin(d.w * 0.5 + q.y * 0.4)));
+    wc = mix(wc, vec3(0.45, 0.50, 0.55), ss(-0.9, 0.0, dw) * 0.7);      // wing edge vein
+    wc = mix(wc, vec3(0.30, 0.32, 0.36), ss(1.0, 0.4, stig));                // dark spot near each wing tip
+    col = mix(col, wc, mw); a = max(a, mw * 0.55);
+  }
+  // abdomen, thorax, head with big eyes
+  float ab = segD(q, vec2(-17.0, 0.0), vec2(0.0, 0.0)) - mix(0.7, 1.2, segT(q, vec2(-17.0, 0.0), vec2(0.0, 0.0)));
+  float th = ellD(q - vec2(2.2, 0.0), vec2(3.0, 1.9));
+  float hd = length(q - vec2(5.6, 0.0)) - 1.8;
+  float mb = ss(0.5, -0.5, min(min(ab, th), hd));
+  vec3 bc = bodyC;
+  bc = mix(bc, bc * 0.55, step(0.5, fract(q.x * 0.33)) * step(q.x, -1.0) * 0.6);   // segment bands
+  bc = mix(bc, vec3(0.20, 0.28, 0.30), ss(0.5, -0.5, hd) * 0.6);
+  col = mix(col, bc, mb); a = max(a, mb);
+  return vec4(col, a);
+}
+
+void main() {
+  vec2 p = vec2(gl_FragCoord.x, uRes.y * uScale - gl_FragCoord.y) / uScale;
+  vec2 f = field(p);
+  float s = f.x;
+  float dep = depthOf(f);
+  float t = uTime;
+
+  vec4 n1 = N(p, 900.0), n2 = N(p + 311.0, 260.0), n3 = N(p + 71.0, 90.0);
+  float lap = sin(t * 0.9 + n1.r * 9.0) * 1.3;               // the waterline breathes a little
+  float sw = s + (n3.b - 0.5) * 5.0 + lap;                   // waterline
+  float sg = s + (n2.b - 0.5) * 20.0 + 17.0 + 6.0 * (n1.a - 0.5);   // grass edge (sandy band between)
+  vec3 col;
+
+  if (sw < 2.0 || s < 6.0) {
+    // ---------- land: watercolor grass washes with brush strokes; a sandy, pebbly strip at the shore ----------
+    vec3 grass = mix(G_MID, G_SUN, ss(0.3, 0.75, n1.b * 0.6 + n2.g * 0.4));
+    float wd = N(p + 977.0, 1300.0).r;
+    grass = mix(grass, G_DEEP, ss(0.5, 0.85, wd) * 0.5);
+    grass *= 1.0 - 0.06 * (1.0 - ss(0.0, 0.03, abs(wd - 0.62)));            // wash edge (backrun) line
+    grass = mix(grass, grass * 0.9, ss(-30.0, 0.0, sg) * 0.4);                // lush, darker near the water
+    grass = mix(grass, INK, grassInk(p) * 0.6);
+    if (sg < -14.0) { vec4 fl = flower(p); grass = mix(grass, fl.rgb, fl.a * ss(-14.0, -24.0, sg)); }
+    vec3 sand = mix(SAND, SAND * 0.93, ss(0.3, 0.7, n3.r));
+    sand = mix(sand, SAND_W, ss(-9.0, 0.0, sw));                              // wet sand at the waterline
+    float ga = ss(1.2, -1.2, sg);
+    col = mix(sand, grass, ga);
+    col = mix(col, col * 0.86, (1.0 - ss(0.0, 2.2, abs(sg))) * 0.7);          // pooled pigment at the wash edge
+    vec4 pb = pebbles(p, s);
+    col = mix(col, pb.rgb, pb.a * (1.0 - ga));
+  }
+  if (sw > -2.0) {
+    // ---------- water ----------
+    // surface ripple normal (two drifting noise layers)
+    vec2 drift = vec2(9.0, 4.0) * t;
+    vec4 r1 = N(p * vec2(1.0, 1.6) + drift * 1.4, 130.0), r2 = N(p * vec2(1.6, 1.0) - drift.yx * 1.1 + 500.0, 170.0);
+    vec2 nrm = (r1.xy + r2.yx - 1.0);
+    // ring ripples add to the normal and to the shading
+    float ring = 0.0;
+    for (int i = 0; i < 12; i++) {
+      vec4 rp = uRip[i];
+      if (rp.w <= 0.0) continue;
+      vec2 dv = p - rp.xy;
+      float dl = length(dv);
+      float R = 2.0 + rp.z * 24.0, w = 1.4 + rp.z * 1.6;
+      if (abs(dl - R) > 4.0 * w) continue;
+      float x = (dl - R) / w;
+      float amp = rp.w * exp(-rp.z * 1.1);
+      float wv = x * exp(-x * x) * amp;
+      ring += wv;
+      nrm += dv / max(dl, 1e-3) * wv * 0.8;
+    }
+    // bottom (refracted): sand near the shore, silt deeper, sand ripples parallel to the shore, pebbles
+    vec2 pb = p + nrm * 3.0 * ss(0.0, 30.0, dep);
+    vec4 bn = N(pb, 140.0);
+    vec3 bed = mix(BED0, BED1, ss(10.0, 110.0, dep + (bn.r - 0.5) * 40.0));
+    float rip = sin(dep * 0.55 + (bn.g - 0.5) * 9.0 + N(pb, 400.0).a * 6.0);
+    bed *= 1.0 + 0.07 * rip * ss(90.0, 10.0, dep);
+    bed = mix(bed, bed * 0.82, ss(0.55, 0.75, N(pb + 33.0, 220.0).b) * 0.5);   // weedy patches
+    vec4 pbl = pebbles(pb, s);
+    bed = mix(bed, pbl.rgb, pbl.a);
+    // caustics: thin bright network where two drifting noise layers cross
+    float cz = abs(N(pb + vec2(6.0, 3.0) * t, 110.0).r - N(pb - vec2(4.0, 5.0) * t + 200.0, 140.0).g);
+    bed *= 1.0 + 0.35 * (1.0 - ss(0.0, 0.07, cz)) * ss(140.0, 5.0, dep);
+    // lily pad shadows fall on the bottom in the shallows, on the surface farther out
+    float lsh;
+    vec4 lp = (dep > 6.0 && uLily > 0.0) ? lilies(p, lsh) : vec4(0.0);
+    if (dep <= 6.0 || uLily <= 0.0) lsh = 0.0;
+    bed = mix(bed, bed * SHADE, lsh * 0.55);
+    // absorption: soft watercolor glazes that get darker toward the middle
+    float dj = dep + (n2.r - 0.5) * 30.0 + (n1.g - 0.5) * 40.0;
+    vec3 wcol = mix(bed * W_SHAL, W_MID, ss(4.0, 70.0, dj));
+    wcol = mix(wcol, W_DEEP, ss(70.0, 170.0, dj));
+    wcol = mix(wcol, W_ABYSS, ss(180.0, 320.0, dj) * 0.8);
+    // darker pigment lines at the glaze edges (watercolor "blooms")
+    wcol *= 1.0 - 0.05 * (1.0 - ss(0.0, 5.0, abs(dj - 60.0))) - 0.05 * (1.0 - ss(0.0, 6.0, abs(dj - 150.0)));
+    // reflections: sky tint and drifting clouds, broken up by the ripples
+    vec2 cp = p + nrm * 4.0 - vec2(14.0, 6.0) * t;
+    float cm = N(cp, 1500.0).b * 0.75 + N(cp + 400.0, 700.0).b * 0.25;
+    float cloud = ss(0.56, 0.74, cm);
+    cloud *= 0.75 + 0.25 * ss(0.6, 0.85, cm);                  // brighter cores
+    float rf = ss(10.0, 120.0, dep);
+    wcol = mix(wcol, SKY, 0.10 + 0.12 * rf);
+    wcol = mix(wcol, CLOUD, cloud * (0.12 + 0.28 * rf));
+    wcol = mix(wcol, wcol * 0.88, lsh * ss(20.0, 80.0, dep) * 0.45);           // farther out the pad shadow lies on the surface
+    // wind ripples: light glints and soft dark troughs
+    float gl = dot(nrm, -LIGHT);
+    wcol *= 1.0 + 0.06 * gl + 0.25 * ring;
+    wcol = mix(wcol, vec3(1.0), ss(0.25, 0.75, gl) * 0.07 * (0.4 + 0.6 * rf));
+    wcol *= 0.975 + 0.05 * n3.a;                                           // pigment granulation
+    // the waterline: a thin darker pigment line and a light glint just off the shore
+    wcol = mix(wcol, wcol * 0.78, (1.0 - ss(0.0, 2.2, sw)) * 0.8);
+    wcol = mix(wcol, vec3(0.95, 0.99, 0.97), (1.0 - ss(0.0, 1.5, abs(sw - 4.5))) * 0.25);
+    // water striders: dimples darken / brighten the bottom, then the insect on the surface
+    for (int i = 0; i < 4; i++) {
+      if (float(i) >= uStrN) break;
+      vec4 st = uStr[i];
+      if (length(p - st.xy) > 20.0) continue;
+      float dim;
+      vec4 sc = strider(p, st, dim);
+      wcol = mix(wcol, wcol * 0.75, dim);
+      wcol = mix(wcol, sc.rgb, sc.a);
+    }
+    // lily pads on top
+    wcol = mix(wcol, lp.rgb, lp.a);
+    float wa = ss(-1.0, 1.0, sw);
+    col = sw < 2.0 || s < 6.0 ? mix(col, wcol, wa) : wcol;
+  }
+
+  // ---------- reeds along the shore ----------
+  if (abs(s) < 70.0) {
+    float rsh = 0.0; vec4 rc = vec4(0.0);
+    for (int i = 0; i < 28; i++) {
+      vec4 r = uReed[i];
+      if (r.z <= 0.0) continue;
+      vec2 dv = p - r.xy;
+      if (dot(dv, dv) > 1600.0 * r.z * r.z) continue;
+      for (int b = 0; b < 10; b++) {
+        float hb = hash2(vec2(r.w, float(b) * 1.37));
+        float ang = float(b) * 0.628 + hb * 0.9 + sin(t * 0.9 + float(b) + r.w) * 0.06;
+        float len = (13.0 + 17.0 * hash2(vec2(float(b), r.w))) * r.z;
+        vec2 dir = vec2(cos(ang), sin(ang));
+        vec2 tip = r.xy + dir * len, mid = r.xy + dir * len * 0.5 + vec2(-dir.y, dir.x) * len * 0.12 * (hb - 0.5);
+        float d = min(segD(p, r.xy, mid), segD(p, mid, tip));
+        float tt = length(p - r.xy) / len;
+        float wdt = mix(2.1, 0.4, clamp(tt, 0.0, 1.0)) * r.z;
+        float m = ss(0.5, -0.5, (d - wdt) * uScale * 0.7);
+        vec3 bc = mix(vec3(0.24, 0.42, 0.18), vec3(0.50, 0.62, 0.26), hb);
+        bc = mix(bc * 0.8, bc * 1.1, clamp(tt, 0.0, 1.0));
+        bc = mix(bc, bc * 1.2, ss(0.0, 1.0, dot(vec2(-dir.y, dir.x), -LIGHT)) * 0.3);
+        // cattail head on some blades
+        if (hb < 0.3) {
+          float dh = ellD(rot(-ang) * (p - (r.xy + dir * len * 0.82)), vec2(3.6 * r.z, 1.5 * r.z));
+          float mh = ss(0.5, -0.5, dh * uScale * 0.7);
+          bc = mix(bc, vec3(0.45, 0.28, 0.16), mh);
+          m = max(m, mh);
+        }
+        rc = vec4(mix(rc.rgb, bc, m), max(rc.a, m));
+        float ds = min(segD(p - SHDIR * 5.0, r.xy, mid), segD(p - SHDIR * 5.0, mid, tip));
+        rsh = max(rsh, ss(1.5, -0.5, ds - wdt));
+      }
+    }
+    col = mix(col, col * SHADE, rsh * 0.45 * (1.0 - rc.a));
+    col = mix(col, rc.rgb, rc.a);
+  }
+
+  // ---------- dragonflies: a soft shadow below, then the insect ----------
+  for (int i = 0; i < 2; i++) {
+    if (uDfB[i].z <= 0.0) continue;
+    vec4 d = uDf[i];
+    vec2 so = SHDIR * uDfB[i].x;
+    if (length(p - d.xy - so) < 24.0) {
+      vec4 sh = dragonfly(p - so, d, uDfB[i].y);
+      col = mix(col, col * SHADE, ss(0.0, 1.0, sh.a) * 0.35 * uDfB[i].z);
+    }
+    if (length(p - d.xy) < 24.0) {
+      vec4 dc = dragonfly(p, d, uDfB[i].y);
+      col = mix(col, dc.rgb, dc.a * uDfB[i].z);
+    }
+  }
+
+  // paper grain and a soft light from the upper left
+  col *= 1.0 + (hash2(floor(p * max(uScale, 1.0))) - 0.5) * 0.035;
+  col *= 1.0 + 0.06 * (0.5 - (p.x + p.y) / (uRes.x + uRes.y));
+  o = vec4(col, 1.0);
+}`;
+
+/* ======================================================================
+   WebGL
+   ====================================================================== */
+const cv = document.getElementById('art');
+const gl = cv.getContext('webgl2', { antialias: false });
+if (!gl) document.getElementById('nogl').style.display = 'grid';
+function program(fs) {
+  const mk = (type, src) => {
+    const s = gl.createShader(type);
+    gl.shaderSource(s, src); gl.compileShader(s);
+    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) { console.error(gl.getShaderInfoLog(s)); throw new Error('shader: ' + gl.getShaderInfoLog(s)); }
+    return s;
+  };
+  const p = gl.createProgram();
+  gl.attachShader(p, mk(gl.VERTEX_SHADER, VS));
+  gl.attachShader(p, mk(gl.FRAGMENT_SHADER, fs));
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) console.error(gl.getProgramInfoLog(p));
+  const U = {};
+  const n = gl.getProgramParameter(p, gl.ACTIVE_UNIFORMS);
+  for (let i = 0; i < n; i++) { const nm = gl.getActiveUniform(p, i).name.replace(/\[0\]$/, ''); U[nm] = gl.getUniformLocation(p, nm); }
+  return { p, U };
+}
+const PR = program(FS);
+gl.bindVertexArray(gl.createVertexArray());
+
+let noiseTex = null;
+function buildNoiseTex() {
+  const { S, d } = makeNoiseImage();
+  noiseTex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, noiseTex);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, S, S, 0, gl.RGBA, gl.UNSIGNED_BYTE, d);
+  gl.generateMipmap(gl.TEXTURE_2D);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.REPEAT);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.REPEAT);
+}
+const f32 = new Float32Array(1), u32 = new Uint32Array(f32.buffer);
+function toHalf(v) {
+  f32[0] = v; const x = u32[0];
+  const sign = (x >>> 16) & 0x8000, e = ((x >>> 23) & 0xff) - 112, m = x & 0x7fffff;
+  if (e <= 0) return sign;
+  if (e >= 31) return sign | 0x7c00;
+  return sign | (e << 10) | (m >>> 13);
+}
+// two field textures (RG16F: s clamped at the shore, s as depth); the shader blends from -> to
+const ftex = [null, null];
+let fromI = 0, toI = 0, FA = null, FB = null;
+let morphT0 = -1e9, morphDur = MORPH_MS, curMix = 1;
+function allocField() {
+  for (let i = 0; i < 2; i++) {
+    if (ftex[i]) gl.deleteTexture(ftex[i]);
+    ftex[i] = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, ftex[i]);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RG16F, Gw, Gh, 0, gl.RG, gl.HALF_FLOAT, null);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  }
+}
+function uploadField(i, Fd) {
+  const n = Gw * Gh, d = new Uint16Array(n * 2);
+  for (let k = 0; k < n; k++) { const v = Fd.s[k]; d[k * 2] = toHalf(Math.min(v, S_CLAMP)); d[k * 2 + 1] = toHalf(v); }
+  gl.bindTexture(gl.TEXTURE_2D, ftex[i]);
+  gl.pixelStorei(gl.UNPACK_ALIGNMENT, 2);
+  gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, Gw, Gh, gl.RG, gl.HALF_FLOAT, d);
+}
+
+let icons = [];
+const iconRects = () => icons.map(ic => ({ cx: ic.x + ic.w / 2, cy: ic.y + ic.h / 2, hw: ic.w / 2 - 4, hh: ic.h / 2 - 2 }));
+// Field currently on screen (from -> to blended by curMix): a new transition must start from it, not from the
+// previous target, or the scenery jumps when icons move again while a transition is still running.
+function blendFields(A, B, m) {
+  const out = {};
+  for (const k in B) {
+    const a = A && A[k], b = B[k];
+    if (!(b instanceof Float32Array)) continue;                  // reeds are rebuilt from the blended shore below
+    if (!(a instanceof Float32Array) || a.length !== b.length) return null;
+    const r = new Float32Array(b.length);
+    for (let i = 0; i < b.length; i++) r[i] = a[i] + (b[i] - a[i]) * m;
+    out[k] = r;
+  }
+  if (out.s) out.reeds = computeReeds(out.s);
+  return out;
+}
+function commit(fromEmpty = false) {
+  const nf = computeField(iconRects());
+  const target = 1 - toI;
+  if (fromEmpty) { FA = computeField([]); uploadField(toI, FA); }
+  else if (FA && FB && curMix < 0.999 && (FA = blendFields(FA, FB, Math.max(0, curMix)))) uploadField(toI, FA);
+  else FA = FB || nf;
+  FB = nf;
+  uploadField(target, FB);
+  fromI = toI; toI = target;
+  morphT0 = performance.now();
+  morphDur = fromEmpty ? 2600 : MORPH_MS;
+  curMix = 0;
+}
+function refresh() {
+  FA = FB = computeField(iconRects());
+  uploadField(toI, FB);
+  fromI = toI; morphT0 = -1e9; curMix = 1;
+}
+// current (blended) depth at a point: <0 on land
+// (mirrors the shader: the shore channel is clamped, and depthOf() blends it with the unclamped channel)
+function curS(x, y) {
+  if (!FB) return 999;
+  const a = sampleArr(FA.s, x, y), b = sampleArr(FB.s, x, y);
+  const r = Math.min(a, S_CLAMP) * (1 - curMix) + Math.min(b, S_CLAMP) * curMix, g = a * (1 - curMix) + b * curMix;
+  return Math.min(g, r + sstep(40, 59, r) * Math.max(g - r, 0));
+}
+
+/* ======================================================================
+   Life: water striders, dragonflies, ring ripples, the odd fish
+   ====================================================================== */
+const ripU = new Float32Array(48), strU = new Float32Array(16), dfU = new Float32Array(8), dfB = new Float32Array(8), reedU = new Float32Array(REED_MAX * 4);
+const LIFETEST = QS.has('lifetest');
+let rips = [], striders = [], dflies = [], plopNext = 3;
+function addRipple(x, y, amp) {
+  rips.push({ x, y, age: 0, amp });
+  if (rips.length > 12) rips.shift();
+}
+function waterPoint(minDepth, tries = 30) {
+  for (let k = 0; k < tries; k++) {
+    const x = 20 + Math.random() * (W - 40), y = 20 + Math.random() * (H - 40);
+    if (curS(x, y) > minDepth) return [x, y];
+  }
+  return null;
+}
+function stepLife(t, dt) {
+  // ripples age
+  for (const r of rips) r.age += dt;
+  rips = rips.filter(r => r.age < 4.5);
+  // fish plops in open water now and then
+  if (t > plopNext) {
+    const pt = waterPoint(70);
+    if (pt) { addRipple(pt[0], pt[1], 0.9); setTimeout(() => addRipple(pt[0], pt[1], 0.5), 450 / Math.max(P.speed, 0.2)); }
+    plopNext = t + 6 + Math.random() * 12;
+  }
+  // water striders: glide, row every second or so, turn away from the shore
+  const want = 4;
+  while (striders.length < want) {
+    const pt = waterPoint(35);
+    if (!pt) break;
+    striders.push({ x: pt[0], y: pt[1], a: Math.random() * 6.283, v: 0, next: Math.random(), stroke: 0, turn: 0 });
+  }
+  for (let i = striders.length - 1; i >= 0; i--) {
+    const s = striders[i];
+    s.next -= dt;
+    if (s.next <= 0) {
+      s.next = 0.6 + Math.random() * 1.6;
+      if (Math.random() < 0.25) { s.next += 1.5 + Math.random() * 3; continue; }   // rest a while
+      s.turn = (Math.random() - 0.5) * 1.6;
+      s.v = 45 + Math.random() * 40; s.stroke = 1;
+      const c = Math.cos(s.a), sn = Math.sin(s.a);
+      for (const sg of [-1, 1]) addRipple(s.x - c * 3 - sn * 12 * sg, s.y - sn * 3 + c * 12 * sg, 0.28);
+    }
+    s.a += s.turn * dt * (s.v / 60);
+    // look ahead: steer away from the shore and the screen edges
+    const ax = s.x + Math.cos(s.a) * 40, ay = s.y + Math.sin(s.a) * 40;
+    if (curS(ax, ay) < 28 || ax < 10 || ay < 10 || ax > W - 10 || ay > H - 10) { s.a += 2.6 * dt; s.v *= 0.96; }
+    s.x += Math.cos(s.a) * s.v * dt; s.y += Math.sin(s.a) * s.v * dt;
+    s.v *= Math.exp(-1.8 * dt);
+    s.stroke = Math.max(0, s.stroke - dt * 3);
+    if (curS(s.x, s.y) < 12) striders.splice(i, 1);          // land grew under it (icons moved): respawn elsewhere
+  }
+  strU.fill(0);
+  striders.slice(0, 4).forEach((s, i) => strU.set([s.x, s.y, s.a, Math.sin(Math.min(s.stroke, 1) * Math.PI)], i * 4));
+  // dragonflies: come in from the edge, dart between hover spots (mostly over the water), leave again
+  while (dflies.length < 2) dflies.push({ state: 'away', wait: (LIFETEST ? 0.5 : 4 + Math.random() * 20) + dflies.length * 6, kind: dflies.length });
+  dflies.forEach((d, i) => {
+    if (d.state === 'away') {
+      d.wait -= dt;
+      if (d.wait <= 0) {
+        const side = Math.floor(Math.random() * 4);
+        d.x = side === 0 ? -30 : side === 1 ? W + 30 : Math.random() * W;
+        d.y = side === 2 ? -30 : side === 3 ? H + 30 : Math.random() * H;
+        d.a = 0; d.state = 'fly'; d.life = 20 + Math.random() * 30; d.h = 22 + Math.random() * 10;
+        const pt = waterPoint(20) || [W / 2, H / 2]; d.tx = pt[0]; d.ty = pt[1];
+      }
+      return;
+    }
+    d.life -= dt;
+    const dx = d.tx - d.x, dy = d.ty - d.y, dist = Math.hypot(dx, dy);
+    if (d.state === 'fly') {
+      const tgtA = Math.atan2(dy, dx);
+      let da = tgtA - d.a; da = Math.atan2(Math.sin(da), Math.cos(da));
+      d.a += da * Math.min(1, dt * 8);
+      const v = Math.min(dist * 4, 260);
+      d.x += Math.cos(tgtA) * v * dt; d.y += Math.sin(tgtA) * v * dt;
+      if (dist < 3) {
+        if (d.leaving) { d.state = 'away'; d.leaving = false; d.wait = 15 + Math.random() * 30; return; }
+        d.state = 'hover'; d.hold = 1 + Math.random() * 3.5;
+        if (curS(d.x, d.y) > 15 && Math.random() < 0.3) { d.dip = 0.5; }
+      }
+    } else {
+      d.hold -= dt;
+      d.x += Math.sin(t * 3.1 + i) * 6 * dt; d.y += Math.cos(t * 2.7 + i) * 6 * dt;
+      if (d.dip > 0) { d.dip -= dt; if (d.dip <= 0) addRipple(d.x, d.y, 0.55); }
+      if (d.hold <= 0) {
+        if (d.life <= 0) {
+          d.leaving = true;
+          const ang = Math.random() * 6.283; d.tx = W / 2 + Math.cos(ang) * (W + H); d.ty = H / 2 + Math.sin(ang) * (W + H);
+        } else {
+          const near = Math.random() < 0.7;
+          let pt = null;
+          for (let k = 0; k < 10 && !pt; k++) {
+            const x = near ? d.x + (Math.random() - 0.5) * 360 : Math.random() * W, y = near ? d.y + (Math.random() - 0.5) * 260 : Math.random() * H;
+            if (x > 20 && y > 20 && x < W - 20 && y < H - 20 && (curS(x, y) > 10 || Math.random() < 0.15)) pt = [x, y];
+          }
+          if (pt) { d.tx = pt[0]; d.ty = pt[1]; }
+        }
+        d.state = 'fly';
+      }
+    }
+    if (d.leaving && (d.x < -60 || d.y < -60 || d.x > W + 60 || d.y > H + 60)) { d.state = 'away'; d.leaving = false; d.wait = 15 + Math.random() * 30; }
+  });
+  dfB.fill(0);
+  dflies.forEach((d, i) => {
+    if (d.state === 'away') return;
+    dfU.set([d.x, d.y, d.a, t * 60 + i], i * 4);
+    dfB.set([d.state === 'hover' && d.dip > 0 ? d.h * Math.max(0.2, d.dip * 2) : d.h, d.kind, 1, 0], i * 4);
+  });
+  ripU.fill(0);
+  rips.forEach((r, i) => ripU.set([r.x, r.y, r.age, r.amp], i * 4));
+}
+// reed tufts: the old set fades out while the new one fades in
+function fillReeds() {
+  reedU.fill(0);
+  let n = 0;
+  const put = (list, k) => {
+    if (!list || k <= 0.01) return;
+    for (const r of list) { if (n >= REED_MAX) return; reedU.set([r[0], r[1], r[2] * k, r[3]], n * 4); n++; }
+  };
+  if (FA && FB && FA !== FB && curMix < 1) {
+    const ka = sstep(0.5, 0, curMix), kb = sstep(0.5, 1, curMix);
+    // when they overflow, give the incoming set priority
+    put(FB.reeds, kb); put(FA.reeds, ka);
+  } else if (FB) put(FB.reeds, 1);
+}
+
+/* ======================================================================
+   Frame loop
+   ====================================================================== */
+function resize() {
+  W = innerWidth; H = innerHeight;
+  const scale = PREVIEW ? 0.45 : Math.min(devicePixelRatio || 1, P.quality);
+  const box = cv.getBoundingClientRect();
+  cv.width = Math.round((box.width || W) * scale); cv.height = Math.round((box.height || H) * scale); cv._scale = scale;
+  Gw = Math.ceil(W / STEP) + 2; Gh = Math.ceil(H / STEP) + 2;
+  buildNoise();
+  allocField();
+}
+
+const T0 = performance.now();
+let lastT = 0, fpsEMA = 0, frameN = 0, frameMs = 0, lifeT = 0, waterT = 0;
+let paused = false;
+function frame(now) {
+  requestAnimationFrame(frame);
+  if (paused) { lastT = 0; return; }
+  if (P.cap30 && now - lastT < 31) return;
+  const dt = lastT ? Math.min((now - lastT) / 1000, 0.1) : 0.03;
+  if (lastT) fpsEMA = fpsEMA ? fpsEMA * 0.9 + (1 / dt) * 0.1 : 1 / dt;
+  lastT = now;
+  const sdt = dt * P.speed;
+  lifeT += sdt; waterT += sdt;
+  stepLife(lifeT, sdt);
+  draw(now);
+  frameN++;
+}
+function draw(now) {
+  const t0 = performance.now();
+  const e = Math.min(Math.max((now - morphT0) / morphDur, 0), 1);
+  curMix = e < 0.5 ? 2 * e * e : 1 - Math.pow(-2 * e + 2, 2) / 2;
+  fillReeds();
+  const { p, U } = PR;
+  gl.useProgram(p);
+  gl.viewport(0, 0, cv.width, cv.height);
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, noiseTex);
+  gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, ftex[fromI]);
+  gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D, ftex[toI]);
+  gl.uniform1i(U.uNoise, 0); gl.uniform1i(U.uFA, 1); gl.uniform1i(U.uFB, 2);
+  gl.uniform2f(U.uRes, cv.width / cv._scale, cv.height / cv._scale);
+  gl.uniform2f(U.uGrid, Gw, Gh);
+  gl.uniform1f(U.uScale, cv._scale);
+  gl.uniform1f(U.uSeed, (seed % 997) * 0.37);
+  gl.uniform1f(U.uStep, STEP);
+  gl.uniform1f(U.uMix, curMix);
+  gl.uniform1f(U.uTime, waterT % 3600);
+  gl.uniform1f(U.uLily, P.lilies);
+  gl.uniform4fv(U.uRip, ripU);
+  gl.uniform4fv(U.uStr, strU); gl.uniform1f(U.uStrN, Math.min(striders.length, 4));
+  gl.uniform4fv(U.uDf, dfU); gl.uniform4fv(U.uDfB, dfB);
+  gl.uniform4fv(U.uReed, reedU);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+  frameMs = performance.now() - t0;
+}
+
+/* ======================================================================
+   Settings / hosted mode
+   ====================================================================== */
+let iconsSeen = !(WALL || PREVIEW);
+function reseed(v) {
+  seed = v; buildNoise();
+  if (!iconsSeen) { refresh(); return; }
+  commit(true);
+}
+function applySettings(v) {
+  if (typeof v.seed === 'number' && v.seed !== seed) reseed(v.seed);
+  let field = false;
+  for (const k in v) {
+    if (!KEYS[k] || typeof v[k] !== 'number' || !isFinite(v[k]) || P[k] === v[k]) continue;
+    const [lo, hi] = KEYS[k];
+    P[k] = Math.min(Math.max(v[k], lo), hi);
+    if (k === 'sigma' || k === 'warp') field = true;
+  }
+  if (field && FB) commit();                      // land size / shoreline: smooth transition too
+}
+function drawGhosts() {
+  const box = document.getElementById('ghosts');
+  if (box) box.innerHTML = icons.map(ic => `<div class="ghost" style="left:${ic.x}px;top:${ic.y}px;width:${ic.w}px;height:${ic.h}px"><i></i><b></b></div>`).join('');
+}
+function startHostedMode() {
+  if (PREVIEW) {
+    document.body.classList.add('preview');
+    const g = document.createElement('div'); g.id = 'ghosts'; document.body.appendChild(g);
+  }
+  icons = [];
+  refresh();                                     // open pond until we know where the icons are
+  let first = true;
+  const handle = m => {
+    if (!m || typeof m !== 'object') return;
+    if (m.t === 'pause') { paused = PREVIEW ? false : !!m.v; return; }
+    if (m.t === 'settings') { applySettings(m.v || {}); return; }
+    if (m.t === 'reset') { applySettings(Object.assign({}, DEFAULTS, m.v || {})); return; }
+    if (m.t !== 'icons') return;
+    const k = window.devicePixelRatio || 1;       // physical -> CSS pixels
+    icons = m.vis && Array.isArray(m.r) ? m.r.map(([l, t, r, b]) => ({ x: l / k, y: t / k, w: (r - l) / k, h: (b - t) / k })) : [];
+    if (PREVIEW) drawGhosts();
+    iconsSeen = true;
+    commit(first);                                // first time: land grows in; later: smooth transition
+    first = false;
+  };
+  if (PREVIEW) {
+    addEventListener('message', ev => { if (ev.source === parent) { try { handle(typeof ev.data === 'string' ? JSON.parse(ev.data) : ev.data); } catch (e) {} } });
+    parent.postMessage(JSON.stringify({ t: 'ready' }), '*');
+    return;
+  }
+  const host = window.chrome && window.chrome.webview;
+  if (!host) return;
+  host.addEventListener('message', ev => { try { handle(JSON.parse(ev.data)); } catch (e) { console.error(e); } });
+  host.postMessage('ready');
+}
+function startDemo() {
+  // plain browser: a column of icons on the right and a few scattered ones
+  const list = [];
+  for (let r = 0; r < 6; r++) list.push({ x: W - 90, y: 10 + r * 100, w: 76, h: 92 });
+  list.push({ x: W * 0.22, y: H * 0.3, w: 76, h: 92 }, { x: W * 0.45, y: H * 0.62, w: 76, h: 92 }, { x: W * 0.52, y: H * 0.18, w: 76, h: 92 });
+  icons = list;
+  commit(true);
+}
+
+let resizeT = 0;
+addEventListener('resize', () => {
+  clearTimeout(resizeT);
+  resizeT = setTimeout(() => { resize(); refresh(); }, 100);
+});
+
+window.__dbg = { P, stats: () => ({ fieldMs, frameMs, fps: fpsEMA }) };
+resize();
+buildNoiseTex();
+if (WALL || PREVIEW) startHostedMode();
+else startDemo();
+requestAnimationFrame(frame);
+</script>
+<script src="share.js"></script>
+</body>
+</html>

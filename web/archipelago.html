@@ -1,0 +1,1389 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Iconland · Archipelago</title>
+<!--
+  Iconland · Archipelago theme (a deep tropical ocean seen from straight above; pure WebGL2, one full-screen pass)
+  - Islands: a CPU field (gaussian metaballs around the icons + noise warp) gives the signed distance to the coast
+    (<0 on land). Each icon or cluster of nearby icons becomes an island: a white surf ring, a sandy rim and a lush
+    green interior with soft hills and a canopy of round tree crowns. Turquoise lagoon shallows with reef patches
+    fall off into deep blue open water with calm painted wave strokes.
+  - Ships: a few small sailing ships travel from island to island. Routes are found with A* on a coarse grid of
+    water cells with clearance from the coast, string-pulled and smoothed (Chaikin), and followed at a calm speed
+    with rate-limited turning. Ships dock for a few seconds off a harbour point, furl their sails, then pick a new
+    destination. When the icons move, routes are re-planned; ships caught by new land slide off it (or fade out
+    and back in at a harbour). Each ship leaves a fading white wake (its recent stern positions in a small
+    texture) and casts a small shadow on the water.
+-->
+<style>
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #0b3557; }
+  #art { position: fixed; inset: 0; width: 100vw; height: 100vh; display: block; }
+  #ghosts { position: fixed; inset: 0; pointer-events: none; display: none; }
+  body.preview #ghosts { display: block; }
+  .ghost { position: absolute; }
+  .ghost i { position: absolute; left: 50%; top: 4px; width: 48px; height: 48px; margin-left: -24px; border-radius: 9px;
+    background: rgba(255,255,255,.88); box-shadow: 3px 6px 8px rgba(20,40,30,.3); }
+  .ghost b { position: absolute; left: 14%; right: 14%; top: 60px; height: 10px; border-radius: 5px; background: rgba(255,255,255,.75); }
+  #nogl { position: fixed; inset: 0; display: none; place-items: center; color: #fff; font: 16px system-ui, sans-serif; }
+</style>
+</head>
+<body>
+<canvas id="art"></canvas>
+<div id="nogl">WebGL2 is not available.</div>
+<script>
+'use strict';
+
+/* ======================================================================
+   Parameters
+   ====================================================================== */
+const CELL_W = 76, CELL_H = 100, GRID_X0 = 4, GRID_Y0 = 6, TASKBAR = 0;
+const STEP = 5;
+const MORPH_MS = 1800;
+
+const QS = new URLSearchParams(location.search);
+const WALL = QS.has('wallpaper');
+const PREVIEW = QS.has('preview');
+const LIFETEST = QS.has('lifetest');     // debug: ships start mid-route right away, state printed into __snapErrors
+// Defaults must match themes.json
+const P = {
+  sigma: 62, warp: 40, ships: 4, speed: 1, waves: 1,
+  quality: 2, cap30: true,
+};
+const DEFAULTS = Object.assign({}, P);
+const KEYS = { sigma: [30, 140], warp: [0, 80], ships: [0, 8], speed: [0.3, 3], waves: [0, 2] };
+
+/* ======================================================================
+   Random / noise helpers (CPU)
+   ====================================================================== */
+let seed = (Math.random() * 1e6) | 0;
+function hash2(x, y, k = 0) {
+  let h = Math.imul(x | 0, 374761393) ^ Math.imul(y | 0, 668265263) ^ Math.imul(seed + k, 2246822519);
+  h = Math.imul(h ^ (h >>> 13), 1274126177);
+  return ((h ^ (h >>> 16)) >>> 0) / 4294967296;
+}
+function vnoise(x, y, k = 0) {
+  const ix = Math.floor(x), iy = Math.floor(y), fx = x - ix, fy = y - iy;
+  const ux = fx * fx * (3 - 2 * fx), uy = fy * fy * (3 - 2 * fy);
+  const a = hash2(ix, iy, k), b = hash2(ix + 1, iy, k), c = hash2(ix, iy + 1, k), d = hash2(ix + 1, iy + 1, k);
+  return a + (b - a) * ux + (c - a) * uy + (a - b - c + d) * ux * uy;
+}
+function fbm(x, y, k = 0) {
+  let a = 0.5, s = 0;
+  for (let i = 0; i < 4; i++) { s += a * vnoise(x, y, k + i * 7); x = x * 2.03 + 17.1; y = y * 2.03 + 17.1; a *= 0.5; }
+  return s;
+}
+// Tileable noise texture (fixed): 4 channels of fbm at different scales
+function tileNoise(x, y, px, py, k) {
+  const ix = Math.floor(x), iy = Math.floor(y), fx = x - ix, fy = y - iy;
+  const ux = fx * fx * (3 - 2 * fx), uy = fy * fy * (3 - 2 * fy);
+  const m = (v, p) => ((v % p) + p) % p;
+  const x0 = m(ix, px), x1 = m(ix + 1, px), y0 = m(iy, py), y1 = m(iy + 1, py);
+  const h = (a, b) => { let v = Math.imul(a, 374761393) ^ Math.imul(b, 668265263) ^ Math.imul(k, 2246822519); v = Math.imul(v ^ (v >>> 13), 1274126177); return ((v ^ (v >>> 16)) >>> 0) / 4294967296; };
+  const a = h(x0, y0), b = h(x1, y0), c = h(x0, y1), d = h(x1, y1);
+  return a + (b - a) * ux + (c - a) * uy + (a - b - c + d) * ux * uy;
+}
+function makeNoiseImage() {
+  const S = 256, d = new Uint8Array(S * S * 4);
+  const chans = [[8, 16, 32, 64], [8, 16, 32, 64], [4, 8, 16, 32], [16, 32, 64, 128]];
+  for (let y = 0; y < S; y++) for (let x = 0; x < S; x++) {
+    const u = x / S, v = y / S, i = (y * S + x) * 4;
+    for (let c = 0; c < 4; c++) {
+      let s = 0, w = 0.5, tw = 0;
+      for (let j = 0; j < chans[c].length; j++) { const p = chans[c][j]; s += w * tileNoise(u * p, v * p, p, p, 300 + c * 50 + j * 13); tw += w; w *= 0.5; }
+      d[i + c] = Math.min(Math.max((s / tw - 0.5) * 1.9 + 0.5, 0), 1) * 255;
+    }
+  }
+  return { S, d };
+}
+const sstep = (a, b, x) => { const t = Math.min(Math.max((x - a) / (b - a), 0), 1); return t * t * (3 - 2 * t); };
+
+/* ======================================================================
+   Island field (CPU): s = signed distance to the coast (<0 on land)
+   ====================================================================== */
+let W = innerWidth, H = innerHeight, Gw = 1, Gh = 1, NZ = null;
+function buildNoise() {
+  const N = Gw * Gh;
+  NZ = { wx: new Float32Array(N), wy: new Float32Array(N) };
+  for (let gy = 0; gy < Gh; gy++) for (let gx = 0; gx < Gw; gx++) {
+    const i = gy * Gw + gx, x = gx * STEP, y = gy * STEP;
+    NZ.wx[i] = fbm(x * 0.0032, y * 0.0032, 1) - 0.47;
+    NZ.wy[i] = fbm(x * 0.0032, y * 0.0032, 2) - 0.47;
+  }
+}
+let fieldMs = 0;
+function computeField(rects) {
+  const t0 = performance.now();
+  const N = Gw * Gh, f1 = new Float32Array(N);
+  const sig = P.sigma, is1 = 1 / (sig * sig);
+  const wa = P.warp * 2.2, wmax = wa * 0.5;
+  for (const r of rects) {
+    const R = 5.5 * sig + Math.max(r.hw, r.hh) * 0.5 + wmax;
+    const gx0 = Math.max(0, Math.floor((r.cx - R) / STEP)), gx1 = Math.min(Gw - 1, Math.ceil((r.cx + R) / STEP));
+    const gy0 = Math.max(0, Math.floor((r.cy - R) / STEP)), gy1 = Math.min(Gh - 1, Math.ceil((r.cy + R) / STEP));
+    const chw = r.hw * 0.5, chh = r.hh * 0.5;
+    for (let gy = gy0; gy <= gy1; gy++) for (let gx = gx0; gx <= gx1; gx++) {
+      const i = gy * Gw + gx;
+      const qx = gx * STEP + NZ.wx[i] * wa, qy = gy * STEP + NZ.wy[i] * wa;
+      let dx = Math.abs(qx - r.cx) - chw, dy = Math.abs(qy - r.cy) - chh;
+      if (dx < 0) dx = 0; if (dy < 0) dy = 0;
+      f1[i] += Math.exp(-(dx * dx + dy * dy) * is1);
+    }
+  }
+  // floor = the contribution at the edge of the evaluated window, so open water has no square seams
+  const c0 = Math.sqrt(-Math.log(0.35)), s = new Float32Array(N), fMin = Math.exp(-30);
+  for (let i = 0; i < N; i++) {
+    const g = Math.log(Math.max(f1[i], fMin));
+    s[i] = Math.min(400, sig * (Math.sqrt(Math.max(-g, 0)) - c0) - sig * 0.6 * Math.max(g, 0));
+  }
+  fieldMs = performance.now() - t0;
+  return { s };
+}
+function sampleArr(a, x, y) {
+  const fx = Math.min(Math.max(x / STEP, 0), Gw - 1.001), fy = Math.min(Math.max(y / STEP, 0), Gh - 1.001);
+  const ix = Math.floor(fx), iy = Math.floor(fy), tx = fx - ix, ty = fy - iy, i = iy * Gw + ix;
+  return (a[i] * (1 - tx) + a[i + 1] * tx) * (1 - ty) + (a[i + Gw] * (1 - tx) + a[i + Gw + 1] * tx) * ty;
+}
+
+/* ======================================================================
+   Shaders
+   ====================================================================== */
+const VS = `#version 300 es
+void main() {
+  vec2 p = vec2(float((gl_VertexID << 1) & 2), float(gl_VertexID & 2));
+  gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);
+}`;
+
+const MAXSHIP = 8, WAKE_K = 40, MAXFX = 6, MAXDEB = 28;
+const FS = `#version 300 es
+precision highp float;
+uniform sampler2D uNoise, uFA, uFB;
+uniform highp sampler2D uWake;   // one row per ship: (x, y, age s, ship alpha), newest first; age < 0 = end
+uniform vec2 uRes, uGrid;
+uniform float uScale, uSeed, uStep, uMix, uTime, uWaves, uSigma;
+uniform int uShipN;
+uniform vec4 uShip[${MAXSHIP}];       // x, y, heading, alpha
+uniform vec4 uShipB[${MAXSHIP}];      // scale, sail (0 furled .. 1 set), boom side -1..1, style index
+uniform vec4 uWakeBox[${MAXSHIP}];    // bounding box of the wake (x0, y0, x1, y1)
+uniform vec4 uShipC[${MAXSHIP}];      // sinking 0..1 (darker), squish (heeling: narrower), bob phase, -
+uniform int uFxN, uDebN;
+uniform vec4 uFx[${MAXFX}];           // x, y, kind (0 whirlpool, 1 splash), strength (whirlpool) / phase 0..1 (splash)
+uniform vec4 uFxB[${MAXFX}];          // whirlpool: radius, turn direction, turned angle; splash: scale, -, seed
+uniform vec4 uDeb[${MAXDEB}];         // wreck debris: x, y, rotation, alpha
+uniform vec4 uDebB[${MAXDEB}];        // type (0 bow half, 1 stern half, 2 plank, 3 sail scrap, 4 spar), scale, style, sinking
+out vec4 o;
+
+const int WAKE_K = ${WAKE_K};
+// water: surf-side shallows -> lagoon -> reef blue -> ocean -> abyss
+const vec3 SHOAL = vec3(0.60, 0.90, 0.80), LAGOON = vec3(0.16, 0.73, 0.75), REEFB = vec3(0.05, 0.50, 0.66);
+const vec3 OCEAN = vec3(0.04, 0.30, 0.52), ABYSS = vec3(0.025, 0.15, 0.34);
+const vec3 FOAM = vec3(0.96, 0.98, 0.98), CREST = vec3(0.40, 0.64, 0.82);
+const vec3 SAND_WET = vec3(0.82, 0.74, 0.56), SAND = vec3(0.95, 0.88, 0.69), SAND_HI = vec3(0.99, 0.95, 0.82);
+const vec3 GRASS = vec3(0.47, 0.62, 0.27), JUNGLE = vec3(0.16, 0.42, 0.20), JUNGLE_D = vec3(0.07, 0.25, 0.13), JUNGLE_HI = vec3(0.42, 0.62, 0.26);
+const vec2 LIGHT = vec2(-0.6, -0.8);                        // sun in the upper left
+const vec2 SHOFF = vec2(2.2, 3.0);                          // ship shadow offset on the water
+const float SWELL = -0.42;
+
+float hash2(vec2 p) {
+  vec3 p3 = fract(vec3(p.xyx) * 0.1031);
+  p3 += dot(p3, p3.yzx + 33.33);
+  return fract((p3.x + p3.y) * p3.z);
+}
+float ss(float a, float b, float x) { float t = clamp((x - a) / (b - a), 0.0, 1.0); return t * t * (3.0 - 2.0 * t); }
+vec4 N(vec2 p, float scale) { return texture(uNoise, p / scale + uSeed * 0.013); }
+float fieldS(sampler2D t, vec2 p) { return texture(t, (p / uStep + 0.5) / uGrid).r; }
+float sAt(vec2 p) { return mix(fieldS(uFA, p), fieldS(uFB, p), uMix); }
+float segD(vec2 p, vec2 a, vec2 b) { vec2 pa = p - a, ba = b - a; return length(pa - ba * clamp(dot(pa, ba) / dot(ba, ba), 0.0, 1.0)); }
+mat2 rot(float a) { float c = cos(a), s = sin(a); return mat2(c, s, -s, c); }
+
+// short painted crest strokes on open water: at most one per cell of a swell-aligned grid, each with its own slow clock
+vec2 waveInk(vec2 p, float t) {
+  vec2 q = rot(SWELL) * p;
+  q.y += t * 2.0;
+  const vec2 G = vec2(52.0, 11.0);
+  float ink = 0.0, foam = 0.0;
+  for (int j = -1; j <= 1; j++) {
+    float row = floor(q.y / G.y) + float(j);
+    vec2 c = vec2(floor((q.x - row * 19.0) / G.x), row);
+    vec2 cp = (c + 0.5) * G + vec2(row * 19.0, 0.0);
+    float h = hash2(c + 5.1);
+    float dens = (0.05 + 0.38 * ss(0.35, 0.8, N(cp, 700.0).r)) * min(uWaves, 1.5);
+    if (h > dens) continue;
+    float life = sin(fract(t * (0.04 + 0.045 * hash2(c + 7.7)) + hash2(c + 1.3)) * 3.14159);
+    life *= life;
+    float len = 8.0 + 12.0 * hash2(c + 1.9);
+    vec2 ctr = cp + (vec2(hash2(c + 4.3), hash2(c + 5.9)) - 0.5) * vec2(10.0, 4.0);
+    vec2 d = q - ctr;
+    d.y -= (0.10 + 0.12 * hash2(c + 6.6)) * d.x * d.x / len;
+    float k = clamp(d.x / len, -1.0, 1.0);
+    float th = (0.15 + 0.7 * (1.0 - k * k)) * (0.7 + 0.5 * hash2(c + 9.1));
+    float a = (1.0 - ss(th * 0.4, th + 0.75, segD(d, vec2(-len, 0.0), vec2(len, 0.0)))) * life;
+    ink = max(ink, a * (0.3 + 0.35 * hash2(c + 2.7)));
+    if (hash2(c + 12.7) < 0.03 + 0.18 * ss(0.62, 0.88, N(cp + 90.0, 380.0).g) * min(uWaves, 1.5)) foam = max(foam, a * 0.75);
+  }
+  return vec2(ink, foam);
+}
+
+// tree crowns on a jittered grid: returns (shade 0..1 inside a crown / -1 in a gap, crown tone id)
+vec2 canopy(vec2 p, float G) {
+  vec2 c0 = floor(p / G);
+  float best = 1e9, tone = 0.0, lit = 0.0;
+  for (int j = -1; j <= 1; j++) for (int i = -1; i <= 1; i++) {
+    vec2 c = c0 + vec2(float(i), float(j));
+    vec2 ctr = (c + 0.5 + (vec2(hash2(c + 3.7), hash2(c + 9.2)) - 0.5) * 0.7) * G;
+    float r = G * (0.55 + 0.35 * hash2(c + 1.1));
+    vec2 d = (p - ctr) / r;
+    float dd = dot(d, d);
+    // crowns lower on the screen sit "on top" (painter's order), so prefer them when overlapping
+    float key = -ctr.y - hash2(c + 8.8) * 2.0;
+    if (dd < 1.0 && key < best) { best = key; tone = hash2(c + 5.5); lit = clamp(0.6 + dot(d, LIGHT) * 0.5 - dd * 0.3, 0.0, 1.0) * (1.0 - 0.45 * ss(0.6, 1.0, dd)); }
+  }
+  return best > 1e8 ? vec2(-1.0, 0.0) : vec2(lit, tone);
+}
+
+// ---------- a small sailing ship, seen from straight above (forward = +x, units: px at scale 1) ----------
+float hullD(vec2 q) {
+  float x = q.x;
+  float w = x > 0.0 ? 4.2 * (1.0 - pow(clamp(x / 11.5, 0.0, 1.0), 1.7)) : 4.2 * sqrt(max(0.0, 1.0 - pow(clamp(-x / 9.5, 0.0, 1.0), 4.0)));
+  return max(abs(q.y) - w, max(x - 11.5, -9.5 - x)) * 0.85;
+}
+// a fore-and-aft sail seen from above: from the mast at m its boom runs aft, swung out by ang (to leeward);
+// the cloth bellies out beyond the boom. Returns (distance, across 0..1 from boom to belly)
+vec2 sailD(vec2 q, vec2 m, float ang, float Lb, float belly) {
+  vec2 r = rot(-ang) * (q - m);            // boom along -x
+  float u = -r.x / Lb;                     // 0 at the mast .. 1 at the boom end
+  float side = ang >= 0.0 ? 1.0 : -1.0;
+  float v = r.y * side;                    // >0 on the belly side
+  float uc = clamp(u, 0.0, 1.0);
+  float prof = belly * 4.0 * uc * pow(1.0 - uc, 0.75) + 0.45;
+  float d = max(abs(v - prof * 0.5 + 0.2) - prof * 0.5, max(-r.x - Lb, r.x));
+  return vec2(d, clamp(v / max(prof, 0.5), 0.0, 1.0));
+}
+// colour + coverage of a ship; q in ship space (already divided by scale); aa = one screen pixel in ship units
+// sail: 0 furled .. 1 set; boom: -1..1 which side the booms swing to; style 0..3
+vec4 shipCol(vec2 q, float sail, float boom, float style, float t, float aa) {
+  float dh = hullD(q);
+  float m = ss(aa, -aa, dh);
+  vec3 wood = style < 1.0 ? vec3(0.42, 0.25, 0.13) : style < 2.0 ? vec3(0.62, 0.17, 0.12) : style < 3.0 ? vec3(0.13, 0.22, 0.36) : vec3(0.90, 0.88, 0.80);
+  vec3 col = wood * 0.8;
+  vec3 deck = vec3(0.80, 0.62, 0.40);
+  float inDeck = ss(aa, -aa, dh + 1.0);
+  col = mix(col, deck * (0.92 + 0.08 * step(0.5, fract(q.y * 0.55 + 0.25))), inDeck);   // planks along the hull
+  // small cabin at the stern
+  float cab = max(abs(q.x + 5.6) - 2.2, abs(q.y) - 2.0);
+  col = mix(col, wood * 1.1 + 0.08, ss(aa, -aa, cab));
+  col = mix(col, wood * 0.6, ss(aa, -aa, abs(cab + 0.5) - 0.3) * ss(aa, -aa, cab));
+  float a = m;
+  // bowsprit
+  float bs = max(abs(q.y) - 0.4, max(q.x - 15.0, 10.0 - q.x));
+  col = mix(col, vec3(0.32, 0.21, 0.12), ss(aa, -aa, bs));
+  a = max(a, ss(aa, -aa, bs));
+  // jib: from the bowsprit tip to the fore mast, bellied to leeward
+  float ang = boom * 0.68 * sail;
+  vec3 cloth = style == 3.0 ? vec3(0.99, 0.98, 0.95) : vec3(0.98, 0.94, 0.85);
+  vec2 jb = sailD(q, vec2(13.5, 0.0), ang * 0.45, 7.5, 1.3 * sail);
+  float jm = ss(aa, -aa, jb.x) * ss(0.02, 0.15, sail);
+  col = mix(col, cloth * (0.84 + 0.18 * jb.y), jm);
+  a = max(a, jm);
+  // fore and main sail on their booms
+  for (int k = 0; k < 2; k++) {
+    vec2 mp = k == 0 ? vec2(5.5, 0.0) : vec2(0.5, 0.0);
+    float Lb = k == 0 ? 5.8 : 9.5;
+    vec2 sd = sailD(q, mp, ang, Lb, mix(0.15, k == 0 ? 2.4 : 3.8, sail));
+    float sm = ss(aa, -aa, sd.x);
+    vec3 sc = cloth * (0.80 + 0.22 * sd.y);                                                   // belly catches the light
+    if (style == 2.0) sc = mix(sc, vec3(0.82, 0.25, 0.20), step(0.5, fract(-(rot(-ang) * (q - mp)).x / Lb * 2.0)) * 0.8 * sail);   // two-tone sails
+    col = mix(col, sc, sm);
+    // boom along the sail's foot and the mast
+    vec2 r = rot(-ang) * (q - mp);
+    col = mix(col, vec3(0.30, 0.20, 0.11), ss(aa, -aa, max(abs(r.y) - 0.33, max(-r.x - Lb, r.x))) * 0.9);
+    col = mix(col, vec3(0.22, 0.14, 0.08), ss(aa, -aa, length(q - mp) - 0.9));
+    a = max(a, sm);
+  }
+  // a pennant at the main mast top, streaming aft and fluttering gently
+  vec3 flag = style < 1.0 ? vec3(0.86, 0.20, 0.17) : style < 2.0 ? vec3(0.98, 0.80, 0.22) : style < 3.0 ? vec3(0.95, 0.95, 0.92) : vec3(0.15, 0.55, 0.85);
+  float fx = -(q.x - 0.5);
+  float fy = q.y - 0.45 * sin(fx * 1.2 - t * 3.0) * ss(0.0, 2.0, fx);
+  float fd = max(abs(fy) - 0.8 * (1.0 - fx / 4.5), max(-fx, fx - 4.5));
+  float fm = ss(aa, -aa, fd);
+  col = mix(col, flag, fm);
+  a = max(a, fm);
+  return vec4(col, a);
+}
+float shipShadow(vec2 q, float sail, float boom, float aa) {
+  float d = hullD(q);
+  float ang = boom * 0.68 * sail;
+  vec2 o = vec2(-1.2, 1.6);                                 // sails stand higher: their shadow falls a little farther
+  d = min(d, sailD(q - o, vec2(5.5, 0.0), ang, 5.8, mix(0.15, 2.6, sail)).x);
+  d = min(d, sailD(q - o, vec2(0.5, 0.0), ang, 9.5, mix(0.15, 3.6, sail)).x);
+  return ss(aa + 1.2, -aa - 0.6, d);
+}
+
+vec3 woodOf(float style) { return style < 1.0 ? vec3(0.42, 0.25, 0.13) : style < 2.0 ? vec3(0.62, 0.17, 0.12) : style < 3.0 ? vec3(0.13, 0.22, 0.36) : vec3(0.90, 0.88, 0.80); }
+// one piece of a wrecked ship (q in piece space, divided by scale)
+vec4 debrisCol(vec2 q, float type, float style, float aa) {
+  vec3 wood = woodOf(style), c;
+  float d;
+  if (type < 1.5) {
+    // a hull half with a splintered break
+    vec2 h = q + vec2(type < 0.5 ? 5.5 : -4.0, 0.0);
+    float brk = h.x - 0.6 - 0.55 * sin(h.y * 2.3 + 1.0) - 0.3 * sin(h.y * 5.1);
+    d = max(hullD(h), type < 0.5 ? -brk : brk);
+    c = wood * 0.8;
+    float inDeck = ss(aa, -aa, d + 1.0);
+    c = mix(c, vec3(0.80, 0.62, 0.40) * (0.92 + 0.08 * step(0.5, fract(h.y * 0.55 + 0.25))), inDeck);
+    if (type > 0.5) c = mix(c, wood * 1.1 + 0.08, ss(aa, -aa, max(abs(h.x + 5.6) - 2.2, abs(h.y) - 2.0)));
+    c = mix(c, vec3(0.86, 0.72, 0.50), ss(aa, -aa, abs(brk) - 0.45) * inDeck);          // raw splintered wood
+  } else if (type < 2.5) {
+    d = max(abs(q.x) - 3.4, abs(q.y) - 0.7);
+    c = vec3(0.76, 0.58, 0.36) * (0.88 + 0.12 * step(0.5, fract(q.x * 0.35 + 0.1)));
+  } else if (type < 3.5) {
+    float an = atan(q.y, q.x);
+    d = (length(q / vec2(3.0, 2.0)) - 1.0 + 0.2 * sin(an * 3.0 + 1.0)) * 2.0;
+    c = (style == 3.0 ? vec3(0.99, 0.98, 0.95) : vec3(0.98, 0.94, 0.85)) * (0.82 + 0.15 * ss(-2.0, 2.0, -q.y));
+    if (style == 2.0) c = mix(c, vec3(0.82, 0.25, 0.20), step(0.0, q.x) * 0.8);
+  } else {
+    d = max(abs(q.x) - 4.6, abs(q.y) - 0.42);
+    c = vec3(0.30, 0.20, 0.11);
+  }
+  return vec4(c, ss(aa, -aa, d));
+}
+// a whirlpool: the water darkens into a funnel, foam arms spiral in, a few flecks ride round, a foam rim
+vec3 vortexCol(vec3 col, vec2 p, vec4 f, vec4 fb) {
+  vec2 d = p - f.xy;
+  float R = fb.x, r = length(d), str = f.w;
+  if (r > R * 1.5 || str <= 0.0) return col;
+  float rn = r / R, dir = fb.y;
+  vec2 dr = rot(-fb.z) * d;                                  // frame turning with the water (textures stay with it)
+  float a = atan(dr.y, dr.x);
+  float n = N(dr + 400.0, 24.0).r;
+  float band = ss(0.08, 0.3, rn) * (1.0 - ss(0.75, 1.3, rn));
+  float ph = 3.0 * a + dir * 7.0 * log(r * 0.25 + 1.0);
+  float arms = ss(0.3, 0.92, sin(ph + n * 2.2)) * band;
+  col = mix(col, col * vec3(0.55, 0.68, 0.80), exp(-rn * rn * 2.6) * str * 0.85);   // the funnel
+  col = mix(col, vec3(0.02, 0.07, 0.14), (1.0 - ss(0.0, 0.24, rn)) * str * 0.85);  // its dark throat
+  col = mix(col, mix(col, FOAM, 0.85), arms * str * (0.45 + 0.4 * n));
+  col = mix(col, FOAM, (1.0 - ss(0.0, 0.14, abs(rn - 1.0 - 0.1 * (n - 0.5)))) * str * 0.4);
+  vec2 bc = floor(dr / 4.5);
+  vec2 bp = (bc + 0.25 + 0.5 * vec2(hash2(bc + 3.0), hash2(bc + 5.0))) * 4.5;
+  float bub = (1.0 - ss(0.3, 0.8, length(dr - bp))) * step(hash2(bc + 17.0), 0.14) * band;
+  return mix(col, FOAM, bub * str * 0.75);
+}
+// a splash: a broken foam ring racing out and a foamy patch in the middle, both fading
+vec3 splashCol(vec3 col, vec2 p, vec4 f, vec4 fb, vec3 tint, float amt) {
+  vec2 d = p - f.xy;
+  float r = length(d), ph = f.w, sc = fb.x;
+  if (r > 36.0 * sc) return col;
+  float e = 1.0 - pow(1.0 - ph, 2.5);
+  float n = N(d + fb.z * 300.0, 12.0).r;                     // fixed relative to the splash centre
+  float R = (5.0 + 20.0 * e) * sc;
+  float ring = 1.0 - ss(0.6 + 1.5 * e, 2.4 + 4.0 * e, abs(r - R - (n - 0.5) * 5.0));
+  float core = (1.0 - ss(0.0, (7.0 + 9.0 * e) * sc, r)) * ss(0.3, 0.6, n + 0.35 * (1.0 - ph));
+  return mix(col, tint, amt * clamp((ring * (0.5 + 0.5 * n) + core * 0.85) * pow(1.0 - ph, 1.4), 0.0, 1.0));
+}
+
+// the white wake of ship i: its recent stern positions, the V spreading and fading with age
+float wakeOf(vec2 p, int i) {
+  vec4 b = uWakeBox[i];
+  if (p.x < b.x || p.y < b.y || p.x > b.z || p.y > b.w) return 0.0;
+  float acc = 0.0;
+  vec4 a = texelFetch(uWake, ivec2(0, i), 0);
+  if (a.z < 0.0) return 0.0;
+  float br = N(p, 26.0).g;                                   // fixed in world space, like the wake itself
+  for (int k = 1; k < WAKE_K; k++) {
+    vec4 c = texelFetch(uWake, ivec2(k, i), 0);
+    if (c.z < 0.0) break;
+    vec2 pa = p - a.xy, ba = c.xy - a.xy;
+    float hr = dot(pa, ba) / max(dot(ba, ba), 1e-4), h = clamp(hr, 0.0, 1.0);
+    float d = length(pa - ba * h), age = mix(a.z, c.z, h);
+    float inSeg = ss(-0.35, 0.0, hr) * ss(1.35, 1.0, hr);    // arms only alongside the segment (no round caps)
+    float hw = 1.8 + age * 2.3;
+    float fade = exp(-age * 0.5) * a.w;
+    float arms = (1.0 - ss(0.35 + age * 0.1, 1.2 + age * 0.3, abs(d - hw))) * (1.0 - ss(1.0, 7.0, age) * 0.5);
+    float churn = (1.0 - ss(0.0, 1.6 + age * 1.3, d)) * exp(-age * 0.55) * (0.75 + 0.25 * br);
+    acc = max(acc, max(arms * inSeg * (0.35 + 0.3 * br), churn * 0.8) * fade);
+    a = c;
+  }
+  return acc;
+}
+
+void main() {
+  vec2 p = vec2(gl_FragCoord.x, uRes.y * uScale - gl_FragCoord.y) / uScale;
+  float t = uTime;
+  float s = sAt(p);
+  vec4 n1 = N(p, 230.0), n2 = N(p + 51.0, 70.0);
+  vec3 col;
+
+  if (s > 0.0) {
+    // ---------- water ----------
+    vec2 drift = vec2(t * 1.3, t * 0.6);
+    float sw = s + (n1.r - 0.5) * 30.0 * ss(0.0, 50.0, s) + (n2.b - 0.5) * 10.0 * ss(0.0, 20.0, s);
+    float deep = sw + (N(p + drift * 0.5, 1500.0).b - 0.5) * 140.0 * ss(60.0, 160.0, sw);
+    col = mix(SHOAL, LAGOON, ss(2.0, 24.0, sw));
+    col = mix(col, REEFB, ss(30.0, 80.0, sw));
+    col = mix(col, OCEAN, ss(70.0, 150.0, deep));
+    col = mix(col, ABYSS, ss(150.0, 270.0, deep));
+    // the reef edge: a soft lighter band where the lagoon drops off into deep water
+    col += vec3(0.02, 0.06, 0.05) * ss(40.0, 62.0, sw) * ss(95.0, 68.0, sw);
+    // reef patches in the lagoon: darker coral heads with a lighter sandy halo
+    float rv = N(p + 333.0, 150.0).g * 0.65 + N(p + 77.0, 34.0).b * 0.35;
+    float reefZone = ss(8.0, 22.0, sw) * ss(82.0, 50.0, sw);
+    float reef = ss(0.62, 0.68, rv) * reefZone;
+    float halo = ss(0.54, 0.62, rv) * reefZone * (1.0 - reef);
+    col = mix(col, col * vec3(1.05, 1.06, 0.98) + vec3(0.06, 0.06, 0.03), halo * 0.45);
+    vec3 coral = mix(vec3(0.09, 0.50, 0.57), vec3(0.24, 0.54, 0.50), N(p + 11.0, 18.0).r);
+    col = mix(col, coral, reef * 0.6);
+    // light caustics over the shallows (slow)
+    float c1 = N(p + vec2(t * 2.2, t * 1.1), 46.0).r, c2 = N(p - vec2(t * 1.6, -t * 1.9) + 200.0, 52.0).g;
+    float cau = pow(max(0.0, 1.0 - abs(c1 - c2) * 3.2), 5.0);
+    col += vec3(0.10, 0.12, 0.10) * cau * ss(4.0, 14.0, sw) * ss(70.0, 30.0, sw) * min(uWaves, 1.5);
+    // long, gentle swell bands and painted crest strokes on open water
+    vec2 q = rot(SWELL) * p;
+    float bend = N(p, 900.0).r * 7.0 + N(p + 41.0, 260.0).g * 1.6;
+    float swl = sin(q.y * 0.045 + bend + t * 0.3);
+    float open = ss(60.0, 140.0, sw);
+    col *= 1.0 + (0.06 * swl) * open * uWaves;
+    vec2 wi = waveInk(p, t) * open;
+    col = mix(col, mix(col, CREST, 0.55), wi.x);
+    col = mix(col, FOAM, wi.y * 0.8);
+    // surf: a broken white ring right at the shore, and soft lines rolling in toward it
+    float sf = s + (n2.r - 0.5) * 3.0;
+    float ring = 1.0 - ss(1.2, 4.0 + 2.5 * n2.g, sf);
+    float roll = ss(0.82, 0.98, sin(sf * 0.33 + t * 0.9 + n1.g * 4.0)) * (1.0 - ss(5.0, 20.0, sf)) * ss(1.0, 4.0, sf);
+    col = mix(col, FOAM, clamp(ring * 0.95 + roll * 0.35 * min(uWaves, 1.5), 0.0, 1.0));
+    // brush texture
+    col *= 0.95 + 0.1 * N(p + 70.0, 120.0).a;
+
+    // ---------- wakes ----------
+    float wk = 0.0;
+    for (int i = 0; i < ${MAXSHIP}; i++) { if (i >= uShipN) break; wk = max(wk, wakeOf(p, i)); }
+    col = mix(col, FOAM, wk * 0.8);
+    // ---------- whirlpools ----------
+    for (int i = 0; i < ${MAXFX}; i++) { if (i >= uFxN) break; if (uFx[i].z < 0.5) col = vortexCol(col, p, uFx[i], uFxB[i]); }
+  } else {
+    // ---------- land ----------
+    float sandW = min(9.0 + 9.0 * N(p + 17.0, 260.0).r, 0.32 * uSigma);
+    float sl = s + (n2.g - 0.5) * 6.0;
+    col = mix(SAND, SAND_HI, ss(0.45, 0.8, N(p, 40.0).r) * 0.5);
+    col = mix(SAND_WET, col, ss(-0.5, -3.5, s));
+    // the jungle edge casts a soft shadow on the sand (sun in the upper left)
+    float sb = sAt(p + LIGHT * 5.0) + (N(p + LIGHT * 5.0 + 51.0, 70.0).g - 0.5) * 6.0;
+    col *= 1.0 - 0.16 * ss(-sandW - 1.0, -sandW - 5.0, sb) * (1.0 - ss(-sandW + 1.5, -sandW - 3.5, sl));
+    col *= 0.97 + 0.05 * N(p * 3.0, 50.0).a;
+    // elevation for the hill shading: rises inland, with soft noise hills
+    vec2 lp = p - LIGHT * 7.0;
+    float e0 = ss(-sandW, -140.0, s) + (N(p + 9.0, 210.0).r - 0.5) * 0.7 * ss(-sandW, -60.0, s);
+    float s1 = sAt(lp);
+    float e1 = ss(-sandW, -140.0, s1) + (N(lp + 9.0, 210.0).r - 0.5) * 0.7 * ss(-sandW, -60.0, s1);
+    float lit = clamp((e1 - e0) * 9.0, -1.0, 1.0);
+    // vegetation: grassy fringe, then the jungle canopy
+    float veg = ss(-sandW + 1.5, -sandW - 3.5, sl);
+    if (veg > 0.0) {
+      vec3 g = GRASS * (0.9 + 0.2 * N(p, 30.0).r);
+      float jung = ss(-sandW - 2.0, -sandW - 16.0, sl);
+      vec2 cn = canopy(p, 10.0);
+      vec3 jc = JUNGLE_D;
+      if (cn.x >= 0.0) {
+        vec3 base = mix(JUNGLE, mix(JUNGLE, vec3(0.24, 0.47, 0.17), 0.7), cn.y);
+        base = mix(base, vec3(0.12, 0.36, 0.24), step(0.82, cn.y) * 0.7);
+        jc = mix(base * 0.78, mix(base, JUNGLE_HI, 0.55), cn.x);
+      }
+      // bigger, softer canopy masses
+      jc *= 0.88 + 0.2 * N(p + 300.0, 90.0).g;
+      vec3 vc = mix(g, jc, jung);
+      // a few crowns already stand in the grass fringe
+      if (cn.x >= 0.0 && jung < 1.0 && cn.y > 0.72) vc = mix(vc, mix(JUNGLE * 0.85, JUNGLE_HI, cn.x), 1.0 - jung);
+      col = mix(col, vc, veg);
+      col *= 1.0 + 0.32 * lit * veg;
+      // hilltops a touch lighter and warmer
+      col = mix(col, col * vec3(1.08, 1.05, 0.92), ss(0.55, 0.95, e0) * 0.5 * veg);
+    }
+  }
+
+  // ---------- ships: shadow on the water, then the ship ----------
+  for (int i = 0; i < ${MAXSHIP}; i++) {
+    if (i >= uShipN) break;
+    vec4 sh = uShip[i];
+    if (sh.w <= 0.0) continue;
+    vec4 sb = uShipB[i];
+    vec2 dp = p - sh.xy;
+    if (dot(dp, dp) > 24.0 * 24.0 * sb.x * sb.x) continue;
+    float sc = sb.x;
+    float aa = 0.7 / (uScale * sc);
+    // gentle bobbing / rocking (stable per ship)
+    vec4 sc2 = uShipC[i];
+    float ph = sc2.z;
+    float roll = 0.035 * sin(t * 0.9 + ph);
+    float bob = 1.0 + 0.035 * sin(t * 1.3 + ph * 1.7);
+    vec2 q = rot(-(sh.z + roll)) * dp / sc;
+    q.y /= bob * sc2.y;
+    vec2 qs = rot(-(sh.z + roll)) * (dp - SHOFF * sc * (1.0 - sc2.x)) / sc;
+    qs.y /= sc2.y;
+    vec3 under = col;
+    col = mix(col, col * vec3(0.55, 0.62, 0.70), shipShadow(qs, sb.y, sb.z, aa) * 0.55 * sh.w * (1.0 - sc2.x));
+    vec4 c = shipCol(q, sb.y, sb.z, sb.w, t + ph, aa);
+    c.rgb = mix(c.rgb, under * vec3(0.45, 0.55, 0.65), sc2.x * 0.85);                // sinking: swallowed by the water
+    col = mix(col, c.rgb, c.a * sh.w);
+  }
+
+  // ---------- wreck debris, then splashes on top ----------
+  for (int i = 0; i < ${MAXDEB}; i++) {
+    if (i >= uDebN) break;
+    vec4 dd = uDeb[i];
+    if (dd.w <= 0.0) continue;
+    vec4 db = uDebB[i];
+    vec2 dp = p - dd.xy;
+    if (dot(dp, dp) > 100.0 * db.y * db.y) continue;
+    vec2 q = rot(-dd.z) * dp / db.y;
+    float aa = 0.7 / (uScale * db.y);
+    vec4 c = debrisCol(q, db.x, db.z, aa);
+    vec3 under = col;
+    col = mix(col, col * vec3(0.6, 0.66, 0.74), debrisCol(rot(-dd.z) * (dp - vec2(1.0, 1.4)) / db.y, db.x, db.z, aa).a * 0.4 * dd.w * (1.0 - db.w));
+    c.rgb = mix(c.rgb, under * vec3(0.55, 0.65, 0.72), db.w);
+    col = mix(col, c.rgb, c.a * dd.w);
+  }
+  // spray over water, a puff of sand where the hull hit the beach
+  for (int i = 0; i < ${MAXFX}; i++) { if (i >= uFxN) break; if (uFx[i].z > 0.5) col = s > 0.0 ? splashCol(col, p, uFx[i], uFxB[i], FOAM, 1.0) : splashCol(col, p, uFx[i], uFxB[i], SAND_HI, 0.45); }
+
+  col *= 1.0 + (hash2(floor(p * max(uScale, 1.0))) - 0.5) * 0.02;   // fine paper grain (static)
+  o = vec4(col, 1.0);
+}`;
+
+/* ======================================================================
+   WebGL
+   ====================================================================== */
+const cv = document.getElementById('art');
+const gl = cv.getContext('webgl2', { antialias: false });
+if (!gl) document.getElementById('nogl').style.display = 'grid';
+function program(fs) {
+  const mk = (type, src) => {
+    const s = gl.createShader(type);
+    gl.shaderSource(s, src); gl.compileShader(s);
+    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) { console.error(gl.getShaderInfoLog(s)); throw new Error('shader: ' + gl.getShaderInfoLog(s)); }
+    return s;
+  };
+  const p = gl.createProgram();
+  gl.attachShader(p, mk(gl.VERTEX_SHADER, VS));
+  gl.attachShader(p, mk(gl.FRAGMENT_SHADER, fs));
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) console.error(gl.getProgramInfoLog(p));
+  const U = {};
+  const n = gl.getProgramParameter(p, gl.ACTIVE_UNIFORMS);
+  for (let i = 0; i < n; i++) { const nm = gl.getActiveUniform(p, i).name.replace(/\[0\]$/, ''); U[nm] = gl.getUniformLocation(p, nm); }
+  return { p, U };
+}
+const PR = program(FS);
+gl.bindVertexArray(gl.createVertexArray());
+
+let noiseTex = null;
+function buildNoiseTex() {
+  const { S, d } = makeNoiseImage();
+  noiseTex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, noiseTex);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, S, S, 0, gl.RGBA, gl.UNSIGNED_BYTE, d);
+  gl.generateMipmap(gl.TEXTURE_2D);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.REPEAT);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.REPEAT);
+}
+const f32 = new Float32Array(1), u32 = new Uint32Array(f32.buffer);
+function toHalf(v) {
+  f32[0] = v; const x = u32[0];
+  const sign = (x >>> 16) & 0x8000, e = ((x >>> 23) & 0xff) - 112, m = x & 0x7fffff;
+  if (e <= 0) return sign;
+  if (e >= 31) return sign | 0x7c00;
+  return sign | (e << 10) | (m >>> 13);
+}
+const ftex = [null, null];
+let fromI = 0, toI = 0, FA = null, FB = null;
+let morphT0 = -1e9, morphDur = MORPH_MS, curMix = 1;
+function allocField() {
+  for (let i = 0; i < 2; i++) {
+    if (ftex[i]) gl.deleteTexture(ftex[i]);
+    ftex[i] = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, ftex[i]);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.R16F, Gw, Gh, 0, gl.RED, gl.HALF_FLOAT, null);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  }
+}
+function uploadField(i, Fd) {
+  const d = new Uint16Array(Gw * Gh);
+  for (let k = 0; k < d.length; k++) d[k] = toHalf(Fd.s[k]);
+  gl.bindTexture(gl.TEXTURE_2D, ftex[i]);
+  gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+  gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, Gw, Gh, gl.RED, gl.HALF_FLOAT, d);
+}
+let wakeTex = null;
+const wakeBuf = new Float32Array(WAKE_K * MAXSHIP * 4);
+function allocWake() {
+  wakeTex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, wakeTex);
+  gl.texStorage2D(gl.TEXTURE_2D, 1, gl.RGBA32F, WAKE_K, MAXSHIP);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+}
+
+let icons = [];
+const iconRects = () => icons.map(ic => ({ cx: ic.x + ic.w / 2, cy: ic.y + ic.h / 2, hw: ic.w / 2 - 4, hh: ic.h / 2 - 2 }));
+// Field currently on screen (from -> to blended by curMix): a new transition must start from it, not from the
+// previous target, or the scenery jumps when icons move again while a transition is still running.
+function blendFields(A, B, m) {
+  const out = {};
+  for (const k in B) {
+    const a = A && A[k], b = B[k];
+    if (!(b instanceof Float32Array) || !(a instanceof Float32Array) || a.length !== b.length) return null;
+    const r = new Float32Array(b.length);
+    for (let i = 0; i < b.length; i++) r[i] = a[i] + (b[i] - a[i]) * m;
+    out[k] = r;
+  }
+  return out;
+}
+function commit(fromEmpty = false) {
+  const nf = computeField(iconRects());
+  const target = 1 - toI;
+  if (fromEmpty) { FA = computeField([]); uploadField(toI, FA); }
+  else if (FA && FB && curMix < 0.999 && (FA = blendFields(FA, FB, Math.max(0, curMix)))) uploadField(toI, FA);
+  else FA = FB || nf;
+  FB = nf;
+  uploadField(target, FB);
+  fromI = toI; toI = target;
+  morphT0 = performance.now();
+  morphDur = fromEmpty ? 2600 : MORPH_MS;
+  curMix = 0;
+  navDirty = true;
+}
+function refresh() {
+  FA = FB = computeField(iconRects());
+  uploadField(toI, FB);
+  fromI = toI; morphT0 = -1e9; curMix = 1;
+  navDirty = true;
+}
+// coast distance on screen right now (blended), and in the target field (what routes are planned on)
+const curS = (x, y) => FB ? sampleArr(FA.s, x, y) * (1 - curMix) + sampleArr(FB.s, x, y) * curMix : 999;
+const tgtS = (x, y) => FB ? sampleArr(FB.s, x, y) : 999;
+
+/* ======================================================================
+   Navigation: coarse grid over the target field, islands, harbours, A* routes
+   ====================================================================== */
+const NS = 10;              // nav cell size (px)
+const HARD = 17;            // ships never plan through water closer than this to the coast (px)
+const COMFY = 46;           // routes prefer to keep at least this far off the coast
+let nav = null, navDirty = true, navMs = 0, planMs = 0;
+function buildNav() {
+  const t0 = performance.now();
+  const nw = Math.max(2, Math.ceil(W / NS)), nh = Math.max(2, Math.ceil(H / NS)), N = nw * nh;
+  const s = new Float32Array(N), pass = new Uint8Array(N), isl = new Int16Array(N).fill(-1), near = new Int16Array(N).fill(-1);
+  for (let gy = 0; gy < nh; gy++) for (let gx = 0; gx < nw; gx++) {
+    const i = gy * nw + gx, x = (gx + 0.5) * NS, y = (gy + 0.5) * NS;
+    s[i] = tgtS(x, y);
+    const border = x < 14 || y < 14 || x > W - 14 || y > H - 14;
+    pass[i] = s[i] > HARD && !border ? 1 : 0;
+  }
+  // islands = 8-connected land components
+  let nIsl = 0;
+  const q = new Int32Array(N);
+  for (let i0 = 0; i0 < N; i0++) {
+    if (s[i0] >= 0 || isl[i0] >= 0) continue;
+    let qh = 0, qt = 0; q[qt++] = i0; isl[i0] = nIsl;
+    while (qh < qt) {
+      const i = q[qh++], gx = i % nw, gy = (i / nw) | 0;
+      for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+        const x = gx + dx, y = gy + dy;
+        if (x < 0 || y < 0 || x >= nw || y >= nh) continue;
+        const j = y * nw + x;
+        if (s[j] < 0 && isl[j] < 0) { isl[j] = nIsl; q[qt++] = j; }
+      }
+    }
+    nIsl++;
+  }
+  // every water cell belongs to its nearest island (multi-source BFS)
+  let qh = 0, qt = 0;
+  for (let i = 0; i < N; i++) if (isl[i] >= 0) { near[i] = isl[i]; q[qt++] = i; }
+  while (qh < qt) {
+    const i = q[qh++], gx = i % nw, gy = (i / nw) | 0;
+    const nb = [gx > 0 ? i - 1 : -1, gx < nw - 1 ? i + 1 : -1, gy > 0 ? i - nw : -1, gy < nh - 1 ? i + nw : -1];
+    for (const j of nb) if (j >= 0 && near[j] < 0) { near[j] = near[i]; q[qt++] = j; }
+  }
+  // harbours: water a little off each island's shore, inside the screen; open-sea spots far from any coast
+  const harb = []; for (let k = 0; k < nIsl; k++) harb.push([]);
+  const sea = [];
+  for (let gy = 0; gy < nh; gy++) for (let gx = 0; gx < nw; gx++) {
+    const i = gy * nw + gx, x = (gx + 0.5) * NS, y = (gy + 0.5) * NS;
+    if (!pass[i]) continue;
+    if (s[i] >= 26 && s[i] <= 40 && near[i] >= 0 && x > 40 && y > 40 && x < W - 40 && y < H - 40) harb[near[i]].push(i);
+    if (s[i] > 150 && x > 80 && y > 80 && x < W - 80 && y < H - 80 && (gx + gy) % 3 === 0) sea.push(i);
+  }
+  // connected regions of sailable water (4-neighbour, which is exactly what A* can traverse) and their areas
+  const pc = new Int32Array(N).fill(-1), pcArea = [];
+  for (let i0 = 0; i0 < N; i0++) {
+    if (!pass[i0] || pc[i0] >= 0) continue;
+    const k = pcArea.length;
+    let qh = 0, qt = 0; q[qt++] = i0; pc[i0] = k;
+    while (qh < qt) {
+      const i = q[qh++], gx = i % nw, gy = (i / nw) | 0;
+      const nb = [gx > 0 ? i - 1 : -1, gx < nw - 1 ? i + 1 : -1, gy > 0 ? i - nw : -1, gy < nh - 1 ? i + nw : -1];
+      for (const j of nb) if (j >= 0 && pass[j] && pc[j] < 0) { pc[j] = k; q[qt++] = j; }
+    }
+    pcArea.push(qt);
+  }
+  nav = { nw, nh, N, s, pass, isl, near, nIsl, harb, sea, pc, pcArea };
+  navDirty = false;
+  navMs = performance.now() - t0;
+}
+const cellX = i => (i % nav.nw + 0.5) * NS, cellY = i => (((i / nav.nw) | 0) + 0.5) * NS;
+function cellOf(x, y) {
+  const gx = Math.min(nav.nw - 1, Math.max(0, Math.floor(x / NS))), gy = Math.min(nav.nh - 1, Math.max(0, Math.floor(y / NS)));
+  return gy * nav.nw + gx;
+}
+// Where a ship at (x, y) can join the sailable water: BFS through wet cells only (never across land) to the
+// nearest passable cell. Returns { pc: that cell, chain: wet cells leading to it } or null (no way out).
+const WET = 6;
+function entry(x, y) {
+  const { nw, nh, s, pass } = nav, i0 = cellOf(x, y);
+  if (pass[i0]) return { pc: i0, chain: [] };
+  const from = new Map([[i0, -1]]), q = [i0];
+  for (let qh = 0; qh < q.length && q.length < 600; qh++) {
+    const i = q[qh], gx = i % nw, gy = (i / nw) | 0;
+    const nb = [gx > 0 ? i - 1 : -1, gx < nw - 1 ? i + 1 : -1, gy > 0 ? i - nw : -1, gy < nh - 1 ? i + nw : -1];
+    for (const j of nb) {
+      if (j < 0 || from.has(j) || s[j] < WET) continue;
+      from.set(j, i);
+      if (pass[j]) { const chain = []; for (let c = j; c >= 0 && c !== i0; c = from.get(c)) chain.push(c); return { pc: j, chain: chain.reverse() }; }
+      q.push(j);
+    }
+  }
+  return null;
+}
+const regionOf = (x, y) => { const e = entry(x, y); return e ? nav.pc[e.pc] : -1; };
+const regionArea = k => k >= 0 ? nav.pcArea[k] : 0;
+// A* over water cells (8-neighbour); stepping close to the coast costs extra so routes keep a margin
+function astar(a, b) {
+  const { nw, nh, N, s, pass } = nav;
+  const g = new Float32Array(N).fill(1e9), from = new Int32Array(N).fill(-1), closed = new Uint8Array(N);
+  const heap = [], hf = [];
+  const push = (i, f) => {
+    heap.push(i); hf.push(f);
+    let k = heap.length - 1;
+    while (k > 0) { const pk = (k - 1) >> 1; if (hf[pk] <= hf[k]) break; [heap[pk], heap[k]] = [heap[k], heap[pk]]; [hf[pk], hf[k]] = [hf[k], hf[pk]]; k = pk; }
+  };
+  const pop = () => {
+    const top = heap[0], lastI = heap.pop(), lastF = hf.pop();
+    if (heap.length) {
+      heap[0] = lastI; hf[0] = lastF;
+      let k = 0;
+      for (;;) {
+        const l = 2 * k + 1, r = l + 1; let m = k;
+        if (l < heap.length && hf[l] < hf[m]) m = l;
+        if (r < heap.length && hf[r] < hf[m]) m = r;
+        if (m === k) break;
+        [heap[m], heap[k]] = [heap[k], heap[m]]; [hf[m], hf[k]] = [hf[k], hf[m]]; k = m;
+      }
+    }
+    return top;
+  };
+  const bx = b % nw, by = (b / nw) | 0;
+  const hfn = i => { const dx = Math.abs(i % nw - bx), dy = Math.abs(((i / nw) | 0) - by); return Math.max(dx, dy) + 0.4142 * Math.min(dx, dy); };
+  g[a] = 0; push(a, hfn(a));
+  let found = false;
+  while (heap.length) {
+    const i = pop();
+    if (closed[i]) continue;
+    closed[i] = 1;
+    if (i === b) { found = true; break; }
+    const gx = i % nw, gy = (i / nw) | 0;
+    for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+      if (!dx && !dy) continue;
+      const x = gx + dx, y = gy + dy;
+      if (x < 0 || y < 0 || x >= nw || y >= nh) continue;
+      const j = y * nw + x;
+      if (!pass[j] || closed[j]) continue;
+      if (dx && dy && (!pass[gy * nw + x] || !pass[y * nw + gx])) continue;   // no cutting land corners
+      const c = (dx && dy ? 1.4142 : 1) * (1 + 3 * sstep(COMFY, HARD, s[j]));
+      const ng = g[i] + c;
+      if (ng < g[j]) { g[j] = ng; from[j] = i; push(j, ng + hfn(j)); }
+    }
+  }
+  if (!found) return null;
+  const cells = [];
+  for (let i = b; i >= 0; i = from[i]) cells.push(i);
+  return cells.reverse();
+}
+// clear line of sight on the target field: every 4px along a-b keeps at least `need` from the coast
+function los(ax, ay, bx, by, need) {
+  const L = Math.hypot(bx - ax, by - ay), n = Math.max(1, Math.ceil(L / 4));
+  for (let k = 1; k < n; k++) { const u = k / n; if (tgtS(ax + (bx - ax) * u, ay + (by - ay) * u) < need) return false; }
+  return true;
+}
+// a smooth route from (x0, y0) to (x1, y1): A* cells -> string pulling -> subdivision -> Chaikin
+function planRoute(x0, y0, x1, y1) {
+  const t0 = performance.now();
+  if (navDirty || !nav) buildNav();
+  const ea = entry(x0, y0), eb = entry(x1, y1);
+  if (!ea || !eb || nav.pc[ea.pc] !== nav.pc[eb.pc]) return null;     // different water: no route (no A* needed)
+  const a = ea.pc, b = eb.pc;
+  const cells = a === b ? [a] : astar(a, b);
+  if (!cells) return null;
+  let pts = [[x0, y0]];
+  for (const c of ea.chain) pts.push([cellX(c), cellY(c)]);
+  for (let k = 1; k < cells.length - 1; k++) pts.push([cellX(cells[k]), cellY(cells[k])]);
+  pts.push([x1, y1]);
+  // string pulling: from each kept point jump to the farthest point still in clear sight
+  const need = Math.min(30, tgtS(x0, y0) - 3, tgtS(x1, y1) - 3, 30);
+  const pulled = [pts[0]];
+  let i = 0;
+  while (i < pts.length - 1) {
+    let j = i + 1;
+    for (let k = i + 2; k < pts.length; k++) if (los(pts[i][0], pts[i][1], pts[k][0], pts[k][1], Math.max(HARD, need))) j = k; else if (k > j + 6) break;
+    pulled.push(pts[j]);
+    i = j;
+  }
+  // subdivide long legs, then round the corners
+  let sm = [pulled[0]];
+  for (let k = 1; k < pulled.length; k++) {
+    const [ax, ay] = pulled[k - 1], [bx, by] = pulled[k], n = Math.max(1, Math.ceil(Math.hypot(bx - ax, by - ay) / 28));
+    for (let m = 1; m <= n; m++) sm.push([ax + (bx - ax) * m / n, ay + (by - ay) * m / n]);
+  }
+  for (let it = 0; it < 3; it++) {
+    const o = [sm[0]];
+    for (let k = 0; k < sm.length - 1; k++) {
+      const [ax, ay] = sm[k], [bx, by] = sm[k + 1];
+      o.push([ax * 0.75 + bx * 0.25, ay * 0.75 + by * 0.25], [ax * 0.25 + bx * 0.75, ay * 0.25 + by * 0.75]);
+    }
+    o.push(sm[sm.length - 1]);
+    sm = o;
+  }
+  const path = sm.length > 1 ? sm : [[x0, y0], [x1, y1]];
+  const cum = [0];
+  for (let k = 1; k < path.length; k++) cum.push(cum[k - 1] + Math.hypot(path[k][0] - path[k - 1][0], path[k][1] - path[k - 1][1]));
+  planMs = performance.now() - t0;
+  return { pts: path, cum, L: cum[cum.length - 1] };
+}
+function pointAt(r, d) {
+  const { pts, cum } = r;
+  d = Math.min(Math.max(d, 0), r.L);
+  let lo = 0, hi = cum.length - 1;
+  while (hi - lo > 1) { const m = (lo + hi) >> 1; if (cum[m] <= d) lo = m; else hi = m; }
+  const seg = cum[hi] - cum[lo] || 1, u = (d - cum[lo]) / seg;
+  return [pts[lo][0] + (pts[hi][0] - pts[lo][0]) * u, pts[lo][1] + (pts[hi][1] - pts[lo][1]) * u];
+}
+
+/* ======================================================================
+   Ships
+   ====================================================================== */
+const ships = [];
+let shipSerial = 0, minShipS = 999, minShipInfo = '';
+const shipU = new Float32Array(MAXSHIP * 4), shipB = new Float32Array(MAXSHIP * 4), shipC = new Float32Array(MAXSHIP * 4), wakeBox = new Float32Array(MAXSHIP * 4);
+// effects (whirlpools, splashes) and wreck debris, drawn by the shader from small uniform arrays
+const fxList = [], debris = [];
+const fxU = new Float32Array(MAXFX * 4), fxB = new Float32Array(MAXFX * 4), debU = new Float32Array(MAXDEB * 4), debB = new Float32Array(MAXDEB * 4);
+const LIFEMODE = QS.get('lifetest') || '';       // 'vortex' / 'wreck' force that animation on ship 0; 'pond' puts ship 0 in the smallest water
+const MIN_REGION = 400;    // ships only (re)appear in sailable water at least this big (nav cells of 10x10px)
+const TRAP_AREA = 30;      // sailable water smaller than this: the ship goes down in a whirlpool right away
+const SAIL_MIN = 300;      // in less sailable water than this a ship stays at anchor (and goes down after two more tries)
+const VORTEX_T = 6;        // seconds for a whole whirlpool (opens, swallows the ship, closes)
+const angDiff = (a, b) => { let d = b - a; while (d > Math.PI) d -= 2 * Math.PI; while (d < -Math.PI) d += 2 * Math.PI; return d; };
+const afloat = sh => sh.state === 'sail' || sh.state === 'dock' || sh.state === 'anchor';
+const respawnDelay = () => LIFETEST ? 2 : 6 + Math.random() * 6;
+// spots other ships occupy or are heading to (so two ships never dock on top of each other)
+function busySpots(except) {
+  const l = [];
+  for (const o of ships) if (o !== except && !o.dying && afloat(o)) { l.push([o.x, o.y]); if (o.dest) l.push([o.dest.x, o.dest.y]); }
+  return l;
+}
+// a destination in the ship's own water (region comp): a harbour off another island, now and then the open sea
+function pickDest(sh, comp) {
+  const busy = busySpots(sh);
+  const free = i => busy.every(([x, y]) => Math.hypot(x - cellX(i), y - cellY(i)) > 56);
+  const ok = i => nav.pc[i] === comp && Math.hypot(cellX(i) - sh.x, cellY(i) - sh.y) > 60;
+  const islands = [], pools = {};
+  for (let k = 0; k < nav.nIsl; k++) { const h = nav.harb[k].filter(ok); if (h.length) { islands.push(k); pools[k] = h; } }
+  const sea = nav.sea.filter(ok);
+  let pool = null, k = -1;
+  const others = islands.filter(j => j !== sh.isl);
+  if (islands.length && (Math.random() > (islands.length === 1 ? 0.35 : 0.12) || !sea.length)) {
+    if (others.length) { k = others[Math.floor(Math.random() * others.length)]; pool = pools[k]; }
+    else {
+      // only one island: another harbour on it, well away from here (the ship sails around it)
+      k = islands[0];
+      const far = pools[k].filter(i => Math.hypot(cellX(i) - sh.x, cellY(i) - sh.y) > 160);
+      pool = far.length ? far : pools[k];
+    }
+  } else if (sea.length) pool = sea;
+  if (!pool || !pool.length) return null;
+  for (let tries = 0; tries < 16; tries++) {
+    const i = pool[Math.floor(Math.random() * pool.length)];
+    if (free(i) || tries === 15) return [cellX(i) + (Math.random() - 0.5) * 6, cellY(i) + (Math.random() - 0.5) * 6, k];
+  }
+  return null;
+}
+// drop anchor: sails furled, no movement, heading held; try again only every few seconds
+function anchor(sh) {
+  if (sh.state !== 'anchor') sh.fails = 0;
+  // (while the islands are still changing shape, look again soon after they settle)
+  sh.state = 'anchor'; sh.timer = curMix < 1 ? 1 + Math.random() : 4 + Math.random() * 2; sh.fails++; sh.route = null; sh.dest = null;
+}
+// plan a new voyage for sh from where it is now (only inside its own connected water)
+function setSail(sh) {
+  const comp = regionOf(sh.x, sh.y);
+  if (regionArea(comp) >= SAIL_MIN) for (let tries = 0; tries < 4; tries++) {
+    const d = pickDest(sh, comp);
+    if (!d) break;
+    const r = planRoute(sh.x, sh.y, d[0], d[1]);
+    if (r && r.L > 30) { sh.route = r; sh.d = 0; sh.bx = sh.x; sh.by = sh.y; sh.nx = sh.ny = sh.side = 0; sh.dest = { x: d[0], y: d[1], isl: d[2] }; sh.state = 'sail'; return true; }
+  }
+  anchor(sh);
+  return false;
+}
+// the icons moved: re-plan the current voyage (same destination if it is still a harbour in reach, else a new one)
+function replan(sh) {
+  if (sh.state === 'anchor') { sh.timer = Math.min(sh.timer, 0.5); sh.fails = 0; return; }
+  if (sh.state === 'dock') { const s = tgtS(sh.x, sh.y); if (s < 22 || s > 70) sh.timer = Math.min(sh.timer, 0.6 + Math.random()); return; }
+  if (sh.state !== 'sail' || !sh.dest) return;
+  const ds = tgtS(sh.dest.x, sh.dest.y);
+  let r = null;
+  if (ds >= 24 && ds <= 48) r = planRoute(sh.x, sh.y, sh.dest.x, sh.dest.y);
+  if (r && r.L > 5) { sh.route = r; sh.d = 0; sh.bx = sh.x; sh.by = sh.y; sh.nx = sh.ny = sh.side = 0; return; }
+  setSail(sh);
+}
+const STYLES = 4;
+function newShip(midRoute) {
+  const sh = { id: shipSerial++, x: 0, y: 0, hd: 0, state: 'dock', timer: 1 + Math.random() * 3, route: null, d: 0, dest: null, isl: -1,
+    alpha: 0, dying: false, sail: 0, scale: 1.15 + Math.random() * 0.25, style: 0, boom: 1, fails: 0,
+    wake: [], side: 0, nx: 0, ny: 0, v: 0, sink: 0, squish: 1 };
+  sh.style = (sh.id * 3 + (seed % 7)) % STYLES;
+  // start at (or on a voyage from) a harbour in open enough water
+  const big = i => regionArea(nav.pc[i]) >= MIN_REGION;
+  const all = [];
+  for (let k = 0; k < nav.nIsl; k++) for (const i of nav.harb[k]) if (big(i)) all.push([i, k]);
+  const startPool = all.length ? all : nav.sea.filter(big).map(i => [i, -1]);
+  if (!startPool.length) return null;
+  const busy = busySpots(null);
+  let st = null;
+  for (let tries = 0; tries < 20 && !st; tries++) {
+    const c = startPool[Math.floor(Math.random() * startPool.length)];
+    if (tries > 15 || busy.every(([x, y]) => Math.hypot(x - cellX(c[0]), y - cellY(c[0])) > 70)) st = c;
+  }
+  sh.x = sh.bx = cellX(st[0]); sh.y = sh.by = cellY(st[0]); sh.isl = st[1];
+  sh.hd = Math.random() * 6.283;
+  if (midRoute && setSail(sh)) {
+    const r = sh.route;
+    sh.d = r.L * (0.15 + 0.6 * Math.random());
+    const [x, y] = pointAt(r, sh.d), [x2, y2] = pointAt(r, sh.d + 8);
+    sh.x = sh.bx = x; sh.y = sh.by = y; sh.hd = Math.atan2(y2 - y, x2 - x); sh.sail = 1; sh.v = baseSpeed();
+    // a wake as if it had been sailing all along
+    for (let k = WAKE_K - 2; k >= 1; k--) {
+      const dd = sh.d - k * 5;
+      if (dd < 0) continue;
+      const [wx, wy] = pointAt(r, dd), [ux, uy] = pointAt(r, dd + 3);
+      const a = Math.atan2(uy - wy, ux - wx);
+      sh.wake.push({ x: wx - Math.cos(a) * 9 * sh.scale, y: wy - Math.sin(a) * 9 * sh.scale, t: lifeT - k * 5 / sh.v });
+    }
+  } else if (sh.state === 'anchor') { sh.state = 'dock'; sh.timer = 1 + Math.random() * 3; }
+  return sh;
+}
+// whirlpool: opens beside the ship, which circles inward along a tightening spiral, spins, tilts and goes down
+function startVortex(sh) {
+  // centre: a little off the ship, toward the most open water around it
+  const R0 = 12;
+  let cx = sh.x, cy = sh.y, best = -1e9;
+  for (let k = 0; k < 12; k++) {
+    const a = k / 12 * 6.2832, x = sh.x + Math.cos(a) * R0, y = sh.y + Math.sin(a) * R0, v = curS(x, y);
+    if (v > best) { best = v; cx = x; cy = y; }
+  }
+  const vx = sh.x - cx, vy = sh.y - cy;                                   // centre -> ship
+  const dir = Math.cos(sh.hd) * -vy + Math.sin(sh.hd) * vx >= 0 ? 1 : -1;  // circle the way the bow already points
+  Object.assign(sh, { state: 'vortex', vt: 0, vc: [cx, cy], vth: Math.atan2(vy, vx), vdir: dir, vr0: R0, spin: 0, route: null, dest: null, side: 0, nx: 0, ny: 0 });
+  fxList.push({ kind: 0, x: cx, y: cy, t0: lifeT, dur: VORTEX_T, dir, ang: 0, str: 0 });
+  if (LIFETEST) (sh.log = sh.log || []).push('VORTEX@' + lifeT.toFixed(1));
+}
+function stepVortex(sh, dt) {
+  sh.vt += dt;
+  const u = Math.min(1, sh.vt / VORTEX_T), pull = sstep(0.12, 0.72, u);
+  const r = sh.vr0 * (1 - pull);
+  sh.vth += sh.vdir * (0.45 + 3.0 * pull) * sstep(0, 0.1, u) * dt;
+  sh.x = sh.vc[0] + Math.cos(sh.vth) * r; sh.y = sh.vc[1] + Math.sin(sh.vth) * r;
+  // the bow follows the circle, then the hull starts to spin faster than it circles
+  sh.spin += sh.vdir * 2.4 * sstep(0.35, 0.8, u) * dt;
+  const want = sh.vth + sh.vdir * Math.PI / 2 + sh.spin;
+  const rate = 0.8 + 4 * pull;
+  sh.hd += Math.max(-rate * dt, Math.min(rate * dt, angDiff(sh.hd, want)));
+  sh.sail = Math.max(0, sh.sail - dt * 0.6);
+  sh.sink = sstep(0.3, 0.8, u);                       // darker, smaller
+  sh.squish = 1 - 0.45 * sstep(0.25, 0.65, u);        // heeling over: the hull looks narrower
+  sh.alpha = 1 - sstep(0.62, 0.84, u);
+  if (u >= 1) { sh.state = 'gone'; sh.timer = respawnDelay(); }
+}
+// shipwreck: the hull breaks in two, planks / spars / sail scraps scatter a little, a splash; then it all settles and fades
+const WRECK_PARTS = [[0, 5.5, 0, 0, 1.0], [1, -4, 0, 0, 1.0], [2, 1, 2.4, 0.3, 0.6], [2, -0.5, -2.4, -0.25, 0.8], [3, 3, 3, 0.2, 0.9], [3, -2, -3.5, -0.4, 0.7], [4, 0.5, 0.6, 0.5, 0.7]];
+function startWreck(sh) {
+  const c = Math.cos(sh.hd), sn = Math.sin(sh.hd), sc = sh.scale;
+  // pieces drift a little toward open water
+  let gx = curS(sh.x + 4, sh.y) - curS(sh.x - 4, sh.y), gy = curS(sh.x, sh.y + 4) - curS(sh.x, sh.y - 4);
+  const gl2 = Math.hypot(gx, gy) || 1; gx /= gl2; gy /= gl2;
+  for (const [type, lx, ly, r0, sp] of WRECK_PARTS) {
+    const wx = sh.x + (c * lx - sn * ly) * sc, wy = sh.y + (sn * lx + c * ly) * sc;
+    let dx = wx - sh.x, dy = wy - sh.y; const L = Math.hypot(dx, dy) || 1;
+    dx = dx / L * 0.75 + gx * 0.5; dy = dy / L * 0.75 + gy * 0.5;
+    debris.push({ type, x0: wx, y0: wy, dx, dy, dist: (3 + 7 * sp * (0.6 + 0.4 * Math.random())) * sc, rot0: sh.hd + r0,
+      spin: (Math.random() - 0.5) * 1.3, t0: lifeT, style: sh.style, sc, ph: Math.random() * 6.283, x: wx, y: wy, rot: sh.hd + r0, a: 1, dark: 0 });
+  }
+  while (debris.length > MAXDEB) debris.shift();
+  fxList.push({ kind: 1, x: sh.x, y: sh.y, t0: lifeT, dur: 1.5, sc, seedv: Math.random() });
+  Object.assign(sh, { state: 'wreck', vt: 0, route: null, dest: null });
+  if (LIFETEST) (sh.log = sh.log || []).push('WRECK@' + lifeT.toFixed(1));
+}
+function stepFx(t, dt) {
+  for (let i = fxList.length - 1; i >= 0; i--) {
+    const f = fxList[i], u = (t - f.t0) / f.dur;
+    if (u >= 1) { fxList.splice(i, 1); continue; }
+    if (f.kind === 0) { f.str = sstep(0, 0.18, u) * (1 - sstep(0.8, 1, u)); f.ang += f.dir * (0.35 + 1.4 * f.str) * dt; }
+    f.u = u;
+  }
+  while (fxList.length > MAXFX) fxList.shift();
+  for (let i = debris.length - 1; i >= 0; i--) {
+    const d = debris[i], age = t - d.t0, e = 1 - Math.pow(1 - Math.min(1, age / 1.3), 3);
+    const land = curS(d.x, d.y) < 1;
+    const drift = land ? 0 : 0.8 * Math.max(0, age - 0.6);
+    d.x = d.x0 + d.dx * d.dist * e + WIND[0] * drift; d.y = d.y0 + d.dy * d.dist * e + WIND[1] * drift;
+    d.rot = d.rot0 + d.spin * e + (land ? 0 : 0.06 * Math.sin(age * 1.1 + d.ph));
+    // debris on sand lingers a little longer; afloat it slowly darkens as it sinks
+    if (land) d.landT = (d.landT || 0) + dt;
+    const f0 = land || d.landT > 0.5 ? 3.6 : 2.3, f1 = f0 + (land ? 1.8 : 1.6);
+    d.a = Math.min(d.a, 1 - sstep(f0, f1, age));
+    d.dark = land ? d.dark : Math.max(d.dark, 0.65 * sstep(1.0, 3.6, age));
+    if (d.a <= 0.001 && age > 1) debris.splice(i, 1);
+  }
+}
+const WIND = [0.6, 0.8];
+const baseSpeed = () => 17 * P.speed;
+let shipsReady = false, wasMorphing = false, forced = false, jitterN = 0, jitterInfo = '';
+function stepShips(t, dt) {
+  if (!FB) return;
+  if (navDirty) {
+    buildNav();
+    for (const sh of ships) if (!sh.dying && afloat(sh)) replan(sh);
+  }
+  // spawn once the first islands are (nearly) grown in; adjust the count when the setting changes
+  if (!shipsReady && iconsSeen && (curMix > 0.45 || LIFETEST)) shipsReady = true;
+  if (shipsReady) {
+    const alive = ships.filter(s => !s.dying);
+    for (let n = alive.length; n < P.ships; n++) { const sh = newShip(true); if (!sh) break; ships.push(sh); if (LIFETEST) sh.alpha = 1; }
+    for (let i = P.ships; i < alive.length; i++) alive[i].dying = true;
+  }
+  // debug hooks
+  if (LIFEMODE && ships[0] && !forced && t > 3 && curMix >= 1) {
+    const sh = ships[0];
+    if (LIFEMODE === 'vortex' && afloat(sh)) { forced = true; startVortex(sh); }
+    if (LIFEMODE === 'wreck' && afloat(sh)) { forced = true; startWreck(sh); }
+  }
+  const at = QS.get('shipat');
+  if (at && ships[0] && !forced && curMix >= 1) {
+    // debug: put ship 0 at a given spot and let it sail from there
+    forced = true;
+    const [x, y] = at.split(',').map(Number), sh = ships[0];
+    Object.assign(sh, { x, y, bx: x, by: y, nx: 0, ny: 0, side: 0, alpha: 1, wake: [], state: 'dock', timer: 0.1 });
+  }
+  if (LIFEMODE === 'pond' && ships[0] && !forced && curMix >= 1) {
+    // put ship 0 at anchor in the smallest patch of water that still has room for it
+    let best = -1, area = 1e9;
+    for (let i = 0; i < nav.N; i++) { const k = nav.pc[i]; if (k >= 0 && nav.pcArea[k] < area && nav.pcArea[k] >= 2) { area = nav.pcArea[k]; best = i; } }
+    if (best >= 0 && area < 400) { forced = true; const sh = ships[0]; Object.assign(sh, { x: cellX(best), y: cellY(best), bx: cellX(best), by: cellY(best), nx: 0, ny: 0, side: 0, alpha: 1, wake: [] }); anchor(sh); sh.timer = 1; }
+  }
+  stepFx(t, dt);
+  const morphing = curMix < 1;
+  const v0 = baseSpeed();
+  for (let si = ships.length - 1; si >= 0; si--) {
+    const sh = ships[si];
+    if (sh.state === 'gone') {
+      if (sh.dying) { ships.splice(si, 1); continue; }
+      sh.alpha = 0; sh.timer -= dt; recordWake(sh, t);
+      if (sh.timer <= 0) {
+        // reappear at a free harbour, fading in
+        const n = newShip(false);
+        if (n) { n.id = sh.id; n.style = sh.style; n.scale = sh.scale; n.alpha = 0; ships[si] = n; } else sh.timer = 3;
+      }
+      continue;
+    }
+    if (sh.state === 'vortex' || sh.state === 'wreck') {
+      if (sh.state === 'vortex') stepVortex(sh, dt);
+      else { sh.vt += dt; sh.alpha = Math.max(0, 1 - sh.vt / 0.35); if (sh.vt > 0.4) { sh.state = 'gone'; sh.timer = respawnDelay(); } }
+      recordWake(sh, t);
+      continue;
+    }
+    // fade in / out
+    if (sh.dying) sh.alpha = Math.max(0, sh.alpha - dt * 1.6);
+    else sh.alpha = Math.min(1, sh.alpha + dt * 0.8);
+    if (sh.dying && sh.alpha <= 0) { ships.splice(si, 1); continue; }
+    let bx = sh.bx, by = sh.by;                                       // position on the route (before side step / push)
+    if (sh.state === 'dock' || sh.state === 'anchor') {
+      sh.sail = Math.max(0, sh.sail - dt * 0.5);
+      sh.v = Math.max(0, sh.v - dt * 8);
+      sh.timer -= dt;
+      if (sh.timer <= 0 && !sh.dying && !morphing) {
+        if (sh.state === 'anchor') {
+          // still boxed in? A pond too small to sail (or no way out for a long while) swallows the ship
+          const area = regionArea(regionOf(sh.x, sh.y));
+          if (area < TRAP_AREA || (sh.fails >= 2 && area < SAIL_MIN)) { startVortex(sh); recordWake(sh, t); continue; }
+        }
+        setSail(sh);
+      }
+    }
+    if (sh.state === 'sail') {
+      const r = sh.route;
+      sh.sail = Math.min(1, sh.sail + dt * 0.5);
+      const [tx, ty] = pointAt(r, sh.d + 10);
+      const [px0, py0] = pointAt(r, sh.d);
+      const want = Math.atan2(ty - py0, tx - px0);
+      const err = angDiff(sh.hd, want);
+      // ease in leaving harbour, ease out arriving; slow down while turning hard (it turns before it moves off)
+      const ease = Math.max(0.12, sstep(-10, 30, sh.d)) * Math.max(0.1, sstep(0, 45, r.L - sh.d));
+      const align = Math.max(0.08, Math.cos(Math.min(Math.abs(err), 1.5)));
+      const vt = v0 * ease * align * (0.35 + 0.65 * sh.sail);
+      sh.v += (vt - sh.v) * Math.min(1, dt * 2);
+      // a fresh route may lead off the other way (re-planned when icons moved): no lurching back at speed, it turns first
+      sh.d += sh.v * Math.max(0.06, Math.cos(Math.min(Math.abs(err), 1.5))) * dt;
+      sh.hd += Math.max(-dt * 0.9, Math.min(dt * 0.9, err));
+      [bx, by] = pointAt(r, sh.d);
+      if (sh.d >= r.L - 0.5) { sh.state = 'dock'; sh.timer = 3 + Math.random() * 4; sh.isl = sh.dest ? sh.dest.isl : -1; if (LIFETEST) (sh.log = sh.log || []).push('D' + sh.isl + '@' + t.toFixed(0)); }
+    }
+    // booms swing to leeward (the wind blows toward the lower right); they cross over smoothly
+    const cr = Math.cos(sh.hd) * WIND[1] - Math.sin(sh.hd) * WIND[0];
+    if (Math.abs(cr) > 0.15) sh.boom += Math.max(-dt * 0.7, Math.min(dt * 0.7, Math.sign(cr) - sh.boom));
+    // loose avoidance while sailing: step aside from a nearby ship (only into open water)
+    let want = 0;
+    if (sh.state === 'sail' && sh.v > 6) for (const o of ships) {      // only once under way: no sideways sliding at a standstill
+      if (o === sh || o.alpha < 0.1 || !afloat(o)) continue;
+      const dx = o.x - sh.x, dy = o.y - sh.y, dist = Math.hypot(dx, dy);
+      if (dist < 42) want += (dx * -Math.sin(sh.hd) + dy * Math.cos(sh.hd) > 0 ? -1 : 1) * 11 * sstep(42, 22, dist);
+    }
+    want = Math.max(-12, Math.min(12, want));
+    const nxs = -Math.sin(sh.hd), nys = Math.cos(sh.hd);
+    if (curS(bx + nxs * want, by + nys * want) < 24) want = 0;
+    sh.side += Math.max(-dt * 6, Math.min(dt * 6, want - sh.side));
+    if (curS(bx + nxs * sh.side, by + nys * sh.side) < 18) sh.side *= Math.max(0, 1 - dt * 3);
+    // the coast moved toward the ship (icons moved): slide off toward open water
+    const ex = bx + nxs * sh.side, ey = by + nys * sh.side;
+    let s = curS(ex + sh.nx, ey + sh.ny);
+    if (s < 15) {
+      const gx = curS(ex + sh.nx + 3, ey + sh.ny) - curS(ex + sh.nx - 3, ey + sh.ny), gy = curS(ex + sh.nx, ey + sh.ny + 3) - curS(ex + sh.nx, ey + sh.ny - 3);
+      const gl2 = Math.hypot(gx, gy) || 1, push = Math.min(15 - s, 170 * dt);
+      sh.nx += gx / gl2 * push; sh.ny += gy / gl2 * push;
+    } else if ((sh.nx || sh.ny) && sh.state === 'sail') {
+      // ease the push back out only with room to spare (hysteresis: no back-and-forth)
+      const k = Math.max(0, 1 - dt * 0.7), cx = sh.nx * k, cy = sh.ny * k;
+      if (curS(ex + cx, ey + cy) >= 24) { sh.nx = Math.abs(cx) < 0.05 ? 0 : cx; sh.ny = Math.abs(cy) < 0.05 ? 0 : cy; }
+    }
+    sh.x = ex + sh.nx; sh.y = ey + sh.ny; sh.bx = bx; sh.by = by;
+    s = curS(sh.x, sh.y);
+    if (s < 3) { startWreck(sh); recordWake(sh, t); continue; }     // the coast overran it
+    if (sh.alpha > 0.5 && s < minShipS) { minShipS = s; minShipInfo = sh.state + ' ' + Math.round(sh.x) + ',' + Math.round(sh.y) + ' mix' + curMix.toFixed(2); }
+    // after a transition the route no longer needs the push: plan again from where the ship really is
+    if (!morphing && wasMorphing && (Math.abs(sh.nx) > 1 || Math.abs(sh.ny) > 1) && sh.state === 'sail') {
+      sh.nx = sh.ny = 0; sh.side = 0;
+      const r = planRoute(sh.x, sh.y, sh.dest.x, sh.dest.y);
+      if (r && r.L > 5) { sh.route = r; sh.d = 0; sh.bx = sh.x; sh.by = sh.y; } else setSail(sh);
+    }
+    recordWake(sh, t);
+    if (LIFETEST) {
+      // jitter metric: the ship's motion reversing direction from one frame to the next
+      const vx = (sh.x - (sh.px ?? sh.x)) / dt, vy = (sh.y - (sh.py ?? sh.y)) / dt;
+      if (sh.pvx !== undefined && Math.hypot(vx, vy) > 3 && Math.hypot(sh.pvx, sh.pvy) > 3 && vx * sh.pvx + vy * sh.pvy < 0) { jitterN++; jitterInfo = sh.state + (sh.route ? ' d' + sh.d.toFixed(0) + '/' + sh.route.L.toFixed(0) : '') + ' n' + sh.nx.toFixed(1) + ',' + sh.ny.toFixed(1) + ' side' + sh.side.toFixed(1) + ' v' + Math.hypot(vx, vy).toFixed(0) + ' mix' + curMix.toFixed(2); }
+      sh.px = sh.x; sh.py = sh.y; sh.pvx = vx; sh.pvy = vy;
+    }
+  }
+  wasMorphing = morphing;
+  // uniforms
+  shipU.fill(0); shipB.fill(0); shipC.fill(0); wakeBuf.fill(-1); wakeBox.fill(0);
+  ships.forEach((sh, i) => {
+    if (i >= MAXSHIP) return;
+    const a = sh.alpha * sh.alpha * (3 - 2 * sh.alpha);
+    shipU.set([sh.x, sh.y, sh.hd, sh.state === 'gone' ? 0 : a], i * 4);
+    shipB.set([sh.scale * (1 - 0.5 * sh.sink), sh.sail * sh.sail * (3 - 2 * sh.sail), sh.boom, sh.style], i * 4);
+    shipC.set([sh.sink, sh.squish, sh.id * 2.3 + 0.7, 0], i * 4);
+    // the wake of a wrecked / sunk ship stays where it was and simply ages away
+    const head = afloat(sh) || sh.state === 'vortex', wa = sh.dying || !(sh.state === 'gone' || sh.state === 'wreck') ? a : 1;
+    if (!head && !sh.wake.length) return;
+    let o = i * WAKE_K * 4;
+    let x0 = 1e9, y0 = 1e9, x1 = -1e9, y1 = -1e9, maxAge = 0;
+    if (head) { wakeBuf.set([sh.sx, sh.sy, 0, wa], o); o += 4; x0 = x1 = sh.sx; y0 = y1 = sh.sy; }
+    for (let k = sh.wake.length - 1; k >= 0; k--) {
+      const w = sh.wake[k], age = t - w.t;
+      wakeBuf.set([w.x, w.y, age, wa], o); o += 4;
+      x0 = Math.min(x0, w.x); x1 = Math.max(x1, w.x); y0 = Math.min(y0, w.y); y1 = Math.max(y1, w.y); maxAge = Math.max(maxAge, age);
+    }
+    const m = 4 + maxAge * 2.8;
+    wakeBox.set([x0 - m, y0 - m, x1 + m, y1 + m], i * 4);
+  });
+  fxU.fill(0); fxB.fill(0);
+  fxList.forEach((f, i) => {
+    if (f.kind === 0) { fxU.set([f.x, f.y, 0, f.str], i * 4); fxB.set([38 * (0.65 + 0.35 * f.str), f.dir, f.ang, 0], i * 4); }
+    else { fxU.set([f.x, f.y, 1, f.u], i * 4); fxB.set([f.sc, 0, f.seedv, 0], i * 4); }
+  });
+  debU.fill(0); debB.fill(0);
+  debris.forEach((d, i) => { debU.set([d.x, d.y, d.rot, d.a], i * 4); debB.set([d.type, d.sc, d.style, d.dark], i * 4); });
+  if (LIFETEST) window.__snapErrors = ['ships ' + ships.map(s => s.state.slice(0, 2) + Math.round(s.x) + ',' + Math.round(s.y) + '@' + curS(s.x, s.y).toFixed(0) + '>' + (s.dest ? s.dest.isl : '-')).join(' '),
+    'minShipS ' + minShipS.toFixed(1) + ' ' + minShipInfo + ' jitter ' + jitterN + ' ' + jitterInfo, 'log ' + ships.map(s => s.id + ':' + (s.log || []).join(',')).join(' | '),
+    'fx ' + fxList.map(f => f.kind + '@' + Math.round(f.x) + ',' + Math.round(f.y) + ' u' + (f.u || 0).toFixed(2)).join(' ') + ' debris ' + debris.length + (debris.length ? ' dc ' + Math.round(debris[0].x) + ',' + Math.round(debris[0].y) + ' a' + debris[0].a.toFixed(2) : ''),
+    'islands ' + (nav ? nav.nIsl + ' harb ' + nav.harb.map(h => h.length).join('/') + ' regions ' + nav.pcArea.join('/') : '-'),
+    'fieldMs ' + fieldMs.toFixed(1), 'navMs ' + navMs.toFixed(1), 'planMs ' + planMs.toFixed(1), 'frameMs ' + frameMs.toFixed(1)];
+}
+// wake: stern positions every 5px
+function recordWake(sh, t) {
+  const sx = sh.x - Math.cos(sh.hd) * 9 * sh.scale, sy = sh.y - Math.sin(sh.hd) * 9 * sh.scale;
+  const lw = sh.wake[sh.wake.length - 1];
+  if (sh.state !== 'gone' && sh.state !== 'wreck' && (!lw || Math.hypot(sx - lw.x, sy - lw.y) >= 5)) sh.wake.push({ x: sx, y: sy, t });
+  while (sh.wake.length && (sh.wake.length > WAKE_K - 1 || t - sh.wake[0].t > 8)) sh.wake.shift();
+  sh.sx = sx; sh.sy = sy;
+}
+function resetShips() { ships.length = 0; shipsReady = false; fxList.length = 0; debris.length = 0; }
+
+/* ======================================================================
+   Frame loop
+   ====================================================================== */
+function resize() {
+  W = innerWidth; H = innerHeight;
+  const scale = PREVIEW ? 0.45 : Math.min(devicePixelRatio || 1, P.quality);
+  const box = cv.getBoundingClientRect();
+  cv.width = Math.round((box.width || W) * scale); cv.height = Math.round((box.height || H) * scale); cv._scale = scale;
+  Gw = Math.ceil(W / STEP) + 2; Gh = Math.ceil(H / STEP) + 2;
+  buildNoise();
+  allocField();
+}
+
+const T0 = performance.now();
+let lastT = 0, fpsEMA = 0, frameN = 0, frameMs = 0, lifeT = 0;
+let paused = false;
+function frame(now) {
+  requestAnimationFrame(frame);
+  if (paused) { lastT = 0; return; }
+  if (P.cap30 && now - lastT < 31) return;
+  const dt = lastT ? Math.min((now - lastT) / 1000, 0.1) : 0.03;
+  if (lastT) fpsEMA = fpsEMA ? fpsEMA * 0.9 + (1 / dt) * 0.1 : 1 / dt;
+  lastT = now;
+  lifeT += dt;
+  const e = Math.min(Math.max((now - morphT0) / morphDur, 0), 1);
+  curMix = e < 0.5 ? 2 * e * e : 1 - Math.pow(-2 * e + 2, 2) / 2;
+  stepShips(lifeT, dt);
+  draw(now);
+  frameN++;
+}
+function draw(now) {
+  const t0 = performance.now();
+  const e = Math.min(Math.max((now - morphT0) / morphDur, 0), 1);
+  curMix = e < 0.5 ? 2 * e * e : 1 - Math.pow(-2 * e + 2, 2) / 2;
+  const t = (now - T0) / 1000;
+  const { p, U } = PR;
+  gl.useProgram(p);
+  gl.viewport(0, 0, cv.width, cv.height);
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, noiseTex);
+  gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, ftex[fromI]);
+  gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D, ftex[toI]);
+  gl.activeTexture(gl.TEXTURE3); gl.bindTexture(gl.TEXTURE_2D, wakeTex);
+  gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, WAKE_K, MAXSHIP, gl.RGBA, gl.FLOAT, wakeBuf);
+  gl.uniform1i(U.uNoise, 0); gl.uniform1i(U.uFA, 1); gl.uniform1i(U.uFB, 2); gl.uniform1i(U.uWake, 3);
+  gl.uniform2f(U.uRes, cv.width / cv._scale, cv.height / cv._scale);
+  gl.uniform2f(U.uGrid, Gw, Gh);
+  gl.uniform1f(U.uScale, cv._scale);
+  gl.uniform1f(U.uSeed, (seed % 997) * 0.37);
+  gl.uniform1f(U.uStep, STEP);
+  gl.uniform1f(U.uMix, curMix);
+  gl.uniform1f(U.uTime, t % 3600);
+  gl.uniform1f(U.uWaves, P.waves);
+  gl.uniform1f(U.uSigma, P.sigma);
+  gl.uniform1i(U.uShipN, Math.min(ships.length, MAXSHIP));
+  gl.uniform4fv(U.uShip, shipU); gl.uniform4fv(U.uShipB, shipB); gl.uniform4fv(U.uWakeBox, wakeBox); gl.uniform4fv(U.uShipC, shipC);
+  gl.uniform1i(U.uFxN, Math.min(fxList.length, MAXFX)); gl.uniform4fv(U.uFx, fxU); gl.uniform4fv(U.uFxB, fxB);
+  gl.uniform1i(U.uDebN, Math.min(debris.length, MAXDEB)); gl.uniform4fv(U.uDeb, debU); gl.uniform4fv(U.uDebB, debB);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+  frameMs = performance.now() - t0;
+}
+
+/* ======================================================================
+   Settings / hosted mode
+   ====================================================================== */
+let iconsSeen = !(WALL || PREVIEW);
+function reseed(v) {
+  seed = v; buildNoise();
+  if (!iconsSeen) return;
+  commit(true);
+}
+function applySettings(v) {
+  if (typeof v.seed === 'number' && v.seed !== seed) reseed(v.seed);
+  let field = false;
+  for (const k in v) {
+    if (!KEYS[k] || typeof v[k] !== 'number' || !isFinite(v[k]) || P[k] === v[k]) continue;
+    const [lo, hi] = KEYS[k];
+    let x = Math.min(Math.max(v[k], lo), hi);
+    if (k === 'ships') x = Math.round(x);
+    if (P[k] === x) continue;
+    P[k] = x;
+    if (k === 'sigma' || k === 'warp') field = true;
+  }
+  if (field && FB) commit();                      // island size / coast: smooth transition too
+}
+function drawGhosts() {
+  const box = document.getElementById('ghosts');
+  if (box) box.innerHTML = icons.map(ic => `<div class="ghost" style="left:${ic.x}px;top:${ic.y}px;width:${ic.w}px;height:${ic.h}px"><i></i><b></b></div>`).join('');
+}
+function startHostedMode() {
+  if (PREVIEW) {
+    document.body.classList.add('preview');
+    const g = document.createElement('div'); g.id = 'ghosts'; document.body.appendChild(g);
+  }
+  icons = [];
+  refresh();                                     // open ocean until we know where the icons are
+  let first = true;
+  const handle = m => {
+    if (!m || typeof m !== 'object') return;
+    if (m.t === 'pause') { paused = PREVIEW ? false : !!m.v; return; }
+    if (m.t === 'settings') { applySettings(m.v || {}); return; }
+    if (m.t === 'reset') { applySettings(Object.assign({}, DEFAULTS, m.v || {})); return; }
+    if (m.t !== 'icons') return;
+    const k = window.devicePixelRatio || 1;
+    icons = m.vis && Array.isArray(m.r) ? m.r.map(([l, t, r, b]) => ({ x: l / k, y: t / k, w: (r - l) / k, h: (b - t) / k })) : [];
+    if (PREVIEW) drawGhosts();
+    iconsSeen = true;
+    commit(first);                                // first time: the islands rise; later: smooth transition
+    first = false;
+  };
+  if (PREVIEW) {
+    addEventListener('message', ev => { if (ev.source === parent) { try { handle(typeof ev.data === 'string' ? JSON.parse(ev.data) : ev.data); } catch (e) {} } });
+    parent.postMessage(JSON.stringify({ t: 'ready' }), '*');
+    return;
+  }
+  const host = window.chrome && window.chrome.webview;
+  if (!host) return;
+  host.addEventListener('message', ev => { try { handle(JSON.parse(ev.data)); } catch (e) { console.error(e); } });
+  host.postMessage('ready');
+}
+function startDemo() {
+  const list = [];
+  for (let r = 0; r < 6; r++) list.push({ x: W - 90, y: 10 + r * 100, w: 76, h: 92 });
+  list.push({ x: W * 0.22, y: H * 0.3, w: 76, h: 92 }, { x: W * 0.45, y: H * 0.62, w: 76, h: 92 }, { x: W * 0.52, y: H * 0.18, w: 76, h: 92 });
+  icons = list;
+  commit(true);
+}
+
+let resizeT = 0;
+addEventListener('resize', () => {
+  clearTimeout(resizeT);
+  resizeT = setTimeout(() => { resize(); refresh(); resetShips(); }, 100);
+});
+
+window.__dbg = { P, ships, stats: () => ({ fieldMs, navMs, planMs, frameMs, fps: fpsEMA, minShipS }) };
+resize();
+buildNoiseTex();
+allocWake();
+if (WALL || PREVIEW) startHostedMode();
+else startDemo();
+requestAnimationFrame(frame);
+</script>
+<script src="share.js"></script>
+</body>
+</html>
