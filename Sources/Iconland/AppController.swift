@@ -22,7 +22,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
 
     private var snapshotDone: ((Result<(thumb: String, png: String), ShareError>) -> Void)?
     private var recordDone: ((Result<(mime: String, poster: String, video: String), ShareError>) -> Void)?
-    private var shareTimeout: DispatchWorkItem?
+    private var snapshotTimeout: DispatchWorkItem?     // one per operation: a snapshot must not disarm a recording
+    private var recordTimeout: DispatchWorkItem?
     private var lastShare: URL?
 
     private var lang: String { Lang.effective(settings.lang) }
@@ -89,6 +90,9 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         guard let page = themes.first(where: { $0.id == settings.theme })?.page else { return }
         wallReady = false
         steering.end(tellPage: false)
+        // The page that owed us an answer is going away: fail now instead of leaving "busy" until the timeout.
+        completeSnapshot(.failure(ShareError(message: "wallpaper reloaded")))
+        completeRecord(.failure(ShareError(message: "wallpaper reloaded")))
         wallpaper?.web.load("\(page)?wallpaper=1")
     }
 
@@ -104,7 +108,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         if m == "steer|off" { steering.end(tellPage: false); return }
         if m.hasPrefix("steer|miss") { Log.write("click: \(m)"); return }
         if m.hasPrefix("fps|") { Log.write("wallpaper \(m) paused=\(pause.paused)"); return }
-        // "ready": settings first (the coastline depends on them), then icons and pause state
+        guard m == "ready" else { Log.write("wallpaper: unknown message \(m.prefix(80))"); return }
+        // Settings first (the coastline depends on them), then icons and pause state.
         wallReady = true
         Log.write("wallpaper page ready: \(settings.theme)")
         wallpaper?.web.post(JSON.string(["t": "settings", "v": settings.values(for: settings.theme)]))
@@ -380,17 +385,16 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
 
     struct ShareError: Error { let message: String }
 
-    private func armTimeout(_ seconds: Double, _ fire: @escaping () -> Void) {
-        shareTimeout?.cancel()
+    private func timeout(_ seconds: Double, _ fire: @escaping () -> Void) -> DispatchWorkItem {
         let w = DispatchWorkItem(block: fire)
-        shareTimeout = w
         DispatchQueue.main.asyncAfter(deadline: .now() + seconds, execute: w)
+        return w
     }
 
     private func requestSnapshot() {
         guard wallReady, snapshotDone == nil else { return postShareFail(video: false, "busy or not ready") }
         snapshotDone = { [weak self] r in self?.finishImage(r) }
-        armTimeout(20) { [weak self] in self?.completeSnapshot(.failure(ShareError(message: "timeout"))) }
+        snapshotTimeout = timeout(20) { [weak self] in self?.completeSnapshot(.failure(ShareError(message: "timeout"))) }
         wallpaper?.web.post(JSON.string(["t": "snapshot"]))
     }
 
@@ -402,7 +406,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
     }
 
     private func completeSnapshot(_ r: Result<(thumb: String, png: String), ShareError>) {
-        shareTimeout?.cancel()
+        snapshotTimeout?.cancel()
+        snapshotTimeout = nil
         let done = snapshotDone
         snapshotDone = nil
         done?(r)
@@ -426,7 +431,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
     private func requestRecording() {
         guard wallReady, recordDone == nil else { return postShareFail(video: true, "busy or not ready") }
         recordDone = { [weak self] r in self?.finishVideo(r) }
-        armTimeout(45) { [weak self] in self?.completeRecord(.failure(ShareError(message: "timeout"))) }
+        recordTimeout = timeout(45) { [weak self] in self?.completeRecord(.failure(ShareError(message: "timeout"))) }
         wallpaper?.web.post(JSON.string(["t": "record"]))
     }
 
@@ -438,7 +443,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
     }
 
     private func completeRecord(_ r: Result<(mime: String, poster: String, video: String), ShareError>) {
-        shareTimeout?.cancel()
+        recordTimeout?.cancel()
+        recordTimeout = nil
         let done = recordDone
         recordDone = nil
         done?(r)

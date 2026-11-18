@@ -674,6 +674,357 @@
           ]
         }
       ]
+    },
+    {
+      "id": "blockworld",
+      "name": "Block World",
+      "desc": "A blocky pixel-art world seen from above: your icons stand on flat lawns ringed with lantern-lit gravel walks, among cubic trees, lakes, terraced hills and snowy peaks. Move an icon and the land is rebuilt block by block.",
+      "page": "blockworld.html",
+      "status": "ready",
+      "product": "free",
+      "thumb": "url(thumbs/blockworld.webp) center / cover no-repeat, linear-gradient(160deg,#6aa84f 0%,#3d7a3a 100%)",
+      "thumbSource": "custom",
+      "groups": [
+        {
+          "name": "Around icons",
+          "params": [
+            {
+              "key": "sigma",
+              "label": "Clearing size",
+              "hint": "How far the flat lawn spreads around your icons",
+              "min": 40,
+              "max": 200,
+              "step": 1,
+              "default": 68,
+              "unit": "px"
+            }
+          ]
+        },
+        {
+          "name": "World",
+          "params": [
+            {
+              "key": "trees",
+              "label": "Forest",
+              "hint": "How much of the land is covered with trees",
+              "min": 0,
+              "max": 1,
+              "step": 0.01,
+              "default": 0.5,
+              "format": "percent"
+            },
+            {
+              "key": "water",
+              "label": "Lakes",
+              "hint": "How much of the world is water",
+              "min": 0,
+              "max": 1,
+              "step": 0.01,
+              "default": 0.5,
+              "format": "percent"
+            },
+            {
+              "key": "animals",
+              "label": "Animals",
+              "hint": "How many sheep, cows, pigs and hens wander the meadows",
+              "min": 0,
+              "max": 12,
+              "step": 1,
+              "default": 6
+            },
+            {
+              "key": "tod",
+              "label": "Time of day",
+              "hint": "Auto follows your Mac's local time; at night the lanterns light the clearings",
+              "options": [
+                "Auto",
+                "Day",
+                "Sunset",
+                "Night"
+              ],
+              "default": 0
+            },
+            {
+              "key": "speed",
+              "label": "Animation speed",
+              "hint": "How fast the water shimmers, clouds drift and animals walk",
+              "min": 0,
+              "max": 3,
+              "step": 0.05,
+              "default": 1,
+              "format": "times"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "space",
+      "name": "Deep Space",
+      "desc": "The calm dark one: your icons glow inside nebulae in a sky full of stars, while comets, a ringed planet and a little rocket pass by",
+      "page": "space.html",
+      "status": "ready",
+      "product": "free",
+      "thumb": "url(thumbs/space.webp) center / cover no-repeat, linear-gradient(160deg,#0b1030 0%,#1a0f3a 100%)",
+      "thumbSource": "custom",
+      "groups": [
+        {
+          "name": "Around icons",
+          "params": [
+            {
+              "key": "sigma",
+              "label": "Nebula size",
+              "hint": "How far the glowing gas spreads out from your icons",
+              "min": 40,
+              "max": 200,
+              "step": 1,
+              "default": 72,
+              "unit": "px"
+            },
+            {
+              "key": "glow",
+              "label": "Nebula brightness",
+              "hint": "How brightly the gas glows; the area right under the icons always stays dark",
+              "min": 0.3,
+              "max": 1.5,
+              "step": 0.01,
+              "default": 1,
+              "format": "percent"
+            },
+            {
+              "key": "palette",
+              "label": "Colours",
+              "hint": "Mixed gives separate nebulae different colours",
+              "options": [
+                "Mixed",
+                "Ember",
+                "Aurora",
+                "Orchid"
+              ],
+              "default": 0
+            }
+          ]
+        },
+        {
+          "name": "Space",
+          "params": [
+            {
+              "key": "stars",
+              "label": "Stars",
+              "hint": "How many stars fill the sky",
+              "min": 0,
+              "max": 2,
+              "step": 0.05,
+              "default": 1,
+              "format": "percent"
+            },
+            {
+              "key": "life",
+              "label": "Comets, rockets and planets",
+              "hint": "How often comets and shooting stars pass, and how many rockets and planets there are",
+              "min": 0,
+              "max": 2,
+              "step": 0.05,
+              "default": 1,
+              "format": "percent"
+            },
+            {
+              "key": "speed",
+              "label": "Animation speed",
+              "hint": "How fast the gas drifts, stars twinkle and everything flies",
+              "min": 0,
+              "max": 3,
+              "step": 0.05,
+              "default": 1,
+              "format": "times"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "winterlake",
+      "name": "Winter Lake",
+      "desc": "A frozen lake seen from above: your icons melt pools of open water in the ice, and when you move one its pool freezes over. Skaters glide around the pools and leave traces (put an icon in a skater's way and they may fall in), a snowman and an ice fisherman keep their distance, and snow falls.",
+      "page": "winterlake.html",
+      "status": "ready",
+      "product": "free",
+      "thumb": "url(thumbs/winterlake.webp) center / cover no-repeat, linear-gradient(160deg,#dcebf5 0%,#9fc3dc 100%)",
+      "thumbSource": "custom",
+      "groups": [
+        {
+          "name": "Around icons",
+          "params": [
+            {
+              "key": "sigma",
+              "label": "Melt pool size",
+              "hint": "How far the open water spreads around your icons",
+              "min": 40,
+              "max": 200,
+              "step": 1,
+              "default": 72,
+              "unit": "px"
+            }
+          ]
+        },
+        {
+          "name": "Lake",
+          "params": [
+            {
+              "key": "skaters",
+              "label": "Skaters",
+              "hint": "How many people skate on the lake",
+              "min": 0,
+              "max": 10,
+              "step": 1,
+              "default": 5
+            },
+            {
+              "key": "extras",
+              "label": "Snowman and fisherman",
+              "hint": "They sit away from your icons and move when icons come close",
+              "options": [
+                "Hide",
+                "Show"
+              ],
+              "default": 1
+            },
+            {
+              "key": "cover",
+              "label": "Snow on the ice",
+              "hint": "How much of the ice is covered by wind-blown snow drifts",
+              "min": 0,
+              "max": 1,
+              "step": 0.01,
+              "default": 0.5,
+              "format": "percent"
+            },
+            {
+              "key": "cracks",
+              "label": "Cracks",
+              "hint": "How cracked the ice is",
+              "min": 0,
+              "max": 1,
+              "step": 0.01,
+              "default": 0.3,
+              "format": "percent"
+            },
+            {
+              "key": "snowfall",
+              "label": "Snowfall",
+              "hint": "How much snow is falling",
+              "min": 0,
+              "max": 1,
+              "step": 0.01,
+              "default": 0.5,
+              "format": "percent"
+            },
+            {
+              "key": "speed",
+              "label": "Animation speed",
+              "hint": "How fast the skaters, snow and steam move",
+              "min": 0,
+              "max": 3,
+              "step": 0.05,
+              "default": 1,
+              "format": "times"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "cyberpunk",
+      "name": "Cyberpunk",
+      "desc": "A rain-soaked neon megacity at night, seen from above. Wherever your icons are, a block has burnt out: the buildings around it are on fire, and fire engines, police, ambulances and firefighting drones rush in from all sides to put it out.",
+      "page": "cyberpunk.html",
+      "status": "ready",
+      "product": "free",
+      "thumb": "url(thumbs/cyberpunk.webp) center / cover no-repeat, linear-gradient(160deg,#0a0618 0%,#2a0b3d 100%)",
+      "thumbSource": "custom",
+      "groups": [
+        {
+          "name": "Around icons",
+          "params": [
+            {
+              "key": "sigma",
+              "label": "Disaster zone size",
+              "hint": "How far the burnt-out area under your icons reaches before the burning buildings begin",
+              "min": 40,
+              "max": 200,
+              "step": 1,
+              "default": 72,
+              "unit": "px"
+            },
+            {
+              "key": "units",
+              "label": "Emergency units",
+              "hint": "How many fire engines, police cars, ambulances and drones respond; 0 leaves the fire alone",
+              "min": 0,
+              "max": 2,
+              "step": 0.05,
+              "default": 1,
+              "format": "percent"
+            }
+          ]
+        },
+        {
+          "name": "City",
+          "params": [
+            {
+              "key": "palette",
+              "label": "Neon colours",
+              "hint": "The colours of the signs and the haze",
+              "options": [
+                "Neon",
+                "Acid",
+                "Sunset"
+              ],
+              "default": 0
+            },
+            {
+              "key": "traffic",
+              "label": "Traffic",
+              "hint": "How many cars drive the streets and fly over the city",
+              "min": 0,
+              "max": 2,
+              "step": 0.05,
+              "default": 1,
+              "format": "percent"
+            },
+            {
+              "key": "rain",
+              "label": "Rain",
+              "hint": "Rain streaks, ripples and the occasional soft lightning",
+              "min": 0,
+              "max": 1,
+              "step": 0.01,
+              "default": 0.6,
+              "format": "percent"
+            },
+            {
+              "key": "glitch",
+              "label": "Glitch",
+              "hint": "How often and how strongly the picture glitches for a moment; 0 turns it off",
+              "min": 0,
+              "max": 1,
+              "step": 0.01,
+              "default": 0.25,
+              "format": "percent"
+            },
+            {
+              "key": "speed",
+              "label": "Animation speed",
+              "hint": "How fast the traffic, the signs and the rain move",
+              "min": 0,
+              "max": 3,
+              "step": 0.05,
+              "default": 1,
+              "format": "times"
+            }
+          ]
+        }
+      ]
     }
   ]
 }

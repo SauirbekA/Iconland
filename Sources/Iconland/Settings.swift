@@ -10,10 +10,28 @@ final class Settings {
     private var pending: DispatchWorkItem?
 
     init() {
-        guard let root = JSON.read(url) as? [String: Any] else { return }
+        guard let root = JSON.read(url) as? [String: Any] else {
+            keepUnreadableFile()
+            return
+        }
         if let t = root["theme"] as? String { theme = t }
         if let p = root["params"] as? [String: [String: Any]] { params = p }
         if let l = root["lang"] as? String { lang = l }
+    }
+
+    /// The file exists but isn't valid settings JSON: the next save would overwrite it with defaults,
+    /// so keep a copy the user can recover from (settings.corrupt.json).
+    private func keepUnreadableFile() {
+        let fm = FileManager.default
+        guard fm.fileExists(atPath: url.path) else { return }      // first run: nothing to keep
+        let backup = url.deletingLastPathComponent().appendingPathComponent("settings.corrupt.json")
+        try? fm.removeItem(at: backup)
+        do {
+            try fm.copyItem(at: url, to: backup)
+            Log.write("settings.json is unreadable, using defaults; the old file was kept as \(backup.lastPathComponent)")
+        } catch {
+            Log.write("settings.json is unreadable and couldn't be backed up: \(error.localizedDescription)")
+        }
     }
 
     func values(for theme: String) -> [String: Any] { params[theme] ?? [:] }
@@ -40,8 +58,11 @@ final class Settings {
     func saveNow() {
         pending?.cancel(); pending = nil
         let root: [String: Any] = ["theme": theme, "params": params, "lang": lang]
-        if let data = try? JSONSerialization.data(withJSONObject: root, options: [.prettyPrinted, .sortedKeys]) {
-            try? data.write(to: url, options: .atomic)
+        do {
+            let data = try JSONSerialization.data(withJSONObject: root, options: [.prettyPrinted, .sortedKeys])
+            try data.write(to: url, options: .atomic)
+        } catch {
+            Log.write("couldn't save settings: \(error.localizedDescription)")
         }
     }
 }
