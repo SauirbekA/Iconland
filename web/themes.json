@@ -674,6 +674,93 @@
           ]
         }
       ]
+    },
+    {
+      "id": "anthill",
+      "name": "蚁巢",
+      "desc": "阳光下的林间地面：每组图标都变成一座蚁丘，小蚂蚁沿着踩出来的小路在蚁巢之间往来，把面包屑、方糖和浆果一点点搬回家",
+      "page": "anthill.html",
+      "status": "ready",
+      "product": "free",
+      "thumb": "url(thumbs/anthill.webp) center / cover no-repeat, linear-gradient(160deg,#9a7a55 0%,#5e4630 100%)",
+      "thumbSource": "custom",
+      "groups": [
+        {
+          "name": "蚁丘",
+          "params": [
+            {
+              "key": "sigma",
+              "label": "蚁丘大小",
+              "hint": "图标下面的蚁丘从图标往外堆多远",
+              "min": 30,
+              "max": 120,
+              "step": 1,
+              "default": 55,
+              "unit": "px"
+            }
+          ]
+        },
+        {
+          "name": "蚂蚁",
+          "params": [
+            {
+              "key": "ants",
+              "label": "蚂蚁数量",
+              "hint": "在外面跑的蚂蚁有多少（蚁巢越多蚂蚁越多）",
+              "min": 0,
+              "max": 1,
+              "step": 0.01,
+              "default": 0.5,
+              "format": "percent"
+            },
+            {
+              "key": "food",
+              "label": "食物",
+              "hint": "面包屑、方糖、浆果和树叶出现得多频繁",
+              "min": 0,
+              "max": 1,
+              "step": 0.01,
+              "default": 0.5,
+              "format": "percent"
+            },
+            {
+              "key": "trails",
+              "label": "蚁道",
+              "hint": "蚂蚁常走的地方慢慢踩出浅色的小路",
+              "options": [
+                "隐藏",
+                "显示"
+              ],
+              "default": 1
+            },
+            {
+              "key": "speed",
+              "label": "动画速度",
+              "hint": "蚂蚁和瓢虫爬行的快慢",
+              "min": 0,
+              "max": 3,
+              "step": 0.05,
+              "default": 1,
+              "format": "times"
+            }
+          ]
+        },
+        {
+          "name": "地面",
+          "params": [
+            {
+              "key": "details",
+              "label": "地面细节",
+              "hint": "石子、落叶、松针、小树枝，以及边上的小草和三叶草有多少",
+              "min": 0,
+              "max": 1,
+              "step": 0.01,
+              "default": 0.6,
+              "format": "percent"
+            }
+          ]
+        }
+      ]
     }
   ]
 }
