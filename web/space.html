@@ -1,0 +1,1066 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Iconland · Deep Space</title>
+<!--
+  Iconland · Deep Space theme (the calm dark one; pure WebGL2, one full-screen pass)
+  - Nebula field (CPU, only when icons change): gaussian metaballs + noise warp -> signed distance s (<0 = inside the
+    quiet cavity that holds the icons). The shader hangs emission-nebula gas on it: a dark saturated cavity under the
+    icons (white labels stay readable), the brightest gas in a shell just outside, wisps and dust lanes further out.
+  - Gas: a few taps of a tileable noise texture, domain-warped twice; the warp layers drift slowly in different
+    directions so the gas churns. All drift phases are wrapped on the CPU, so the picture never jumps.
+  - Sky: near-black space with faint haze and one band of the galaxy, four jittered star lattices (dust, small,
+    medium, a few bright ones with diffraction spikes), three faint distant galaxies.
+  - Life (a handful of uniforms): a slow comet with two tails, a rare shooting star, one or two planets parked in the
+    emptiest part of the screen (they fade out and move when icons arrive), a little rocket that flies from nebula
+    to nebula and steers around them with the CPU copy of the field.
+  Debug flags: ?nocap (no 30 fps cap, so the reported fps is the real one), ?lifetest (comet, shooting star and
+  rocket start at once, inside the view), ?demo (plain-browser demo that also tells the snapshot tool it is ready).
+-->
+<style>
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #05060f; }
+  #art { position: fixed; inset: 0; width: 100vw; height: 100vh; display: block; }
+  /* preview mode (?preview=1, settings window): translucent boxes show where the real icons are */
+  #ghosts { position: fixed; inset: 0; pointer-events: none; display: none; }
+  body.preview #ghosts { display: block; }
+  .ghost { position: absolute; }
+  .ghost i { position: absolute; left: 50%; top: 4px; width: 48px; height: 48px; margin-left: -24px; border-radius: 9px;
+    background: rgba(255,255,255,.55); box-shadow: 0 1px 3px rgba(0,0,0,.25); }
+  .ghost b { position: absolute; left: 14%; right: 14%; top: 60px; height: 10px; border-radius: 5px; background: rgba(255,255,255,.75); }
+  #nogl { position: fixed; inset: 0; display: none; place-items: center; color: #fff; font: 16px system-ui, sans-serif; }
+</style>
+</head>
+<body>
+<canvas id="art"></canvas>
+<div id="nogl">WebGL2 is not available.</div>
+<script>
+'use strict';
+
+/* ======================================================================
+   Parameters
+   ====================================================================== */
+const CELL_W = 76, CELL_H = 100, GRID_X0 = 4, GRID_Y0 = 6, TASKBAR = 0;   // icon grid (share.js uses these)
+const STEP = 5;                          // field grid step (px)
+const MORPH_MS = 2200;
+const WARP = 22;                         // how much the cavity outline is bent by noise (px)
+const S_FAR = 400;                       // field clamp far from every icon (also the "open space" value)
+
+const QS = new URLSearchParams(location.search);
+const WALL = QS.has('wallpaper');        // real desktop: messages from the host
+const PREVIEW = QS.has('preview');       // settings window preview (iframe): messages from the parent page
+const NOCAP = QS.has('nocap');           // debug: no 30 fps cap
+const LIFETEST = QS.has('lifetest');     // debug: bring the comet, the shooting star and the rocket out right away
+// Defaults must match themes.json
+const P = {
+  sigma: 72,        // nebula size around the icons (px)
+  glow: 1,          // nebula brightness
+  palette: 0,       // 0 mixed, 1 ember, 2 aurora, 3 orchid
+  stars: 1,         // star density
+  life: 1,          // comets, shooting stars, rockets, planets
+  speed: 1,         // animation speed
+  quality: 2, cap30: true,
+};
+const DEFAULTS = Object.assign({}, P);
+const KEYS = { sigma: [40, 200], glow: [0.3, 1.5], palette: [0, 3], stars: [0, 2], life: [0, 2], speed: [0, 3] };
+if (NOCAP) P.cap30 = false;
+
+/* ======================================================================
+   Random / noise helpers (CPU)
+   ====================================================================== */
+let seed = (Math.random() * 1e6) | 0;
+function hash2(x, y, k = 0) {
+  let h = Math.imul(x | 0, 374761393) ^ Math.imul(y | 0, 668265263) ^ Math.imul(seed + k, 2246822519);
+  h = Math.imul(h ^ (h >>> 13), 1274126177);
+  return ((h ^ (h >>> 16)) >>> 0) / 4294967296;
+}
+function vnoise(x, y, k = 0) {
+  const ix = Math.floor(x), iy = Math.floor(y), fx = x - ix, fy = y - iy;
+  const ux = fx * fx * (3 - 2 * fx), uy = fy * fy * (3 - 2 * fy);
+  const a = hash2(ix, iy, k), b = hash2(ix + 1, iy, k), c = hash2(ix, iy + 1, k), d = hash2(ix + 1, iy + 1, k);
+  return a + (b - a) * ux + (c - a) * uy + (a - b - c + d) * ux * uy;
+}
+function fbm(x, y, k = 0) {
+  let a = 0.5, s = 0;
+  for (let i = 0; i < 4; i++) { s += a * vnoise(x, y, k + i * 7); x = x * 2.03 + 17.1; y = y * 2.03 + 17.1; a *= 0.5; }
+  return s;
+}
+// Tileable noise texture (fixed): 4 channels of fbm at different scales
+function tileNoise(x, y, px, py, k) {
+  const ix = Math.floor(x), iy = Math.floor(y), fx = x - ix, fy = y - iy;
+  const ux = fx * fx * (3 - 2 * fx), uy = fy * fy * (3 - 2 * fy);
+  const m = (v, p) => ((v % p) + p) % p;
+  const x0 = m(ix, px), x1 = m(ix + 1, px), y0 = m(iy, py), y1 = m(iy + 1, py);
+  const h = (a, b) => { let v = Math.imul(a, 374761393) ^ Math.imul(b, 668265263) ^ Math.imul(k, 2246822519); v = Math.imul(v ^ (v >>> 13), 1274126177); return ((v ^ (v >>> 16)) >>> 0) / 4294967296; };
+  const a = h(x0, y0), b = h(x1, y0), c = h(x0, y1), d = h(x1, y1);
+  return a + (b - a) * ux + (c - a) * uy + (a - b - c + d) * ux * uy;
+}
+function makeNoiseImage() {
+  const S = 256, d = new Uint8Array(S * S * 4);
+  const chans = [[4, 8, 16, 32], [8, 16, 32, 64], [2, 4, 8, 16], [16, 32, 64, 128]];
+  for (let y = 0; y < S; y++) for (let x = 0; x < S; x++) {
+    const u = x / S, v = y / S, i = (y * S + x) * 4;
+    for (let c = 0; c < 4; c++) {
+      let s = 0, w = 0.5, tw = 0;
+      for (let j = 0; j < chans[c].length; j++) { const p = chans[c][j]; s += w * tileNoise(u * p, v * p, p, p, 100 + c * 50 + j * 13); tw += w; w *= 0.5; }
+      d[i + c] = Math.min(Math.max((s / tw - 0.5) * 1.9 + 0.5, 0), 1) * 255;
+    }
+  }
+  return { S, d };
+}
+const sstep = (a, b, x) => { const t = Math.min(Math.max((x - a) / (b - a), 0), 1); return t * t * (3 - 2 * t); };
+const lerp = (a, b, t) => a + (b - a) * t;
+const clamp01 = x => Math.min(1, Math.max(0, x));
+
+/* ======================================================================
+   Nebula field (CPU): s = signed distance to the edge of the cavity that holds the icons (<0 inside)
+   ====================================================================== */
+let W = innerWidth, H = innerHeight, Gw = 1, Gh = 1, NZ = null;
+function buildNoise() {
+  const N = Gw * Gh;
+  NZ = { wx: new Float32Array(N), wy: new Float32Array(N) };
+  for (let gy = 0; gy < Gh; gy++) for (let gx = 0; gx < Gw; gx++) {
+    const i = gy * Gw + gx, x = gx * STEP, y = gy * STEP;
+    NZ.wx[i] = fbm(x * 0.0035, y * 0.0035, 1) - 0.47;
+    NZ.wy[i] = fbm(x * 0.0035, y * 0.0035, 2) - 0.47;
+  }
+}
+let fieldMs = 0;
+function computeField(rects) {
+  const t0 = performance.now();
+  const N = Gw * Gh, f1 = new Float32Array(N);
+  const sig = P.sigma, is1 = 1 / (sig * sig);
+  const wa = WARP * 2.2, wmax = wa * 0.5;
+  for (const r of rects) {
+    const R = 5.5 * sig + Math.max(r.hw, r.hh) * 0.5 + wmax;
+    const gx0 = Math.max(0, Math.floor((r.cx - R) / STEP)), gx1 = Math.min(Gw - 1, Math.ceil((r.cx + R) / STEP));
+    const gy0 = Math.max(0, Math.floor((r.cy - R) / STEP)), gy1 = Math.min(Gh - 1, Math.ceil((r.cy + R) / STEP));
+    const chw = r.hw * 0.5, chh = r.hh * 0.5;
+    for (let gy = gy0; gy <= gy1; gy++) for (let gx = gx0; gx <= gx1; gx++) {
+      const i = gy * Gw + gx;
+      const qx = gx * STEP + NZ.wx[i] * wa, qy = gy * STEP + NZ.wy[i] * wa;
+      let dx = Math.abs(qx - r.cx) - chw, dy = Math.abs(qy - r.cy) - chh;
+      if (dx < 0) dx = 0; if (dy < 0) dy = 0;
+      f1[i] += Math.exp(-(dx * dx + dy * dy) * is1);
+    }
+  }
+  const c0 = Math.sqrt(-Math.log(0.35)), s = new Float32Array(N), fMin = Math.exp(-30);
+  for (let i = 0; i < N; i++) {
+    const g = Math.log(Math.max(f1[i], fMin));
+    s[i] = Math.min(S_FAR, sig * (Math.sqrt(Math.max(-g, 0)) - c0) - sig * 0.6 * Math.max(g, 0));
+  }
+  fieldMs = performance.now() - t0;
+  return { s };
+}
+function sampleArr(a, x, y) {
+  const fx = Math.min(Math.max(x / STEP, 0), Gw - 1.001), fy = Math.min(Math.max(y / STEP, 0), Gh - 1.001);
+  const ix = Math.floor(fx), iy = Math.floor(fy), tx = fx - ix, ty = fy - iy, i = iy * Gw + ix;
+  return (a[i] * (1 - tx) + a[i + 1] * tx) * (1 - ty) + (a[i + Gw] * (1 - tx) + a[i + Gw + 1] * tx) * ty;
+}
+// how far the gas reaches past the cavity edge (px); must stay below the field's far value
+const reachOf = () => Math.min(2.6 * P.sigma, 370);
+
+/* ======================================================================
+   Shaders
+   ====================================================================== */
+const VS = `#version 300 es
+void main() {
+  vec2 p = vec2(float((gl_VertexID << 1) & 2), float(gl_VertexID & 2));
+  gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);
+}`;
+
+const FS = `#version 300 es
+precision highp float;
+uniform sampler2D uNoise, uFA, uFB;
+uniform vec2 uRes, uGrid;
+uniform vec2 uOff;                 // seed offset into the noise texture
+uniform vec2 uD1, uD2, uD3;        // slow drift of the gas: noise-texture phases, each wraps at 1
+uniform float uScale, uStep, uMix, uTime, uSig, uReach, uGlow, uStars, uL0;
+uniform vec3 uPal[12];             // 3 palettes x (cavity, shell, hot filaments, outer wisps), blended across the sky
+uniform vec3 uPalDir;              // palette cycling across the screen: direction (x, y), phase
+uniform vec4 uBand;                // band of the galaxy: a point on it (x, y), angle of its normal, half width
+uniform vec4 uGal[3];              // distant galaxies: x, y, radius, angle (radius 0 = none)
+uniform vec4 uPl[2];               // planets: x, y, radius, alpha
+uniform vec4 uPlS[2];              // planets: kind + hue, axis tilt, spin phase, ring size in radii (0 = no ring)
+uniform vec4 uComet;               // head x, y, direction of travel, brightness (0 = none)
+uniform vec2 uCometT;              // tail length (px), which way the tails bend (+-1)
+uniform vec4 uShoot;               // shooting star head: x, y, angle, brightness (0 = none)
+uniform float uShootL;
+uniform vec4 uShip[2];             // rocket: x, y, heading, alpha (0 = none)
+uniform vec4 uShipS[2];            // rocket: thrust 0..1, size, flame flicker 0..1, -
+out vec4 o;
+
+float hash2(vec2 p) {
+  vec3 p3 = fract(vec3(p.xyx) * 0.1031);
+  p3 += dot(p3, p3.yzx + 33.33);
+  return fract((p3.x + p3.y) * p3.z);
+}
+float ss(float a, float b, float x) { float t = clamp((x - a) / (b - a), 0.0, 1.0); return t * t * (3.0 - 2.0 * t); }
+// noise texture, one tile = "scale" px; explicit LOD so it is safe inside branches
+vec4 N(vec2 p, float scale, vec2 ph) { return textureLod(uNoise, p / scale + ph + uOff, max(0.0, uL0 - log2(scale))); }
+float fieldS(vec2 p) {
+  vec2 uv = (p / uStep + 0.5) / uGrid;
+  return mix(textureLod(uFA, uv, 0.0).r, textureLod(uFB, uv, 0.0).r, uMix);
+}
+float ellD(vec2 p, vec2 r) { return (length(p / r) - 1.0) * min(r.x, r.y); }
+float triD(vec2 p, vec2 a, vec2 b, vec2 c) {
+  vec2 e0 = b - a, e1 = c - b, e2 = a - c, v0 = p - a, v1 = p - b, v2 = p - c;
+  vec2 q0 = v0 - e0 * clamp(dot(v0, e0) / dot(e0, e0), 0.0, 1.0);
+  vec2 q1 = v1 - e1 * clamp(dot(v1, e1) / dot(e1, e1), 0.0, 1.0);
+  vec2 q2 = v2 - e2 * clamp(dot(v2, e2) / dot(e2, e2), 0.0, 1.0);
+  float sg = sign(e0.x * e2.y - e0.y * e2.x);
+  vec2 d = min(min(vec2(dot(q0, q0), sg * (v0.x * e0.y - v0.y * e0.x)), vec2(dot(q1, q1), sg * (v1.x * e1.y - v1.y * e1.x))),
+               vec2(dot(q2, q2), sg * (v2.x * e2.y - v2.y * e2.x)));
+  return -sqrt(d.x) * sign(d.y);
+}
+
+// ---- stars: one jittered star per lattice cell ----
+vec3 starTint(float k) {
+  return k < 0.30 ? mix(vec3(0.66, 0.79, 1.0), vec3(0.90, 0.95, 1.0), k / 0.30)
+       : k < 0.74 ? vec3(1.0, 0.98, 0.94)
+       : mix(vec3(1.0, 0.90, 0.68), vec3(1.0, 0.70, 0.52), (k - 0.74) / 0.26);
+}
+vec3 starLayer(vec2 p, float G, float prob, float size, float k) {
+  vec2 c = floor(p / G), cm = c + k;
+  float ex = ss(0.0, 0.07, prob - hash2(cm));              // the density varies smoothly, so a star fades in, never clips
+  if (ex <= 0.0) return vec3(0.0);
+  vec2 sp = (c + 0.10 + 0.80 * vec2(hash2(cm + 17.3), hash2(cm + 41.7))) * G;
+  float m = hash2(cm + 7.7);                               // magnitude: many dim, few bright
+  float b = 0.10 + 0.90 * m * m * m;
+  float w0 = size * (0.62 + 0.50 * m), w = max(w0, 1.0 / uScale);
+  vec2 d = p - sp;
+  float I = b * exp(-dot(d, d) / (w * w)) * min(1.0, 1.6 * w0 * w0 / (w * w));   // small preview: wider but dimmer, same light
+  float tw = 1.0 + 0.24 * m * sin(uTime * (0.5 + 1.7 * hash2(cm + 3.3)) + m * 60.0);   // slow, gentle twinkle
+  return starTint(hash2(cm + 29.1)) * (I * tw * ex);
+}
+vec3 brightStars(vec2 p, float prob) {
+  const float G = 190.0;
+  vec2 c = floor(p / G), cm = c + 91.7;
+  float ex = ss(0.0, 0.07, prob - hash2(cm));
+  if (ex <= 0.0) return vec3(0.0);
+  vec2 sp = (c + 0.16 + 0.68 * vec2(hash2(cm + 17.3), hash2(cm + 41.7))) * G;
+  vec2 d = abs(p - sp);
+  float r = length(d), m = hash2(cm + 7.7), sz = 0.75 + 0.55 * m;
+  float tw = 1.0 + 0.10 * sin(uTime * (0.35 + 0.9 * hash2(cm + 3.3)) + m * 40.0);
+  float core = exp(-r * r / (2.0 * sz * sz));
+  float halo = 0.20 * exp(-r / (4.5 * sz));
+  float lo = min(d.x, d.y), hi = max(d.x, d.y);
+  float spike = exp(-lo * lo / 0.40) * exp(-hi / (6.5 * sz * tw)) * 0.60;     // soft four-point diffraction cross
+  return starTint(hash2(cm + 29.1)) * ((core + halo + spike) * tw * ex);
+}
+
+// ---- comet: a small coma, a broad curved dust tail and a thin straight ion tail ----
+vec3 cometLight(vec2 p) {
+  if (uComet.w <= 0.0) return vec3(0.0);
+  vec2 dir = vec2(cos(uComet.z), sin(uComet.z)), rel = p - uComet.xy;
+  float L = uCometT.x;
+  float along = -dot(rel, dir);                            // distance behind the head
+  if (along < -34.0 || along > L) return vec3(0.0);
+  float across = dot(rel, vec2(-dir.y, dir.x));
+  if (abs(across) > 0.30 * L + 34.0) return vec3(0.0);
+  float t = clamp(along / L, 0.0, 1.0), back = ss(-3.0, 8.0, along);
+  float ac = across - uCometT.y * t * t * L * 0.15;
+  float w = 2.0 + 0.085 * L * pow(t, 0.85);
+  float streak = textureLod(uNoise, vec2(along / 520.0, ac / (w * 6.0) + 0.37) + uOff, 0.0).g;
+  float dust = exp(-ac * ac / (w * w)) * pow(1.0 - t, 1.7) * (0.50 + 0.70 * streak) * back;
+  float ai = across + uCometT.y * t * L * 0.09;
+  float wi = 1.0 + 0.02 * L * t;
+  float ion = exp(-ai * ai / (wi * wi)) * pow(1.0 - t, 1.2) * back;
+  float r = length(rel);
+  float coma = 1.3 * exp(-r * r / 9.0) + 0.40 * exp(-r * r / 110.0);
+  return (vec3(1.0, 0.93, 0.80) * dust * 0.58 + vec3(0.50, 0.78, 1.0) * ion * 0.42 + vec3(0.86, 1.0, 0.96) * coma) * uComet.w;
+}
+
+// ---- planets: a lit sphere (banded gas, or sea / land / cloud), some with a ring ----
+const vec3 SUN = vec3(-0.557, -0.456, 0.694);              // light from the upper left, a little from the front
+vec3 drawPlanet(vec3 col, vec2 p, vec4 pl, vec4 ps) {
+  float R = pl.z, ext = max(ps.w, 1.0) + 0.35;
+  vec2 d = p - pl.xy;
+  if (pl.w <= 0.0 || abs(d.x) > R * ext || abs(d.y) > R * ext) return col;
+  vec2 q = d / R;
+  float r = length(q), px = 1.0 / (R * uScale);
+  float kind = floor(ps.x), hue = fract(ps.x);
+  float ca = cos(ps.y), sa = sin(ps.y);
+  vec2 qa = vec2(ca * q.x + sa * q.y, -sa * q.x + ca * q.y);          // qa.x along the equator, qa.y along the axis
+  vec3 atm = kind < 0.5 ? (hue < 0.67 ? vec3(1.0, 0.84, 0.60) : vec3(0.50, 0.68, 1.0))
+                        : (hue < 0.34 ? vec3(0.45, 0.76, 1.0) : hue < 0.67 ? vec3(1.0, 0.62, 0.44) : vec3(0.70, 0.90, 1.0));
+  // a thin glow just outside the limb, on the lit side
+  float side = clamp(dot(q / max(r, 1e-3), SUN.xy) * 0.9 + 0.5, 0.0, 1.0);
+  col += atm * exp(-max(r - 1.0, 0.0) / 0.06) * step(1.0, r) * side * 0.20 * pl.w;
+  if (r < 1.0 + px) {
+    float z = sqrt(max(1.0 - r * r, 0.0));
+    float lat = qa.y;
+    float lon = asin(clamp(qa.x / max(sqrt(1.0 - lat * lat), 1e-3), -1.0, 1.0));
+    vec2 suv = vec2(lon * 0.16 + ps.z, lat * 0.5);                     // ps.z: spin phase, wraps at 1
+    vec4 t1 = textureLod(uNoise, suv + hue * 3.7, 0.0);
+    vec3 sc;
+    if (kind < 0.5) {
+      float bl = lat + (t1.g - 0.5) * 0.09;                            // wavy edges of the belts
+      float b1 = textureLod(uNoise, vec2(hue * 5.3 + 0.21, bl * 0.33 + hue * 2.0), 0.0).r;
+      float b2 = textureLod(uNoise, vec2(hue * 9.1 + 0.67, bl * 1.3 + hue), 0.0).g;
+      vec3 c1, c2, c3;
+      if (hue < 0.34) { c1 = vec3(0.93, 0.83, 0.62); c2 = vec3(0.74, 0.58, 0.40); c3 = vec3(0.98, 0.93, 0.80); }
+      else if (hue < 0.67) { c1 = vec3(0.88, 0.66, 0.46); c2 = vec3(0.60, 0.34, 0.24); c3 = vec3(0.96, 0.86, 0.70); }
+      else { c1 = vec3(0.36, 0.52, 0.90); c2 = vec3(0.22, 0.30, 0.70); c3 = vec3(0.62, 0.80, 0.98); }
+      sc = mix(c2, c1, ss(0.30, 0.70, b1));
+      sc = mix(sc, c3, ss(0.55, 0.85, b2) * 0.55);
+      sc *= 0.92 + 0.16 * t1.a;
+    } else {
+      vec4 t2 = textureLod(uNoise, suv * 2.3 + 0.37, 0.0);
+      float land = ss(0.50, 0.58, t1.b * 0.6 + t1.r * 0.4);
+      float cloud = ss(0.55, 0.78, t2.r * 0.6 + t1.g * 0.4);
+      vec3 sea, gnd;
+      if (hue < 0.34) { sea = vec3(0.10, 0.30, 0.62); gnd = vec3(0.30, 0.52, 0.30); }
+      else if (hue < 0.67) { sea = vec3(0.62, 0.30, 0.18); gnd = vec3(0.82, 0.52, 0.32); }
+      else { sea = vec3(0.50, 0.70, 0.86); gnd = vec3(0.86, 0.93, 0.98); }
+      sc = mix(sea, gnd, land);
+      sc = mix(sc, vec3(0.96), cloud * 0.8);
+      sc = mix(sc, vec3(0.95, 0.97, 1.0), ss(0.78, 0.90, abs(lat)));   // polar caps
+    }
+    float diff = dot(vec3(q, z), SUN);
+    float lit = ss(-0.12, 0.75, diff);                                 // soft terminator
+    sc *= (0.03 + 0.97 * lit) * (0.60 + 0.40 * z);                     // limb darkening
+    sc += atm * pow(1.0 - z, 3.0) * lit * 0.35;                        // bright limb on the lit side
+    col = mix(col, sc, ss(px, -px, r - 1.0) * pl.w);
+  }
+  if (ps.w > 0.0) {
+    // ring in the equatorial plane, seen at a slant; its near half passes in front of the planet
+    float rr = length(vec2(qa.x, qa.y / 0.30));
+    if (rr > 1.25 && rr < ps.w + 0.05 && (qa.y > 0.0 || r > 1.0)) {
+      float u = (rr - 1.3) / (ps.w - 1.3);
+      float tex = textureLod(uNoise, vec2(u * 2.6 + hue, 0.53), 0.0).g;
+      float a = ss(0.0, 0.05, u) * ss(1.0, 0.95, u) * (0.30 + 0.70 * ss(0.15, 0.85, tex)) * (0.55 + 0.45 * ss(0.0, 0.30, u));
+      a *= 1.0 - 0.85 * ss(0.035, 0.0, abs(u - 0.66));                 // a gap
+      // the planet's shadow falls across the far side of the ring (ring point and sun in the planet's own frame)
+      vec3 sunA = vec3(ca * SUN.x + sa * SUN.y, -sa * SUN.x + ca * SUN.y, SUN.z);
+      vec3 rp = vec3(qa.x, qa.y, qa.y * 3.18);
+      float ds = dot(rp, sunA);
+      float sh = ss(1.0, 0.88, sqrt(max(dot(rp, rp) - ds * ds, 0.0))) * step(ds, 0.0);
+      vec3 rc = mix(vec3(0.66, 0.57, 0.46), vec3(0.97, 0.91, 0.80), tex) * (1.0 - 0.92 * sh);
+      col = mix(col, rc * 0.88, a * 0.85 * pl.w);
+    }
+  }
+  return col;
+}
+
+// ---- rocket seen from above: cream hull, red nose and fins, a porthole, a flickering flame ----
+vec3 drawShip(vec3 col, vec2 p, vec4 sh, vec4 st) {
+  float k = st.y;
+  vec2 d = p - sh.xy;
+  if (sh.w <= 0.0 || k <= 0.0 || abs(d.x) > 84.0 * k || abs(d.y) > 84.0 * k) return col;
+  float ca = cos(sh.z), sa = sin(sh.z);
+  vec2 l = vec2(ca * d.x + sa * d.y, -sa * d.x + ca * d.y) / k;       // x forward, y to the side
+  float px = 1.0 / (k * uScale), ay = abs(l.y), th = st.x * sh.w;
+  float a = -6.5 - l.x;                                              // distance behind the nozzle
+  if (a > -2.0 && th > 0.0) {
+    // exhaust: a faint cool trail, the flame and its glow
+    float tl = clamp(a / 66.0, 0.0, 1.0), w = 1.4 + 5.5 * tl;
+    col += vec3(0.50, 0.72, 1.0) * exp(-l.y * l.y / (w * w)) * (1.0 - tl) * (1.0 - tl) * ss(-2.0, 2.0, a) * 0.32 * th;
+    float fl = 8.5 + 3.5 * st.z, tf = clamp(a / fl, 0.0, 1.0);
+    float fd = ay - 2.3 * (1.0 - tf) * (0.55 + 0.45 * ss(0.0, 0.25, tf));
+    vec3 fc = mix(vec3(1.0, 0.97, 0.78), vec3(1.0, 0.50, 0.14), ss(-1.6, 0.2, fd));
+    col = mix(col, fc, ss(px, -px, max(fd, -a)) * step(a, fl) * th);
+    col += vec3(1.0, 0.52, 0.18) * exp(-length(l + vec2(10.0, 0.0)) / 5.5) * 0.30 * th;
+  }
+  float hull = min(max(ay - 3.6, max(l.x - 2.0, -6.5 - l.x)), ellD(l - vec2(2.0, 0.0), vec2(7.6, 3.6)));
+  hull = max(hull, -6.5 - l.x);
+  float fin = triD(vec2(l.x, ay), vec2(-1.2, 3.0), vec2(-8.2, 7.4), vec2(-6.9, 3.0));
+  float body = min(hull, fin);
+  if (body < 1.0 + px) {
+    vec3 red = vec3(0.90, 0.25, 0.22);
+    vec3 hc = mix(vec3(0.96, 0.96, 0.93), vec3(0.62, 0.66, 0.80), ss(0.6, 3.6, ay));   // rounded: darker to the sides
+    hc = mix(hc, red * (1.0 - 0.25 * ss(0.6, 3.6, ay)), step(5.4, l.x));                // nose cone
+    hc = mix(hc, red, step(abs(l.x + 3.7), 0.65));                                      // stripe
+    if (fin < hull) hc = vec3(0.82, 0.21, 0.19) * (0.78 + 0.22 * ss(7.4, 3.0, ay));
+    float wd = length(l - vec2(1.6, 0.0)) - 1.75;                                       // porthole
+    hc = mix(hc, vec3(0.16, 0.20, 0.32), ss(px, -px, wd));
+    hc = mix(hc, vec3(0.48, 0.82, 1.0), ss(px, -px, wd + 0.55));
+    hc = mix(hc, vec3(0.92, 0.98, 1.0), ss(px, -px, length(l - vec2(2.0, -0.45)) - 0.40));
+    hc = mix(hc, vec3(0.07, 0.07, 0.13), ss(-0.55 - px, -0.55 + px, body) * 0.9);       // outline
+    col = mix(col, hc, ss(px, -px, body) * sh.w);
+  }
+  return col;
+}
+
+void main() {
+  vec2 p = vec2(gl_FragCoord.x, uRes.y * uScale - gl_FragCoord.y) / uScale;
+  float s = fieldS(p);                                     // px to the edge of the icons' cavity (<0 inside)
+
+  // ---------- deep space: near black with faint haze, and one band of the galaxy ----------
+  vec4 nA = N(p, 2400.0, vec2(0.0));
+  vec4 nB = N(mat2(0.8, -0.6, 0.6, 0.8) * p + 300.0, 1100.0, vec2(0.0));
+  vec3 col = vec3(0.011, 0.013, 0.030);
+  col += vec3(0.018, 0.026, 0.066) * ss(0.35, 0.90, nA.b);
+  col += vec3(0.040, 0.016, 0.054) * ss(0.50, 0.95, nB.b) * 0.8;
+  col += vec3(0.008, 0.036, 0.040) * ss(0.60, 1.00, nA.r) * 0.8;
+  float bd = dot(p - uBand.xy, vec2(cos(uBand.z), sin(uBand.z)));
+  float band = exp(-bd * bd / (uBand.w * uBand.w));
+  col += vec3(0.070, 0.066, 0.100) * band * ss(0.20, 0.85, nB.r * 0.6 + nA.g * 0.4);
+  col += vec3(0.050, 0.030, 0.020) * band * band * ss(0.45, 0.90, nB.a);   // warmer towards its middle
+  col *= 1.0 - 0.50 * band * ss(0.52, 0.78, nB.g);         // dark lanes in the band
+
+  // ---------- distant galaxies ----------
+  for (int i = 0; i < 3; i++) {
+    vec4 g = uGal[i];
+    vec2 d = p - g.xy;
+    if (g.z <= 0.0 || dot(d, d) > g.z * g.z * 9.0) continue;
+    float ca = cos(g.w), sa = sin(g.w), tilt = 0.42 + 0.4 * fract(g.w * 3.1);
+    vec2 q = vec2(ca * d.x + sa * d.y, (-sa * d.x + ca * d.y) / tilt) / g.z;
+    float r = length(q);
+    float arms = 0.5 + 0.5 * cos(2.0 * atan(q.y, q.x) - 5.0 * log(r + 0.06) + g.w * 5.0);
+    float disk = exp(-r * 2.0) * (0.30 + 0.70 * arms * ss(0.06, 0.35, r)) * ss(3.0, 1.6, r);
+    col += vec3(1.0, 0.88, 0.70) * exp(-r * 4.5) * 0.30 + vec3(0.55, 0.66, 1.0) * disk * 0.20;
+  }
+
+  // ---------- stars ----------
+  float sd = uStars * (0.40 + 1.15 * nA.g) * (1.0 + 1.5 * band);       // density varies across the sky
+  vec3 st = starLayer(mat2(0.921, 0.389, -0.389, 0.921) * p, 11.0, min(0.50 * sd, 0.78), 0.50, 3.1) * 0.75;
+  st += starLayer(mat2(0.540, -0.841, 0.841, 0.540) * p, 27.0, min(0.42 * sd, 0.78), 0.85, 57.3);
+  st += starLayer(mat2(0.764, 0.645, -0.645, 0.764) * p, 64.0, min(0.30 * sd, 0.78), 1.20, 131.9) * 1.15;
+  st += brightStars(p, min(0.33 * sd, 0.80)) * 1.2;
+  vec3 back = col + st + cometLight(p);
+
+  // ---------- shooting star ----------
+  if (uShoot.w > 0.0) {
+    vec2 dir = vec2(cos(uShoot.z), sin(uShoot.z)), rel = p - uShoot.xy;
+    float along = -dot(rel, dir);
+    if (along > -4.0 && along < uShootL + 4.0) {
+      float across = abs(dot(rel, vec2(-dir.y, dir.x)));
+      float t = clamp(along / uShootL, 0.0, 1.0), w = mix(1.1, 0.15, t);
+      float m = ss(w + 0.7, w - 0.3, across) * (1.0 - t) * (1.0 - t) * step(0.0, along);
+      m = max(m, exp(-dot(rel, rel) / 2.6));
+      back += vec3(1.0, 0.98, 0.90) * m * uShoot.w;
+    }
+  }
+
+  // ---------- nebula around the icons ----------
+  vec3 neb = vec3(0.0);
+  float occ = 0.0;
+  if (s < uReach) {
+    float x = s / uSig, xr = uReach / uSig;                // distance from the cavity edge in nebula sizes
+    // palette for this part of the sky: three of them follow one another across the screen (neighbours on the
+    // colour wheel only, so the blends never go grey)
+    float pu = dot(p / uRes - 0.5, uPalDir.xy) + uPalDir.z + (nA.b - 0.5) * 0.5;
+    float tri = abs(fract(pu) * 2.0 - 1.0) * 2.0;
+    float k1 = ss(0.20, 0.80, tri), k2 = ss(1.20, 1.80, tri);
+    vec3 cCav = mix(mix(uPal[0], uPal[4], k1), uPal[8], k2);
+    vec3 cRim = mix(mix(uPal[1], uPal[5], k1), uPal[9], k2);
+    vec3 cHot = mix(mix(uPal[2], uPal[6], k1), uPal[10], k2);
+    vec3 cOut = mix(mix(uPal[3], uPal[7], k1), uPal[11], k2);
+    // gas: two layers of fbm (each tap carries four octaves), gently warped; the warp and the layers drift in
+    // different directions, so the gas slowly churns
+    vec4 wv = N(p, 1000.0, uD1);
+    vec2 pa = p + (wv.rg - 0.5) * 90.0;
+    vec4 ga = N(pa, 700.0, uD2);
+    float fa = ga.b * 0.46 + ga.r * 0.27 + ga.g * 0.17 + ga.a * 0.10;
+    vec2 pb = p + (wv.gb - 0.5) * 110.0 + 400.0;
+    vec4 gb = N(pb, 460.0, uD3);
+    float fb = gb.b * 0.46 + gb.r * 0.27 + gb.g * 0.17 + gb.a * 0.10;
+    vec4 dn = N(pa + 811.0, 540.0, -uD3);
+    vec4 fn = N(pb + (ga.rg - 0.5) * 44.0 + 133.0, 250.0, uD2 * 2.0);   // fine structure, dragged along by the big masses
+    float f3 = fn.b * 0.40 + fn.r * 0.30 + fn.g * 0.20 + fn.a * 0.10;
+    float r3 = 1.0 - abs(2.0 * fn.r - 1.0), r4 = 1.0 - abs(2.0 * fn.g - 1.0);
+    float wisp = 0.55 * r3 * r3 + 0.45 * r4 * r4;          // thin bright filaments
+    float fade = ss(xr, xr * 0.5, x);
+    // ln of the summed icon gaussians, recovered from s: unlike s it is smooth everywhere, also where icons merge
+    float lf = x > -1.0246 ? -(x + 1.0246) * (x + 1.0246) : (-1.0246 - x) / 0.6;
+    float cav = ss(-1.62, -0.33, lf);                      // the quiet cavity that holds the icons
+    // dark dust clouds across the shell (never right at the cavity edge)
+    float dust = ss(0.50, 0.66, dn.b * 0.50 + dn.r * 0.30 + fn.b * 0.20) * ss(0.20, 0.80, x);
+    // the glow is strongest right at the icons and fades smoothly through the cavity edge and beyond, so the
+    // cavity has no outline; inside it there is only slow, low-contrast variation
+    float ef = exp(0.5 * lf);
+    float base = min(ef / (ef + 0.59) / 0.66, 1.2) * (0.66 + 0.68 * (ga.b * 0.6 + gb.b * 0.4)) * (1.0 - 0.6 * dust);
+    base *= 1.0 + (f3 - 0.5) * (0.55 - 0.25 * cav);
+    vec3 cCore = mix(cCav, (cRim * 0.5 + cOut * 0.5) * 0.36, ss(0.30, 0.72, wv.b) * 0.55);   // slow drift of hue inside
+    vec3 glow = mix(cCore, cOut * 0.42, ss(-0.1, 1.6, x)) * base;
+    // emission shell: brightest a little way outside the cavity, patchy and ragged (the big masses push the
+    // distance around), missing altogether in places
+    float amp = (0.10 + 0.90 * ss(0.30, 0.72, fb)) * (0.50 + 1.0 * nB.b);
+    float x1 = x + (fa - 0.5) * 1.6;
+    float l1 = ss(-0.30, 0.70, x + (fn.b - 0.5) * 0.45) * exp(-max(x1 - 0.45, 0.0) * 1.6) * amp;
+    l1 *= max(0.42 + 0.90 * wisp + 0.60 * (f3 - 0.5), 0.0) * (1.0 - 0.85 * dust);
+    // outer veil in the cool colour, reaching further
+    float x2 = x + (fb - 0.5) * 1.7;
+    float l2 = ss(-0.2, 0.9, x2) * exp(-max(x2 - 0.9, 0.0) * 1.25) * (0.25 + 0.75 * ss(0.30, 0.80, fa));
+    l2 *= (0.75 + 0.9 * (f3 - 0.5) + 0.25 * r3) * (1.0 - 0.60 * dust) * (1.0 - 0.55 * min(l1, 1.0));
+    // young stars born in the shell light up the gas around them
+    vec3 young = vec3(0.0);
+    const float YG = 96.0;
+    vec2 yc = floor(p / YG), ym = yc + 311.3;
+    if (hash2(ym) < 0.5) {
+      vec2 sp = (yc + 0.16 + 0.68 * vec2(hash2(ym + 17.3), hash2(ym + 41.7))) * YG;
+      float xs = fieldS(sp) / uSig;
+      float wy = ss(0.10, 0.40, xs) * ss(1.5, 0.8, xs);
+      if (wy > 0.0) {
+        float r = length(p - sp), m = hash2(ym + 7.7);
+        float tw = 1.0 + 0.15 * sin(uTime * (0.4 + m) + m * 50.0);
+        float lit = max(1.0 - r / 15.0, 0.0);
+        young = vec3(0.80, 0.90, 1.0) * (exp(-r * r / (1.4 + 1.4 * m)) + 0.22 * lit * lit * lit) * wy * tw * (1.0 - 0.6 * dust);
+        l1 += lit * lit * wy * 0.30 * (1.0 - dust);
+      }
+    }
+    vec3 shell = mix(cRim, cHot, ss(0.45, 1.1, l1) * 0.55) * l1 * 1.05 + (cOut * l2 * 0.55 + young) * (1.0 - cav);
+    neb = (glow + shell) * fade * uGlow;
+    occ = max(clamp(l1 * 0.75 + l2 * 0.40 + dust * 0.5 + base * 0.5, 0.0, 0.88) * fade, cav);
+  }
+  col = back * (1.0 - occ) + neb;
+
+  // ---------- vignette and a soft shoulder so overlapping light never clips ----------
+  vec2 vq = p / uRes - 0.5;
+  col *= 1.0 - 0.30 * ss(0.38, 0.95, length(vq * vec2(1.0, 0.85)));
+  col = 1.0 - exp(-col * 1.3);
+
+  // ---------- planets and rockets ----------
+  col = drawPlanet(col, p, uPl[0], uPlS[0]);
+  col = drawPlanet(col, p, uPl[1], uPlS[1]);
+  col = drawShip(col, p, uShip[0], uShipS[0]);
+  col = drawShip(col, p, uShip[1], uShipS[1]);
+
+  col += (hash2(gl_FragCoord.xy) - 0.5) / 255.0;           // dither: dark gradients would band otherwise
+  o = vec4(col, 1.0);
+}`;
+
+/* ======================================================================
+   WebGL
+   ====================================================================== */
+const cv = document.getElementById('art');
+const gl = cv.getContext('webgl2', { antialias: false });
+if (!gl) document.getElementById('nogl').style.display = 'grid';
+function program(fs) {
+  const mk = (type, src) => {
+    const s = gl.createShader(type);
+    gl.shaderSource(s, src); gl.compileShader(s);
+    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) { console.error(gl.getShaderInfoLog(s)); throw new Error('shader: ' + gl.getShaderInfoLog(s)); }
+    return s;
+  };
+  const p = gl.createProgram();
+  gl.attachShader(p, mk(gl.VERTEX_SHADER, VS));
+  gl.attachShader(p, mk(gl.FRAGMENT_SHADER, fs));
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) console.error(gl.getProgramInfoLog(p));
+  const U = {};
+  const n = gl.getProgramParameter(p, gl.ACTIVE_UNIFORMS);
+  for (let i = 0; i < n; i++) { const nm = gl.getActiveUniform(p, i).name.replace(/\[0\]$/, ''); U[nm] = gl.getUniformLocation(p, nm); }
+  return { p, U };
+}
+const PR = program(FS);
+gl.bindVertexArray(gl.createVertexArray());
+
+let noiseTex = null;
+function buildNoiseTex() {
+  const { S, d } = makeNoiseImage();
+  noiseTex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, noiseTex);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, S, S, 0, gl.RGBA, gl.UNSIGNED_BYTE, d);
+  gl.generateMipmap(gl.TEXTURE_2D);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.REPEAT);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.REPEAT);
+}
+// two field textures (R32F, linear filtering is fine on Apple GPUs; fall back to R16F otherwise)
+const F32LIN = !!gl.getExtension('OES_texture_float_linear');
+const ftex = [null, null];
+let fromI = 0, toI = 0, FA = null, FB = null;
+let morphT0 = -1e9, morphDur = MORPH_MS, curMix = 1;
+function allocField() {
+  for (let i = 0; i < 2; i++) {
+    if (ftex[i]) gl.deleteTexture(ftex[i]);
+    ftex[i] = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, ftex[i]);
+    if (F32LIN) gl.texImage2D(gl.TEXTURE_2D, 0, gl.R32F, Gw, Gh, 0, gl.RED, gl.FLOAT, null);
+    else gl.texImage2D(gl.TEXTURE_2D, 0, gl.R16F, Gw, Gh, 0, gl.RED, gl.FLOAT, null);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  }
+}
+function uploadField(i, Fd) {
+  gl.bindTexture(gl.TEXTURE_2D, ftex[i]);
+  gl.pixelStorei(gl.UNPACK_ALIGNMENT, 4);
+  gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, Gw, Gh, gl.RED, gl.FLOAT, Fd.s);
+}
+
+let icons = [];
+const iconRects = () => icons.map(ic => ({ cx: ic.x + ic.w / 2, cy: ic.y + ic.h / 2, hw: ic.w / 2 - 4, hh: ic.h / 2 - 2 }));
+// Field currently on screen (from -> to blended by curMix): a new transition must start from it, not from the
+// previous target, or the scenery jumps when icons move again while a transition is still running.
+function blendFields(A, B, m) {
+  const out = {};
+  for (const k in B) {
+    const a = A && A[k], b = B[k];
+    if (!(b instanceof Float32Array) || !(a instanceof Float32Array) || a.length !== b.length) return null;
+    const r = new Float32Array(b.length);
+    for (let i = 0; i < b.length; i++) r[i] = a[i] + (b[i] - a[i]) * m;
+    out[k] = r;
+  }
+  return out;
+}
+function commit(fromEmpty = false) {
+  const nf = computeField(iconRects());
+  const target = 1 - toI;
+  if (fromEmpty) { FA = computeField([]); uploadField(toI, FA); }
+  else if (FA && FB && curMix < 0.999 && (FA = blendFields(FA, FB, Math.max(0, curMix)))) uploadField(toI, FA);
+  else FA = FB || nf;
+  FB = nf;
+  uploadField(target, FB);
+  fromI = toI; toI = target;
+  morphT0 = performance.now();
+  morphDur = fromEmpty ? 2800 : MORPH_MS;
+  curMix = 0;
+  navDirty = true; navStamp++;
+  syncPlanets();
+}
+function refresh() {
+  FA = FB = computeField(iconRects());
+  uploadField(toI, FB);
+  fromI = toI; morphT0 = -1e9; curMix = 1;
+  navDirty = true; navStamp++;
+  syncPlanets();
+}
+// field on screen right now, and the field the scenery is heading for
+const curS = (x, y) => FB ? sampleArr(FA.s, x, y) * (1 - curMix) + sampleArr(FB.s, x, y) * curMix : S_FAR;
+const tgtS = (x, y) => FB ? sampleArr(FB.s, x, y) : S_FAR;
+
+/* ======================================================================
+   Palettes: [cavity (dark, under the icons), shell (main emission), hot (densest filaments), outer wisps]
+   "Mixed" spreads three of them across the sky, so separate nebulae come out in different colours.
+   ====================================================================== */
+const PAL = {
+  classic: [[0.250, 0.095, 0.340], [0.98, 0.26, 0.42], [1.00, 0.72, 0.42], [0.10, 0.46, 0.80]],
+  ember:   [[0.300, 0.085, 0.130], [0.98, 0.24, 0.20], [1.00, 0.74, 0.36], [0.55, 0.16, 0.50]],
+  aurora:  [[0.050, 0.190, 0.240], [0.10, 0.80, 0.66], [0.62, 1.00, 0.72], [0.16, 0.30, 0.90]],
+  orchid:  [[0.170, 0.105, 0.370], [0.74, 0.30, 0.98], [1.00, 0.66, 0.90], [0.14, 0.44, 0.95]],
+};
+const PALSETS = [['classic', 'orchid', 'aurora'], ['ember', 'ember', 'ember'], ['aurora', 'aurora', 'aurora'], ['orchid', 'orchid', 'orchid']];
+const palU = new Float32Array(36);
+let palReady = false;
+function stepPalette(dt) {
+  const set = PALSETS[P.palette] || PALSETS[0], k = palReady ? Math.min(1, dt * 1.6) : 1;
+  let i = 0;
+  for (const name of set) for (const c of PAL[name]) for (const v of c) { palU[i] += (v - palU[i]) * k; i++; }
+  palReady = true;
+}
+
+/* ======================================================================
+   Sky decor from the seed: the band of the galaxy and three distant galaxies
+   ====================================================================== */
+const bandU = new Float32Array(4), galU = new Float32Array(12), offU = new Float32Array(2), palDirU = new Float32Array(3);
+function placeSky() {
+  const h = k => hash2(3, 7, 500 + k);
+  offU.set([h(51), h(52)]);
+  const pa = h(53) * 6.283;
+  palDirU.set([Math.cos(pa) * 0.85, Math.sin(pa) * 0.85, h(54)]);
+  // the band runs across the screen at a gentle slant, through a point near the middle
+  bandU.set([W * (0.3 + 0.4 * h(1)), H * (0.25 + 0.5 * h(2)), (h(3) - 0.5) * 1.1 + Math.PI / 2, 110 + 90 * h(4)]);
+  galU.fill(0);
+  for (let i = 0; i < 3; i++) galU.set([W * (i + 0.15 + 0.7 * h(10 + i)) / 3, H * (0.1 + 0.8 * h(20 + i)), 20 + 26 * h(30 + i), h(40 + i) * 6.283], i * 4);
+}
+
+/* ======================================================================
+   Planets: parked in the emptiest part of the screen; they fade out and move when icons arrive
+   ====================================================================== */
+const plU = new Float32Array(8), plSU = new Float32Array(8);
+let planets = [];
+const wantPlanets = () => P.life < 0.3 ? 0 : P.life < 1.5 ? 1 : 2;
+function initPlanets() {
+  planets = [0, 1].map(i => {
+    const h = k => hash2(11 + i, 5, 700 + k), giant = i === 0;
+    return { R: giant ? 40 + 14 * h(1) : 22 + 9 * h(1), kind: (giant ? 0 : 1) + 0.02 + 0.96 * h(2), tilt: (h(3) - 0.5) * 0.9,
+             ring: giant && h(4) < 0.75 ? 2.0 + 0.35 * h(5) : 0, spin: h(6), x: 0, y: 0, a: 0, on: false, placed: false, next: null };
+  });
+}
+function planetSpot(pl, others) {
+  const ext = pl.R * (pl.ring ? pl.ring * 0.95 : 1);
+  let best = null, bs = -1e9;
+  for (let y = 34 + pl.R; y <= H - 96 - pl.R * 0.4; y += 24) for (let x = ext + 16; x <= W - ext - 16; x += 24) {
+    const s = tgtS(x, y);
+    let sc = Math.min(s, 330);
+    for (const o of others) { const d = Math.hypot(x - o.x, y - o.y); if (d < 460) sc -= (460 - d) * 0.9; }
+    sc += hash2(Math.round(x / 24), Math.round(y / 24), 900) * 50;   // not always dead centre of the gap
+    sc -= 90 * (1 - sstep(0, 150, Math.min(x - ext, W - ext - x, y - pl.R, H - 96 - pl.R - y)));   // nor hugging an edge
+    if (sc > bs) { bs = sc; best = { x, y, s }; }
+  }
+  return best;
+}
+// The target field (or the amount of life) changed: a planet keeps its place while that place stays empty.
+function syncPlanets() {
+  if (!iconsSeen || !FB) return;
+  const want = wantPlanets();
+  planets.forEach((pl, i) => {
+    pl.on = i < want;
+    if (!pl.on) return;
+    const need = pl.R + 50;
+    if (pl.placed && pl.next === null && tgtS(pl.x, pl.y) >= need) return;
+    const others = planets.filter((o, j) => j !== i && o.on && (o.placed || o.next)).map(o => o.next || o);
+    const spot = planetSpot(pl, others);
+    pl.next = spot && spot.s >= need ? spot : false;       // false: no room anywhere, stay hidden
+  });
+}
+function stepPlanets(dt, sp) {
+  plU.fill(0); plSU.fill(0);
+  planets.forEach((pl, i) => {
+    const moving = pl.next !== null;
+    pl.a = clamp01(pl.a + (pl.on && pl.placed && !moving ? dt : -dt) * 0.7);
+    if (moving && pl.a <= 0) {
+      if (pl.next) { pl.x = pl.next.x; pl.y = pl.next.y; pl.placed = true; } else pl.placed = false;
+      pl.next = null;
+    }
+    pl.spin = (pl.spin + dt * sp * 0.004) % 1;
+    if (pl.a > 0.004) { plU.set([pl.x, pl.y, pl.R, sstep(0, 1, pl.a)], i * 4); plSU.set([pl.kind, pl.tilt, pl.spin, pl.ring], i * 4); }
+  });
+}
+
+/* ======================================================================
+   Rockets: fly from nebula to nebula. Routes are planned on a coarse grid of the target field, so a rocket always
+   goes around the nebulae (and never over the icons inside them); the field on screen is only a safety net.
+   ====================================================================== */
+const shipU = new Float32Array(8), shipSU = new Float32Array(8);
+let ships = [], shipNext = [0, 0];
+const wantShips = () => P.life < 0.2 ? 0 : P.life < 1.6 ? 1 : 2;
+const SHIP_K = 1.45, SHIP_KEEP = 34, NAV = 24;             // size; distance kept from the cavity edge (px); nav cell (px)
+const NDX = [1, -1, 0, 0, 1, 1, -1, -1], NDY = [0, 0, 1, -1, 1, -1, 1, -1];
+const angDiff = (a, b) => { let d = (a - b) % (2 * Math.PI); if (d > Math.PI) d -= 2 * Math.PI; if (d < -Math.PI) d += 2 * Math.PI; return d; };
+let navW = 0, navH = 0, navFree = null, navDirty = true, navStamp = 0;
+const navX = c => (c % navW + 0.5) * NAV, navY = c => (((c / navW) | 0) + 0.5) * NAV;
+function buildNav() {
+  navW = Math.ceil(W / NAV); navH = Math.ceil(H / NAV);
+  navFree = new Uint8Array(navW * navH);
+  // free: well clear of every nebula's cavity, and not under the menu bar or the Dock
+  for (let c = 0; c < navFree.length; c++) {
+    const x = navX(c), y = navY(c);
+    navFree[c] = x > 30 && x < W - 30 && y > 40 && y < H - 90 && tgtS(x, y) > SHIP_KEEP + 8 ? 1 : 0;
+  }
+  navDirty = false;
+}
+function clearLine(ax, ay, bx, by) {
+  const n = Math.max(1, Math.ceil(Math.hypot(bx - ax, by - ay) / 8));
+  for (let i = 0; i <= n; i++) if (tgtS(ax + (bx - ax) * i / n, ay + (by - ay) * i / n) < SHIP_KEEP + 4) return false;
+  return true;
+}
+// A route from where the rocket is to a new stop: flood the free cells from its cell, pick a reachable stop (best
+// beside a nebula and a real journey away), walk back, then straighten the path wherever the way is clear.
+function planRoute(sh) {
+  if (navDirty) buildNav();
+  const N = navW * navH;
+  let start = Math.min(navH - 1, Math.max(0, Math.floor(sh.y / NAV))) * navW + Math.min(navW - 1, Math.max(0, Math.floor(sh.x / NAV)));
+  if (!navFree[start]) {
+    // not on a free cell (still entering the screen, or the scenery changed): make for the nearest one first
+    let bd = 1e18; start = -1;
+    for (let c = 0; c < N; c++) if (navFree[c]) { const d = (navX(c) - sh.x) ** 2 + (navY(c) - sh.y) ** 2; if (d < bd) { bd = d; start = c; } }
+    if (start < 0) return null;
+  }
+  const prev = new Int32Array(N).fill(-1), dist = new Float32Array(N), queue = new Int32Array(N);
+  let qh = 0, qt = 0;
+  queue[qt++] = start; prev[start] = start;
+  while (qh < qt) {
+    const c = queue[qh++], x = c % navW, y = (c / navW) | 0;
+    for (let k = 0; k < 8; k++) {
+      const nx = x + NDX[k], ny = y + NDY[k];
+      if (nx < 0 || ny < 0 || nx >= navW || ny >= navH) continue;
+      const n = ny * navW + nx;
+      if (!navFree[n] || prev[n] >= 0) continue;
+      if (k >= 4 && (!navFree[y * navW + nx] || !navFree[ny * navW + x])) continue;      // no cutting corners
+      prev[n] = c; dist[n] = dist[c] + (k >= 4 ? 1.414 : 1); queue[qt++] = n;
+    }
+  }
+  let best = start, bs = -1e9;
+  for (let q = 1; q < qt; q++) {
+    const c = queue[q], beside = tgtS(navX(c), navY(c)) < SHIP_KEEP + 46 ? 0.8 : 0;
+    const sc = Math.random() + beside + Math.min(dist[c] * NAV / 500, 1) * 1.3;
+    if (sc > bs) { bs = sc; best = c; }
+  }
+  const cells = [];
+  for (let c = best; c !== start; c = prev[c]) cells.push(c);
+  cells.push(start); cells.reverse();
+  const route = [{ x: navX(start), y: navY(start) }];
+  for (let i = 0; i < cells.length - 1;) {
+    let j = cells.length - 1;
+    while (j > i + 1 && !clearLine(navX(cells[i]), navY(cells[i]), navX(cells[j]), navY(cells[j]))) j--;
+    route.push({ x: navX(cells[j]), y: navY(cells[j]) });
+    i = j;
+  }
+  return route;
+}
+function spawnShip(i) {
+  if (navDirty) buildNav();
+  const sh = { x: 0, y: 0, a: 0, v: 26, al: 0, route: null, wp: 0, stamp: -1, hover: 0, thrust: 1, lost: false, ph: Math.random() * 10 };
+  // comes in over the left, right or top edge, where the way in is free; if no edge is free it simply appears
+  const gates = [];
+  for (let j = 0; j < navH; j++) {
+    if (navFree[j * navW + 1]) gates.push([-30, navY(j * navW), 0]);
+    if (navFree[j * navW + navW - 2]) gates.push([W + 30, navY(j * navW), Math.PI]);
+  }
+  for (let c = 0; c < navW; c++) if (navFree[2 * navW + c]) gates.push([navX(c), -30, Math.PI / 2]);
+  if (gates.length) [sh.x, sh.y, sh.a] = gates[(Math.random() * gates.length) | 0];
+  else {
+    const free = []; for (let c = 0; c < navFree.length; c++) if (navFree[c]) free.push(c);
+    if (!free.length) return null;
+    const c = free[(Math.random() * free.length) | 0]; sh.x = navX(c); sh.y = navY(c); sh.a = Math.random() * 6.283; sh.v = 0;
+  }
+  if (LIFETEST && !spawnShip.used) { spawnShip.used = true; sh.x = W * 0.54; sh.y = H * 0.44; sh.a = -0.5; sh.al = 1; }
+  return sh;
+}
+function stepShips(t, dt, sp) {
+  const want = wantShips(), dts = dt * sp;
+  shipU.fill(0); shipSU.fill(0);
+  for (let i = 0; i < 2; i++) {
+    let sh = ships[i];
+    if (!sh) {
+      if (i >= want || t < shipNext[i] || !FB) continue;
+      sh = ships[i] = spawnShip(i);
+      if (!sh) { shipNext[i] = t + 8; continue; }          // nowhere to fly right now: look again later
+    }
+    const s = curS(sh.x, sh.y);
+    const vis = i < want && s > 2 && !sh.lost;             // caught by a nebula that just formed: fade out, start over
+    sh.al = clamp01(sh.al + (vis ? dt : -dt) * 1.2);
+    if (!vis && sh.al <= 0) { ships[i] = null; shipNext[i] = t + 2 + Math.random() * 4; continue; }
+    if (dts > 0) {
+      if (sh.hover > 0) {
+        // parked beside the nebula for a moment: engine off, drifting to a stop
+        sh.hover -= dts; sh.thrust = Math.max(0, sh.thrust - dts * 2.5); sh.v = Math.max(0, sh.v - 26 * dts);
+        if (sh.hover <= 0) sh.route = null;
+      } else {
+        if (!sh.route || sh.stamp !== navStamp) {          // new journey, or the scenery changed under way
+          sh.route = planRoute(sh); sh.wp = 0; sh.stamp = navStamp;
+          if (!sh.route) sh.lost = true;
+        }
+        if (sh.route) {
+          const wp = sh.route[sh.wp], last = sh.wp === sh.route.length - 1;
+          const dx = wp.x - sh.x, dy = wp.y - sh.y, dist = Math.hypot(dx, dy) || 1;
+          sh.thrust = Math.min(1, sh.thrust + dts * 2);
+          const turn = 1.6 * dts, da = angDiff(Math.atan2(dy, dx), sh.a);
+          sh.a += Math.max(-turn, Math.min(turn, da));
+          // slower into the last stop, and while still turning hard towards the next point
+          const vt = 34 * (last ? 0.35 + 0.65 * sstep(0, 90, dist) : 1) * (1 - 0.55 * sstep(0.6, 2.2, Math.abs(da)));
+          sh.v += (vt - sh.v) * Math.min(1, dts * 1.5);
+          if (dist < (last ? 14 : 28)) { if (last) sh.hover = 2.5 + Math.random() * 3.5; else sh.wp++; }
+        }
+      }
+      sh.x += Math.cos(sh.a) * sh.v * dts; sh.y += Math.sin(sh.a) * sh.v * dts;
+      // safety net on the field that is on screen: pushed back out if it gets too close to a cavity
+      if (s < SHIP_KEEP - 8) {
+        let gx = curS(sh.x + 6, sh.y) - curS(sh.x - 6, sh.y), gy = curS(sh.x, sh.y + 6) - curS(sh.x, sh.y - 6);
+        const gn = Math.hypot(gx, gy) || 1, push = Math.min((SHIP_KEEP - 8 - s) * 0.2, 3);
+        sh.x += gx / gn * push; sh.y += gy / gn * push;
+      }
+    }
+    const fl = 0.5 + 0.25 * Math.sin(t * 23.1 + sh.ph) + 0.25 * Math.sin(t * 37.7 + sh.ph * 2);
+    shipU.set([sh.x, sh.y, sh.a, sstep(0, 1, sh.al)], i * 4);
+    shipSU.set([sh.thrust, SHIP_K, fl, 0], i * 4);
+  }
+}
+
+/* ======================================================================
+   Comet and shooting star
+   ====================================================================== */
+const cometU = new Float32Array(4), cometTU = new Float32Array(2), shootU = new Float32Array(4);
+let comet = null, cometNext = LIFETEST ? 0 : 20 + Math.random() * 50;
+let shoot = null, shootNext = LIFETEST ? 0.5 : 12 + Math.random() * 30, shootLen = 1;
+function stepSky(t, dt, sp) {
+  const rate = Math.max(P.life, 0.25);
+  // comet: crosses the whole screen slowly, mostly sideways
+  if (!comet && t > cometNext && P.life > 0.05 && sp > 0) {
+    const dir = Math.random() < 0.5 ? 1 : -1, len = 250 + Math.random() * 150;
+    comet = { x: dir > 0 ? -30 : W + 30, y: H * (0.12 + Math.random() * 0.7), ang: (dir > 0 ? 0 : Math.PI) + (Math.random() - 0.5) * 0.7,
+              v: 20 + Math.random() * 14, len, bend: Math.random() < 0.5 ? 1 : -1, age: 0, on: 1 };
+    if (LIFETEST) { comet.x = W * 0.34; comet.y = H * 0.88; comet.ang = -0.2; comet.age = 10; }
+  }
+  cometU.fill(0);
+  if (comet) {
+    const c = comet;
+    c.age += dt * sp;
+    c.x += Math.cos(c.ang) * c.v * sp * dt; c.y += Math.sin(c.ang) * c.v * sp * dt;
+    c.on = clamp01(c.on + (P.life > 0.05 ? dt : -dt) * 0.8);     // life turned off: fade away
+    cometU.set([c.x, c.y, c.ang, Math.min(1, c.age / 4) * c.on]);
+    cometTU.set([c.len, c.bend]);
+    const m = c.len + 60;
+    if (c.on <= 0 || c.x < -m || c.x > W + m || c.y < -m || c.y > H + m) { comet = null; cometNext = t + (45 + Math.random() * 90) / rate; }
+  }
+  // shooting star: quick and rare
+  shootU.fill(0);
+  if (!shoot && t > shootNext && P.life > 0.05 && sp > 0) {
+    const ang = (Math.random() < 0.5 ? 0.45 : Math.PI - 0.45) + (Math.random() - 0.5) * 0.4;
+    shoot = { x: W * (0.12 + Math.random() * 0.76), y: H * (0.05 + Math.random() * 0.45), ang, u: 0, dur: 0.8 + Math.random() * 0.4, len: 150 + Math.random() * 90 };
+    if (LIFETEST) { shoot.x = W * 0.62; shoot.y = H * 0.06; shoot.ang = 0.5; shoot.dur = 1e9; shoot.u = 0.45; }
+  }
+  if (shoot) {
+    const s = shoot;
+    if (s.dur < 1e8) s.u += dt * sp / s.dur;
+    const dist = s.u * 440;
+    shootU.set([s.x + Math.cos(s.ang) * dist, s.y + Math.sin(s.ang) * dist, s.ang, Math.sin(Math.min(s.u, 1) * Math.PI)]);
+    shootLen = s.len * Math.min(1, s.u * 2.5);
+    if (s.u >= 1 || P.life <= 0.05) { shoot = null; shootNext = t + (18 + Math.random() * 45) / rate; }
+  }
+}
+function stepLife(t, dt, sp) {
+  stepPalette(dt);
+  stepSky(t, dt, sp);
+  stepPlanets(dt, sp);
+  stepShips(t, dt, sp);
+}
+
+/* ======================================================================
+   Frame loop
+   ====================================================================== */
+function resize() {
+  W = innerWidth; H = innerHeight;
+  const scale = PREVIEW ? 0.45 : Math.min(devicePixelRatio || 1, P.quality);
+  const box = cv.getBoundingClientRect();
+  cv.width = Math.round((box.width || W) * scale); cv.height = Math.round((box.height || H) * scale); cv._scale = scale;
+  Gw = Math.ceil(W / STEP) + 2; Gh = Math.ceil(H / STEP) + 2;
+  buildNoise();
+  allocField();
+  placeSky();
+  initPlanets();
+  ships = []; shipNext = [0, 0]; comet = null; shoot = null;
+}
+
+let lastT = 0, fpsEMA = 0, frameN = 0, frameMs = 0, lifeT = 0, animT = 0;
+let paused = false;
+function frame(now) {
+  requestAnimationFrame(frame);
+  if (paused) { lastT = 0; return; }
+  if (P.cap30 && now - lastT < 31) return;
+  const dt = lastT ? Math.min((now - lastT) / 1000, 0.1) : 0.03;
+  if (lastT) fpsEMA = fpsEMA ? fpsEMA * 0.9 + (1 / dt) * 0.1 : 1 / dt;
+  lastT = now;
+  lifeT += dt;
+  animT += dt * P.speed;
+  const e = Math.min(Math.max((now - morphT0) / morphDur, 0), 1);
+  curMix = e < 0.5 ? 2 * e * e : 1 - Math.pow(-2 * e + 2, 2) / 2;
+  stepLife(lifeT, dt, P.speed);
+  draw(now);
+  frameN++;
+}
+const wrap1 = v => v - Math.floor(v);
+function draw(now) {
+  const t0 = performance.now();
+  const e = Math.min(Math.max((now - morphT0) / morphDur, 0), 1);
+  curMix = e < 0.5 ? 2 * e * e : 1 - Math.pow(-2 * e + 2, 2) / 2;
+  if (!palReady) stepPalette(1);
+  const { p, U } = PR;
+  gl.useProgram(p);
+  gl.viewport(0, 0, cv.width, cv.height);
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, noiseTex);
+  gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, ftex[fromI]);
+  gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D, ftex[toI]);
+  gl.uniform1i(U.uNoise, 0); gl.uniform1i(U.uFA, 1); gl.uniform1i(U.uFB, 2);
+  gl.uniform2f(U.uRes, cv.width / cv._scale, cv.height / cv._scale);
+  gl.uniform2f(U.uGrid, Gw, Gh);
+  gl.uniform1f(U.uScale, cv._scale);
+  gl.uniform1f(U.uL0, Math.log2(256 / cv._scale));
+  gl.uniform1f(U.uStep, STEP);
+  gl.uniform1f(U.uMix, curMix);
+  gl.uniform1f(U.uTime, animT % 3600);
+  gl.uniform1f(U.uSig, P.sigma);
+  gl.uniform1f(U.uReach, reachOf());
+  gl.uniform1f(U.uGlow, P.glow);
+  gl.uniform1f(U.uStars, P.stars);
+  gl.uniform2fv(U.uOff, offU);
+  // gas drift: phases in tile units, wrapped here so the picture stays seamless however long it runs
+  gl.uniform2f(U.uD1, wrap1(animT * 0.0021), wrap1(animT * 0.0008));
+  gl.uniform2f(U.uD2, wrap1(-animT * 0.0016), wrap1(animT * 0.0031));
+  gl.uniform2f(U.uD3, wrap1(animT * 0.0011), wrap1(-animT * 0.0017));
+  gl.uniform3fv(U.uPal, palU); gl.uniform3fv(U.uPalDir, palDirU);
+  gl.uniform4fv(U.uBand, bandU);
+  gl.uniform4fv(U.uGal, galU);
+  gl.uniform4fv(U.uPl, plU); gl.uniform4fv(U.uPlS, plSU);
+  gl.uniform4fv(U.uComet, cometU); gl.uniform2fv(U.uCometT, cometTU);
+  gl.uniform4fv(U.uShoot, shootU); gl.uniform1f(U.uShootL, shootLen);
+  gl.uniform4fv(U.uShip, shipU); gl.uniform4fv(U.uShipS, shipSU);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+  frameMs = performance.now() - t0;
+}
+
+/* ======================================================================
+   Settings / hosted mode
+   ====================================================================== */
+let iconsSeen = !(WALL || PREVIEW);
+function reseed(v) {
+  seed = v; buildNoise(); placeSky(); initPlanets();
+  if (!iconsSeen) { refresh(); return; }
+  commit(true);
+}
+function applySettings(v) {
+  if (typeof v.seed === 'number' && v.seed !== seed) reseed(v.seed);
+  let field = false, life = false;
+  for (const k in v) {
+    if (!KEYS[k] || typeof v[k] !== 'number' || !isFinite(v[k]) || P[k] === v[k]) continue;
+    const [lo, hi] = KEYS[k];
+    let x = Math.min(Math.max(v[k], lo), hi);
+    if (k === 'palette') x = Math.round(x);
+    P[k] = x;
+    if (k === 'sigma') field = true;
+    if (k === 'life') life = true;
+  }
+  if (field && FB) commit();                      // nebula size: smooth transition too
+  else if (life) syncPlanets();
+}
+function drawGhosts() {
+  const box = document.getElementById('ghosts');
+  if (box) box.innerHTML = icons.map(ic => `<div class="ghost" style="left:${ic.x}px;top:${ic.y}px;width:${ic.w}px;height:${ic.h}px"><i></i><b></b></div>`).join('');
+}
+function startHostedMode() {
+  if (PREVIEW) {
+    document.body.classList.add('preview');
+    const g = document.createElement('div'); g.id = 'ghosts'; document.body.appendChild(g);
+  }
+  icons = [];
+  refresh();                                     // open space until we know where the icons are
+  let first = true;
+  const handle = m => {
+    if (!m || typeof m !== 'object') return;
+    if (m.t === 'pause') { paused = PREVIEW ? false : !!m.v; return; }
+    if (m.t === 'settings') { applySettings(m.v || {}); return; }
+    if (m.t === 'reset') { applySettings(Object.assign({}, DEFAULTS, m.v || {})); return; }
+    if (m.t !== 'icons') return;
+    const k = window.devicePixelRatio || 1;       // physical -> CSS pixels
+    icons = m.vis && Array.isArray(m.r) ? m.r.map(([l, t, r, b]) => ({ x: l / k, y: t / k, w: (r - l) / k, h: (b - t) / k })) : [];
+    if (PREVIEW) drawGhosts();
+    iconsSeen = true;
+    commit(first);                                // first time: the nebulae grow in; later: smooth transition
+    first = false;
+  };
+  if (PREVIEW) {
+    addEventListener('message', ev => { if (ev.source === parent) { try { handle(typeof ev.data === 'string' ? JSON.parse(ev.data) : ev.data); } catch (e) {} } });
+    parent.postMessage(JSON.stringify({ t: 'ready' }), '*');
+    return;
+  }
+  const host = window.chrome && window.chrome.webview;
+  if (!host) return;
+  host.addEventListener('message', ev => { try { handle(JSON.parse(ev.data)); } catch (e) { console.error(e); } });
+  host.postMessage('ready');
+}
+function startDemo() {
+  // plain browser: a column of icons on the right and a few scattered ones
+  const list = [];
+  for (let r = 0; r < 6; r++) list.push({ x: W - 90, y: 10 + r * 100, w: 76, h: 92 });
+  list.push({ x: W * 0.22, y: H * 0.3, w: 76, h: 92 }, { x: W * 0.45, y: H * 0.62, w: 76, h: 92 }, { x: W * 0.52, y: H * 0.18, w: 76, h: 92 });
+  icons = list;
+  commit(true);
+  // ?demo inside the app's snapshot tool: say "ready" so it takes the picture (its replies are ignored here)
+  const host = window.chrome && window.chrome.webview;
+  if (host && QS.has('demo')) host.postMessage('ready');
+}
+
+let resizeT = 0;
+addEventListener('resize', () => {
+  clearTimeout(resizeT);
+  resizeT = setTimeout(() => { resize(); refresh(); }, 100);
+});
+
+window.__dbg = { P, stats: () => ({ fieldMs, frameMs, fps: fpsEMA, planets, ships, comet }) };
+resize();
+buildNoiseTex();
+if (WALL || PREVIEW) startHostedMode();
+else startDemo();
+requestAnimationFrame(frame);
+</script>
+<script src="share.js"></script>
+</body>
+</html>

@@ -1,0 +1,1580 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Iconland · Cyberpunk</title>
+<!--
+  Iconland · Cyberpunk theme (a rain-soaked neon megacity at night, seen from above; pure WebGL2, one full-screen pass)
+  - Disaster field (CPU, only when icons change): chamfered boxes around the icons -> signed distance s (<0 = inside
+    the zone). Inside, under the icons, the shader draws a dark burnt-out lot; there is no outline: the edge of the zone
+    is read from the fires, the scorch and the smoke.
+  - City: a jittered street grid, every block split into one to four buildings. The layout comes from one integer hash
+    that is evaluated the same way here (JS) and in the shader (GLSL), so both sides agree on every building.
+    Buildings are drawn in an oblique view: the roof is shifted up by the height, the south wall shows lit windows.
+  - Per building the CPU keeps three values in a tiny texture: presence (buildings on the zone have collapsed),
+    fire (buildings at the rim burn, flare up and die down) and scar (burnt buildings stay black for a while and are
+    repaired slowly after the icons have moved away).
+  - Responders (CPU agents, drawn from a few uniforms): fire engines, police cars and ambulances drive in along the
+    streets from the screen edges, stop at the rim and spray water; firefighting drones hover there and drop water.
+    Where water lands the fire dies down to a smoulder, then it flares up elsewhere, so the scene never "finishes".
+  - Life: car lights flowing along the streets (procedural), trains, flying cars, layered rain with ripples, rare
+    soft lightning and a rare short glitch.
+  Debug flags: ?nocap (no 30 fps cap), ?lifetest (flying cars start inside the view, responders are already on site
+  and spraying), ?glitchtest, ?flashtest.
+-->
+<style>
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #05060b; }
+  #art { position: fixed; inset: 0; width: 100vw; height: 100vh; display: block; }
+  /* preview mode (?preview=1, settings window): translucent boxes show where the real icons are */
+  #ghosts { position: fixed; inset: 0; pointer-events: none; display: none; }
+  body.preview #ghosts { display: block; }
+  .ghost { position: absolute; }
+  .ghost i { position: absolute; left: 50%; top: 4px; width: 48px; height: 48px; margin-left: -24px; border-radius: 9px;
+    background: rgba(255,255,255,.55); box-shadow: 0 1px 3px rgba(0,0,0,.25); }
+  .ghost b { position: absolute; left: 14%; right: 14%; top: 60px; height: 10px; border-radius: 5px; background: rgba(255,255,255,.75); }
+  #nogl { position: fixed; inset: 0; display: none; place-items: center; color: #fff; font: 16px system-ui, sans-serif; }
+</style>
+</head>
+<body>
+<canvas id="art"></canvas>
+<div id="nogl">WebGL2 is not available.</div>
+<script>
+'use strict';
+
+/* ======================================================================
+   Parameters
+   ====================================================================== */
+const CELL_W = 76, CELL_H = 100, GRID_X0 = 4, GRID_Y0 = 6, TASKBAR = 0;
+const STEP = 5;
+const MORPH_MS = 1800;
+const S_FAR = 60;                        // field clamp away from the plazas: low, so that during a transition the
+                                         // old plaza closes about when the new one opens (the field is blended linearly)
+const CHAMFER = 0.88;                    // 0 = round plaza corners, 1 = cut at 45 degrees
+
+const QS = new URLSearchParams(location.search);
+const WALL = QS.has('wallpaper');        // real desktop: messages from the host
+const PREVIEW = QS.has('preview');       // settings window preview (iframe): messages from the parent page
+const LIFETEST = QS.has('lifetest');     // debug: flying cars start inside the view
+const GLITCHTEST = QS.has('glitchtest'); // debug: hold a glitch so a snapshot shows it
+const FLASHTEST = QS.has('flashtest');   // debug: hold a lightning flash
+// Defaults must match themes.json
+const P = {
+  sigma: 72,        // size of the disaster zone around the icons (px)
+  palette: 0,       // 0 neon (cyan / magenta), 1 acid (green / yellow), 2 sunset (orange / pink / violet)
+  traffic: 1,       // street traffic and flying cars
+  units: 1,         // how many emergency units respond
+  rain: 0.6,        // rain streaks and ripples
+  glitch: 0.25,     // how often and how strong the picture glitches
+  speed: 1,         // animation speed
+  quality: 2, cap30: true,
+};
+if (QS.has('nocap')) P.cap30 = false;    // debug: report the real frame rate
+const DEFAULTS = Object.assign({}, P);
+const KEYS = { sigma: [40, 200], palette: [0, 2], traffic: [0, 2], units: [0, 2], rain: [0, 1], glitch: [0, 1], speed: [0, 3] };
+
+// City layout constants (shared with the shader)
+const GX = 144, GY = 142;                // nominal block pitch (px)
+const HMAX = 60;                         // tallest building (px of oblique shift)
+const ALLEY = 2.5;                       // half width of the gap between two buildings of one block
+const RETRACT = -18;                     // buildings that reach this far into the zone have collapsed (px)
+const BURN = 38;                         // buildings closer than this to the zone are on fire (px)
+
+/* ======================================================================
+   Random / noise helpers (CPU)
+   ====================================================================== */
+let seed = (Math.random() * 1e6) | 0;
+function hash2(x, y, k = 0) {
+  let h = Math.imul(x | 0, 374761393) ^ Math.imul(y | 0, 668265263) ^ Math.imul(seed + k, 2246822519);
+  h = Math.imul(h ^ (h >>> 13), 1274126177);
+  return ((h ^ (h >>> 16)) >>> 0) / 4294967296;
+}
+function vnoise(x, y, k = 0) {
+  const ix = Math.floor(x), iy = Math.floor(y), fx = x - ix, fy = y - iy;
+  const ux = fx * fx * (3 - 2 * fx), uy = fy * fy * (3 - 2 * fy);
+  const a = hash2(ix, iy, k), b = hash2(ix + 1, iy, k), c = hash2(ix, iy + 1, k), d = hash2(ix + 1, iy + 1, k);
+  return a + (b - a) * ux + (c - a) * uy + (a - b - c + d) * ux * uy;
+}
+function fbm(x, y, k = 0) {
+  let a = 0.5, s = 0;
+  for (let i = 0; i < 4; i++) { s += a * vnoise(x, y, k + i * 7); x = x * 2.03 + 17.1; y = y * 2.03 + 17.1; a *= 0.5; }
+  return s;
+}
+// Tileable noise texture (fixed): 4 channels of fbm at different scales
+function tileNoise(x, y, px, py, k) {
+  const ix = Math.floor(x), iy = Math.floor(y), fx = x - ix, fy = y - iy;
+  const ux = fx * fx * (3 - 2 * fx), uy = fy * fy * (3 - 2 * fy);
+  const m = (v, p) => ((v % p) + p) % p;
+  const x0 = m(ix, px), x1 = m(ix + 1, px), y0 = m(iy, py), y1 = m(iy + 1, py);
+  const h = (a, b) => { let v = Math.imul(a, 374761393) ^ Math.imul(b, 668265263) ^ Math.imul(k, 2246822519); v = Math.imul(v ^ (v >>> 13), 1274126177); return ((v ^ (v >>> 16)) >>> 0) / 4294967296; };
+  const a = h(x0, y0), b = h(x1, y0), c = h(x0, y1), d = h(x1, y1);
+  return a + (b - a) * ux + (c - a) * uy + (a - b - c + d) * ux * uy;
+}
+function makeNoiseImage() {
+  const S = 256, d = new Uint8Array(S * S * 4);
+  const chans = [[4, 8, 16, 32], [8, 16, 32, 64], [2, 4, 8, 16], [16, 32, 64, 128]];
+  for (let y = 0; y < S; y++) for (let x = 0; x < S; x++) {
+    const u = x / S, v = y / S, i = (y * S + x) * 4;
+    for (let c = 0; c < 4; c++) {
+      let s = 0, w = 0.5, tw = 0;
+      for (let j = 0; j < chans[c].length; j++) { const p = chans[c][j]; s += w * tileNoise(u * p, v * p, p, p, 100 + c * 50 + j * 13); tw += w; w *= 0.5; }
+      d[i + c] = Math.min(Math.max((s / tw - 0.5) * 1.9 + 0.5, 0), 1) * 255;
+    }
+  }
+  return { S, d };
+}
+const sstep = (a, b, x) => { const t = Math.min(Math.max((x - a) / (b - a), 0), 1); return t * t * (3 - 2 * t); };
+const lerp = (a, b, t) => a + (b - a) * t;
+
+/* ======================================================================
+   Plaza field (CPU): s = signed distance to the plaza edge (<0 inside)
+   ====================================================================== */
+let W = innerWidth, H = innerHeight, Gw = 1, Gh = 1;
+function buildNoise() {}                 // the plaza outline is geometric: nothing to precompute (kept for the common page layout)
+let fieldMs = 0;
+function computeField(rects) {
+  const t0 = performance.now();
+  const N = Gw * Gh, s = new Float32Array(N).fill(S_FAR);
+  const D0 = 0.68 * P.sigma, REACH = S_FAR + 8;   // the plaza edge lies D0 outside the icon boxes
+  for (const r of rects) {
+    const gx0 = Math.max(0, Math.floor((r.cx - r.hw - D0 - REACH) / STEP)), gx1 = Math.min(Gw - 1, Math.ceil((r.cx + r.hw + D0 + REACH) / STEP));
+    const gy0 = Math.max(0, Math.floor((r.cy - r.hh - D0 - REACH) / STEP)), gy1 = Math.min(Gh - 1, Math.ceil((r.cy + r.hh + D0 + REACH) / STEP));
+    for (let gy = gy0; gy <= gy1; gy++) for (let gx = gx0; gx <= gx1; gx++) {
+      const i = gy * Gw + gx;
+      let dx = Math.abs(gx * STEP - r.cx) - r.hw, dy = Math.abs(gy * STEP - r.cy) - r.hh;
+      if (dx < 0) dx = 0; if (dy < 0) dy = 0;
+      // a box with cut corners: mix of the round and the octagonal distance. The octagonal one is flat next to
+      // the box, so icons that sit in a row or a column get one straight edge without dents between them.
+      const dr = Math.sqrt(dx * dx + dy * dy), dc = Math.max(dx, dy, (dx + dy) * 0.70710678);
+      const d = Math.min(S_FAR, dr + (dc - dr) * CHAMFER - D0);
+      if (d < s[i]) s[i] = d;
+    }
+  }
+  fieldMs = performance.now() - t0;
+  return { s };
+}
+function sampleArr(a, x, y) {
+  const fx = Math.min(Math.max(x / STEP, 0), Gw - 1.001), fy = Math.min(Math.max(y / STEP, 0), Gh - 1.001);
+  const ix = Math.floor(fx), iy = Math.floor(fy), tx = fx - ix, ty = fy - iy, i = iy * Gw + ix;
+  return (a[i] * (1 - tx) + a[i + 1] * tx) * (1 - ty) + (a[i + Gw] * (1 - tx) + a[i + Gw + 1] * tx) * ty;
+}
+
+/* ======================================================================
+   City layout (CPU side; the shader has the same functions)
+   One integer hash decides everything, so JS and GLSL always agree on which building is where.
+   ====================================================================== */
+function ih(a, b, k) {
+  let h = Math.imul(a | 0, 374761393) ^ Math.imul(b | 0, 668265263) ^ Math.imul(((seed | 0) + k) | 0, 2246822519);
+  h = Math.imul(h ^ (h >>> 13), 1274126177);
+  return (h ^ (h >>> 16)) >>> 0;
+}
+// the street between column c-1 and c: [west edge of block c, east edge of block c-1]
+function edgeX(c) {
+  const h = ih(c, 11, 1);
+  const ctr = (c + ((h & 4095) / 4096 - 0.5) * 0.36) * GX;
+  const half = ((h >>> 12) % 4 === 0) ? 14 : 7 + 3 * ((h >>> 16) & 255) / 255;
+  return [ctr + half, ctr - half];
+}
+// the street between row r-1 and r: [north edge of block r, south edge of block r-1]
+function edgeY(r) {
+  const h = ih(r, 23, 2);
+  const ctr = (r + ((h & 4095) / 4096 - 0.5) * 0.36) * GY;
+  const half = ((h >>> 12) % 3 === 0) ? 22 : 13 + 4 * ((h >>> 16) & 255) / 255;
+  return [ctr + half, ctr - half];
+}
+function bldHash(hb, idx) {
+  let h = Math.imul(hb ^ Math.imul(idx + 1, 0x9E3779B9), 0x85EBCA6B);
+  h ^= h >>> 15;
+  return h >>> 0;
+}
+const bldHeight = h => 14 + (h >>> 3) % 20 + ((h >>> 9) % 5 === 0 ? 24 : 0);
+// the buildings of block (c, r): [{ idx, x0, y0, x1, y1, hgt }]
+function blockBuildings(c, r) {
+  const x0 = edgeX(c)[0], x1 = edgeX(c + 1)[1], y0 = edgeY(r)[0], y1 = edgeY(r + 1)[1];
+  const w = x1 - x0, h = y1 - y0, hb = ih(c, r, 31), pat = hb % 100;
+  const sx = ((pat >= 14 && pat < 36) || pat >= 52) && w >= 80;
+  const yL = pat >= 36 && h >= 78, yR = pat >= 78 && h >= 78;
+  const X = x0 + w * (0.36 + 0.28 * ((hb >>> 8) & 255) / 255);
+  const YL = y0 + h * (0.42 + 0.16 * ((hb >>> 16) & 255) / 255), YR = y0 + h * (0.42 + 0.16 * ((hb >>> 24) & 255) / 255);
+  const out = [];
+  const halves = sx ? [[x0, X - ALLEY, 0], [X + ALLEY, x1, 1]] : [[x0, x1, 0]];
+  for (const [a, b, right] of halves) {
+    const split = right ? yR : yL, Y = right ? YR : YL;
+    if (split) out.push({ idx: right, x0: a, y0, x1: b, y1: Y - ALLEY }, { idx: right + 2, x0: a, y0: Y + ALLEY, x1: b, y1 });
+    else out.push({ idx: right, x0: a, y0, x1: b, y1 });
+  }
+  for (const b of out) b.hgt = bldHeight(bldHash(hb, b.idx));
+  return out;
+}
+
+/* ======================================================================
+   Shaders
+   ====================================================================== */
+const VS = `#version 300 es
+void main() {
+  vec2 p = vec2(float((gl_VertexID << 1) & 2), float(gl_VertexID & 2));
+  gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);
+}`;
+
+const FS = `#version 300 es
+precision highp float;
+precision highp int;
+uniform sampler2D uNoise, uFA, uFB;
+uniform lowp sampler2D uPres;      // one texel per block: presence (0..1) of its up to four buildings
+uniform vec2 uRes, uGrid;
+uniform ivec2 uPOff, uPMax;
+uniform float uScale, uSeed, uStep, uMix, uTime, uRainT, uTraffic, uRain, uFlash;
+uniform uint uSeedU;
+uniform vec3 uA, uB, uC, uHaze;    // palette: two neon colours, an accent, the colour of the night haze
+uniform vec4 uGl;                  // glitch: amount (0 = none), frame id, shift (px), colour split (px)
+uniform vec4 uCar[5];              // flying cars: x, y, heading, visibility (0 = none)
+uniform vec4 uTrail[5];            // two earlier positions of each car: x1, y1, x2, y2
+uniform vec4 uHolo[6];             // holograms above some towers: x, y, radius, visibility
+uniform vec4 uFire[12];            // fires: x, y of the burning roof, half width + seed (fraction), strength (0 = none)
+uniform vec4 uUnit[8];             // emergency units: x, y, heading, kind + visibility (kind 0 engine, 1 police, 2 ambulance, 3 drone; < 0 none)
+uniform vec4 uJet[8];              // their water jets: target x, y, strength (0 = none), unused
+out vec4 o;
+
+const float GX = ${GX.toFixed(1)}, GY = ${GY.toFixed(1)}, HMAX = ${HMAX.toFixed(1)}, ALLEY = ${ALLEY.toFixed(1)};
+
+float hash2(vec2 p) {
+  vec3 p3 = fract(vec3(p.xyx) * 0.1031);
+  p3 += dot(p3, p3.yzx + 33.33);
+  return fract((p3.x + p3.y) * p3.z);
+}
+float ss(float a, float b, float x) { float t = clamp((x - a) / (b - a), 0.0, 1.0); return t * t * (3.0 - 2.0 * t); }
+vec4 N(vec2 p, float scale) { return texture(uNoise, p / scale + uSeed * 0.013); }
+float fieldS(vec2 p) {
+  vec2 uv = (p / uStep + 0.5) / uGrid;
+  return mix(texture(uFA, uv).r, texture(uFB, uv).r, uMix);
+}
+float segD(vec2 p, vec2 a, vec2 b, out float h) {
+  vec2 pa = p - a, ba = b - a;
+  h = clamp(dot(pa, ba) / max(dot(ba, ba), 1e-4), 0.0, 1.0);
+  return length(pa - ba * h);
+}
+float uf(uint h, uint sh) { return float((h >> sh) & 255u) * (1.0 / 255.0); }
+vec3 pal3(float r) { return r < 0.4 ? uA : r < 0.75 ? uB : uC; }
+
+// ---------------------------------------------------------------- city layout (same integer hash as the JS side)
+uint ih(int a, int b, int k) {
+  uint h = (uint(a) * 374761393u) ^ (uint(b) * 668265263u) ^ ((uSeedU + uint(k)) * 2246822519u);
+  h = (h ^ (h >> 13)) * 1274126177u;
+  return h ^ (h >> 16);
+}
+// the street between column c-1 and c: (west edge of block c, east edge of block c-1)
+vec2 edgeX(int c) {
+  uint h = ih(c, 11, 1);
+  float ctr = (float(c) + (float(h & 4095u) / 4096.0 - 0.5) * 0.36) * GX;
+  float hw = ((h >> 12) % 4u == 0u) ? 14.0 : 7.0 + 3.0 * float((h >> 16) & 255u) / 255.0;
+  return vec2(ctr + hw, ctr - hw);
+}
+vec2 edgeY(int r) {
+  uint h = ih(r, 23, 2);
+  float ctr = (float(r) + (float(h & 4095u) / 4096.0 - 0.5) * 0.36) * GY;
+  float hw = ((h >> 12) % 3u == 0u) ? 22.0 : 13.0 + 4.0 * float((h >> 16) & 255u) / 255.0;
+  return vec2(ctr + hw, ctr - hw);
+}
+// column of x: index, block from x0 to x1, the next block starts at nx (the street is in between)
+void colAt(float x, out int c, out float x0, out float x1, out float nx) {
+  c = int(floor(x / GX));
+  vec2 e0 = edgeX(c), e1 = edgeX(c + 1);
+  if (x < e0.x) { e1 = e0; c -= 1; e0 = edgeX(c); }
+  else if (x >= e1.x) { e0 = e1; c += 1; e1 = edgeX(c + 1); }
+  x0 = e0.x; x1 = e1.y; nx = e1.x;
+}
+void rowAt(float y, out int r, out float y0, out float y1, out float ny) {
+  r = int(floor(y / GY));
+  vec2 e0 = edgeY(r), e1 = edgeY(r + 1);
+  if (y < e0.x) { e1 = e0; r -= 1; e0 = edgeY(r); }
+  else if (y >= e1.x) { e0 = e1; r += 1; e1 = edgeY(r + 1); }
+  y0 = e0.x; y1 = e1.y; ny = e1.x;
+}
+struct Blk { vec4 r; uint h; vec4 pres; vec4 fire; vec4 scar; };  // block rectangle, hash; presence, fire and scar of its buildings
+struct Bld { vec4 r; uint h; float full; float hgt; float a; float f; float sc; };  // footprint, hash, full and current height, presence, fire, scar
+Blk mkBlk(vec4 r, int c, int rr) {
+  ivec2 t = clamp(ivec2(c, rr) + uPOff, ivec2(0), uPMax);
+  t.x *= 3;
+  return Blk(r, ih(c, rr, 31), texelFetch(uPres, t, 0), texelFetch(uPres, t + ivec2(1, 0), 0), texelFetch(uPres, t + ivec2(2, 0), 0));
+}
+// the building of block k that stands on q: 0 = none (street, alley), 1 = a building, 2 = a building that is folded away
+int bldIn(Blk k, vec2 q, out Bld b) {
+  if (q.x < k.r.x || q.x > k.r.z || q.y < k.r.y || q.y > k.r.w) return 0;
+  uint pat = k.h % 100u;
+  vec2 sz = k.r.zw - k.r.xy;
+  bool sx = ((pat >= 14u && pat < 36u) || pat >= 52u) && sz.x >= 80.0;
+  bool yL = pat >= 36u && sz.y >= 78.0, yR = pat >= 78u && sz.y >= 78.0;
+  vec4 r = k.r;
+  int idx = 0;
+  bool right = false;
+  if (sx) {
+    float X = k.r.x + sz.x * (0.36 + 0.28 * float((k.h >> 8) & 255u) / 255.0);
+    if (q.x >= X) { r.x = X + ALLEY; idx = 1; right = true; } else r.z = X - ALLEY;
+  }
+  if (right ? yR : yL) {
+    float f = float(((right ? (k.h >> 24) : (k.h >> 16))) & 255u) / 255.0;
+    float Y = k.r.y + sz.y * (0.42 + 0.16 * f);
+    if (q.y >= Y) { r.y = Y + ALLEY; idx += 2; } else r.w = Y - ALLEY;
+  }
+  if (q.x < r.x || q.x > r.z || q.y < r.y || q.y > r.w) return 0;
+  uint h = (k.h ^ (uint(idx + 1) * 0x9E3779B9u)) * 0x85EBCA6Bu;
+  h ^= h >> 15;
+  float full = 14.0 + float((h >> 3) % 20u) + (((h >> 9) % 5u == 0u) ? 24.0 : 0.0);
+  float a = k.pres[idx];
+  b = Bld(r, h, full, full * a * a * (3.0 - 2.0 * a), a, k.fire[idx], k.scar[idx]);
+  return a < 0.02 ? 2 : 1;
+}
+
+// ---------------------------------------------------------------- small pieces
+// rows of blocky pseudo-letters (uv in px): 1 on a stroke
+float glyphs(vec2 uv, vec2 cell, float sd) {
+  vec2 g = floor(uv / cell), f = fract(uv / cell);
+  if (hash2(g * 1.7 + sd) < 0.16) return 0.0;                       // a space
+  vec2 q = (f - vec2(0.14, 0.12)) / vec2(0.72, 0.76);
+  if (q.x < 0.0 || q.y < 0.0 || q.x >= 1.0 || q.y >= 1.0) return 0.0;
+  vec2 sub = floor(q * vec2(3.0, 4.0));
+  return step(0.42, hash2(g * 7.3 + sub * 1.31 + sd));
+}
+// most signs are steady; one in six buzzes now and then
+float flick(uint h) {
+  if ((h >> 27) % 6u != 0u) return 1.0;
+  float burst = step(0.88, hash2(vec2(floor(uTime * 0.4), float(h & 1023u))));
+  float r = hash2(vec2(floor(uTime * 8.0), float((h >> 10) & 1023u)));
+  return 1.0 - 0.4 * burst * step(0.5, r);
+}
+// shop fronts along the foot of a south wall: the light behind the glass and the neon sign above (many have none)
+void shop(float x, uint h, out vec3 glass, out vec3 sign) {
+  float sg = x / 17.0, r = hash2(vec2(floor(sg), float(h & 4095u)));
+  float e = ss(0.5, 0.40, abs(fract(sg) - 0.5)), r2 = fract(r * 29.0);
+  glass = r < 0.22 ? vec3(0.0) : mix(vec3(1.0, 0.74, 0.42), vec3(0.70, 0.90, 1.0), step(0.78, fract(r * 7.0))) * (0.20 + 0.45 * fract(r * 13.0)) * e;
+  sign = (r < 0.22 || r2 < 0.5) ? vec3(0.0) : (r2 < 0.70 ? uA : r2 < 0.88 ? uB : uC) * e;
+}
+// the city glows in different colours from district to district
+vec3 hazeAt(vec2 p) {
+  vec3 d = mix(uA, uB, ss(0.36, 0.64, N(p, 2600.0).g));
+  d = mix(d, uC, ss(0.58, 0.80, N(p + 700.0, 2100.0).r) * 0.6);
+  return mix(uHaze, d, 0.42);
+}
+// light of the plaza rim at distance s outside it: falls off with range r and is gone where the field is clamped
+float rimL(float s, float r) { s = max(s, 0.0); return exp(-s / r) * clamp((${(S_FAR - 6).toFixed(1)} - s) / 22.0, 0.0, 1.0); }
+
+// ---------------------------------------------------------------- what is left of a collapsed building: ruins
+// ash-grey ground, the stumps of the outer and inner walls, fallen beams, a few ember cracks. Dark, even and calm:
+// this is what lies under the icons.
+vec3 plate(vec2 q, vec4 r, vec3 nC, float s) {
+  vec2 e = min(q - r.xy, r.zw - q);
+  float ed = min(e.x, e.y), aa = 0.7 / uScale;
+  vec4 n = N(q, 260.0), n2 = N(q, 70.0);
+  vec3 col = vec3(0.074, 0.069, 0.067) * (0.84 + 0.32 * n2.r);
+  vec2 gb = (0.5 - abs(fract((q - r.xy) / 17.0) - 0.5)) * 17.0;                       // rooms
+  col = mix(col, vec3(0.094, 0.089, 0.087), ss(1.0 + aa, 1.0 - aa, min(gb.x, gb.y)) * step(0.45, n2.g) * 0.6);
+  col = mix(col, vec3(0.112, 0.106, 0.102), ss(1.5 + aa, 1.5 - aa, abs(ed - 1.8)) * step(0.30, n2.b) * 0.8);   // outer wall
+  float bm = ss(1.0, 0.3, abs(fract((q.x + q.y) * 0.7 / 23.0 + n.r * 0.8) - 0.5) * 23.0) * step(0.60, n.g);
+  col = mix(col, vec3(0.030, 0.027, 0.026), bm * 0.8);                                // fallen beams
+  float cr = ss(0.020, 0.004, abs(n2.a - 0.5)) * ss(0.56, 0.74, n.b);                 // ember cracks, breathing slowly
+  col += vec3(0.70, 0.15, 0.03) * cr * (0.30 + 0.20 * sin(uTime * 0.7 + n.r * 30.0));
+  return col;
+}
+
+// ---------------------------------------------------------------- roofs (q = point of the footprint under the roof)
+vec3 roof(Bld b, vec2 q, float s, vec3 nC, vec3 hz, float act) {
+  vec2 sz = b.r.zw - b.r.xy, l = q - b.r.xy;
+  vec2 e2 = min(l, sz - l);
+  float ed = min(e2.x, e2.y), md = min(sz.x, sz.y);
+  float f1 = uf(b.h, 0u), f2 = uf(b.h, 8u), f3 = uf(b.h, 16u), f4 = uf(b.h, 24u);
+  uint ty = (b.h >> 5) % 8u;
+  if (ty == 3u && (md < 40.0 || (b.h >> 11) % 2u == 0u)) ty = 7u;     // helipads only on big roofs, and not on all of them
+  float aa = 0.7 / uScale;
+  vec4 n = N(q, 420.0);
+  float lift = b.full / HMAX;                                   // tall roofs stick out of the haze
+  vec3 base = mix(vec3(0.046, 0.054, 0.086), vec3(0.078, 0.066, 0.112), f1);
+  base = mix(base, vec3(0.044, 0.074, 0.088), f2 * 0.55);
+  base *= (0.62 + 0.75 * lift) * (0.80 + 0.40 * n.g) * (0.75 + 0.7 * f3 * f3);
+  vec2 pg = abs(fract(l / (12.0 + 9.0 * f3)) - 0.5);
+  base *= 1.0 - 0.16 * ss(0.44, 0.48, max(pg.x, pg.y));         // slab seams
+  vec3 col = base, em = vec3(0.0);
+
+  if (md > 58.0 && sz.x < sz.y * 1.5 && sz.y < sz.x * 1.5 && (b.h >> 26) % 6u == 0u) {   // a big glass dome
+    vec2 c = l - sz * 0.5;
+    float R = md * 0.45, rd = length(c), t = rd / R;
+    col *= 1.0 - 0.45 * ss(R + 2.5, R - 2.5, length(c - vec2(0.0, 4.5)));
+    vec3 gc = mix(pal3(f4), vec3(0.6, 0.9, 1.0), 0.35);
+    float seg = atan(c.y, c.x) / 6.2832 * 14.0, ri = t * 4.0;
+    float hp = hash2(vec2(floor(seg), floor(ri)) + f1 * 40.0);
+    vec3 dc = base * (2.0 - 1.1 * t) + gc * (0.03 + 0.17 * hp * hp) * (0.9 + 0.1 * sin(uTime * (0.4 + hp) + hp * 30.0));   // panes lit from inside
+    float dl = min((0.5 - abs(fract(seg) - 0.5)) * rd * 0.4488, (0.5 - abs(fract(ri) - 0.5)) * R * 0.25);                 // ribs and rings
+    dc *= 1.0 - 0.5 * ss(1.0, 0.3, dl);
+    dc *= 0.6 + 0.4 * ss(R, R - 2.0, rd);
+    col = mix(col, dc, ss(R + aa, R - aa, rd));
+    float dn = abs(rd - R * 0.76);
+    em += mix(gc, vec3(1.0), 0.4 * ss(0.9, 0.2, dn)) * (ss(0.9 + aa, 0.9 - aa, dn) * 0.75 + 0.22 * exp(-dn / 3.5));
+    em += vec3(1.0, 0.95, 0.85) * (ss(1.6, 0.5, rd) + 0.4 * exp(-rd / 4.0)) * (0.7 + 0.3 * sin(uTime * 1.3 + f2 * 6.283));
+    ty = 99u;
+  } else if (ty <= 1u) {                                        // air conditioners
+    vec2 a0 = l - 8.0, cs = vec2(15.0, 13.0);
+    vec2 ci = floor(a0 / cs), cf = a0 - (ci + 0.5) * cs;
+    if (a0.x >= 0.0 && a0.y >= 0.0 && (ci.x + 1.0) * cs.x <= sz.x - 16.0 && (ci.y + 1.0) * cs.y <= sz.y - 16.0) {
+      float hu = hash2(ci + vec2(f1, f2) * 91.0);
+      if (hu < 0.48) {
+        vec2 hs = vec2(4.0, 3.0) + vec2(1.6, 1.2) * fract(hu * 13.0);
+        float du = max(abs(cf.x) - hs.x, abs(cf.y) - hs.y);
+        float dsh = max(abs(cf.x) - hs.x, abs(cf.y - 2.0) - hs.y);
+        col *= 1.0 - 0.5 * ss(0.8, -0.8, dsh);
+        vec3 uc = vec3(0.105, 0.118, 0.150) * (0.75 + 0.6 * fract(hu * 7.0));
+        float fd = length(cf - vec2(-hs.x * 0.3, 0.0)), fr = hs.y * 0.72;
+        uc *= 1.0 - 0.45 * ss(fr + aa, fr - aa, fd);
+        uc += 0.03 * ss(aa, -aa, abs(fd - fr) - 0.3);
+        col = mix(col, uc, ss(aa, -aa, du));
+        if (fract(hu * 29.0) < 0.4)
+          em += mix(vec3(0.2, 1.0, 0.4), uC, step(0.5, fract(hu * 53.0))) * ss(1.1, 0.3, length(cf - vec2(hs.x - 1.5, -hs.y + 1.4))) * 0.7;
+      }
+    }
+  } else if (ty == 2u) {                                        // a second tier with a mast and a slow red beacon
+    vec2 in0 = sz * (0.22 + 0.08 * f3), c = l - sz * 0.5, hs = sz * 0.5 - in0;
+    float di = max(abs(c.x) - hs.x, abs(c.y) - hs.y);
+    float dsh = max(abs(c.x) - hs.x, abs(c.y - 3.0) - hs.y);
+    col *= 1.0 - 0.5 * ss(1.0, -1.0, dsh);
+    vec3 tc = base * 1.45 + 0.008;
+    tc = mix(tc, tc * 1.6, ss(-2.6, -1.9, di) * ss(-0.5, -1.2, di));
+    col = mix(col, tc, step(di, 0.0));
+    float bd = length(c);
+    float bl = 0.25 + 0.75 * pow(0.5 + 0.5 * sin(uTime * 1.9 + f4 * 6.283), 4.0);
+    col = mix(col, vec3(0.12, 0.13, 0.16), ss(2.2 + aa, 2.2 - aa, bd));
+    em += vec3(1.0, 0.12, 0.10) * (ss(1.3, 0.4, bd) + 0.5 * exp(-bd / 4.5)) * bl;
+  } else if (ty == 3u) {                                        // helipad
+    vec2 c = l - sz * 0.5;
+    float R = md * 0.34, rd = length(c);
+    col = mix(col, base * 1.25, ss(R + aa, R - aa, rd));
+    float ring = ss(1.0 + aa, 1.0 - aa, abs(rd - R));
+    float hbar = min(max(abs(abs(c.x) - R * 0.28) - 0.9, abs(c.y) - R * 0.46), max(abs(c.x) - R * 0.28, abs(c.y) - 0.9));
+    col = mix(col, mix(vec3(0.42, 0.40, 0.30), uC * 0.5, 0.3), max(ring, ss(aa, -aa, hbar)) * 0.8);
+    float k = floor(atan(c.y, c.x) / 0.7854 + 0.5);
+    vec2 lp = vec2(cos(k * 0.7854), sin(k * 0.7854)) * (R + 3.5);
+    float ld = length(c - lp);
+    float on = 0.55 + 0.45 * sin(uTime * 2.2 + k * 3.1416);
+    em += mix(uA, vec3(0.3, 1.0, 0.5), 0.5) * (ss(1.2, 0.4, ld) + 0.3 * exp(-ld / 3.0)) * on * step(R + 6.0, md * 0.5);
+  } else if (ty == 4u) {                                        // a glass roof with light inside
+    vec2 in0 = max(sz * 0.20, vec2(7.0)), c = l - sz * 0.5, hs = sz * 0.5 - in0;
+    float di = max(abs(c.x) - hs.x, abs(c.y) - hs.y);
+    vec3 gc = mix(mix(uA, vec3(0.5, 0.9, 1.0), 0.5), vec3(1.0, 0.78, 0.45), step(0.6, f3));
+    if (di < 0.0) {
+      vec2 pc = (l - in0) / 6.5, pf = fract(pc), pi = floor(pc);
+      float fr = step(0.12, pf.x) * step(0.12, pf.y);
+      float hp = hash2(pi + f1 * 50.0);
+      float v = (0.22 + 0.55 * hp) * (0.88 + 0.12 * sin(uTime * (0.3 + hp) + hp * 40.0));
+      col = mix(base * 0.5, gc * v * 0.62, fr);
+    } else em += gc * 0.20 * exp(-di / 5.0);
+  } else if (ty == 5u) {                                        // a sign lying on the roof
+    float rows = 1.0 + float((b.h >> 13) % 2u);
+    vec2 c = l - sz * 0.5, hs = vec2(sz.x * 0.5 - 6.0, min(sz.y * 0.5 - 5.0, 1.5 + 3.5 * rows));
+    float di = max(abs(c.x) - hs.x, abs(c.y) - hs.y);
+    vec3 sc = pal3(f4);
+    float fk = flick(b.h);
+    if (di < 0.0) {
+      vec2 uv = c + hs;
+      uv.x += uTime * 4.0 * step(0.6, f3);                      // some of them scroll
+      float g = glyphs(uv - vec2(1.0, 1.5), vec2(5.0, 7.0), f1 * 77.0);
+      col = (mix(sc * 0.12, mix(sc, vec3(1.0), 0.35) * 1.15, g) + sc * 0.06) * fk;
+    } else em += sc * (0.30 * exp(-di / 4.0) + 0.08 * exp(-di / 12.0)) * fk;
+  } else if (ty == 6u) {                                        // solar panels
+    vec2 a0 = l - 6.0, cs = vec2(13.0, 9.0);
+    vec2 ci = floor(a0 / cs), cf = fract(a0 / cs);
+    if (a0.x >= 0.0 && a0.y >= 0.0 && (ci.x + 1.0) * cs.x <= sz.x - 12.0 && (ci.y + 1.0) * cs.y <= sz.y - 12.0) {
+      float pm = step(0.08, cf.x) * step(cf.x, 0.92) * step(0.14, cf.y) * step(cf.y, 0.86);
+      vec3 pc = vec3(0.030, 0.050, 0.105) * (0.8 + 0.5 * hash2(ci + f2 * 9.0));
+      pc += vec3(0.012, 0.018, 0.035) * step(0.86, fract(cf.x * 4.0));
+      pc += hz * 0.09 * ss(0.3, 0.9, n.r);
+      col = mix(col, pc, pm);
+    }
+  } else {                                                      // a water tank and a pipe run
+    vec2 tc = sz * vec2(0.3 + 0.4 * f3, 0.35 + 0.3 * f4);
+    float td = length(l - tc), R = min(md * 0.2, 7.0);
+    col *= 1.0 - 0.45 * ss(R + 1.0, R - 1.0, length(l - tc - vec2(0.0, 2.2)));
+    vec3 tk = vec3(0.105, 0.112, 0.140) * (1.25 - 0.45 * ss(0.0, R, td));
+    col = mix(col, tk, ss(R + aa, R - aa, td));
+    float pd = abs(l.y - sz.y * (0.78 - 0.5 * f1));
+    col = mix(col, base * 1.7, ss(0.9 + aa, 0.9 - aa, pd) * step(4.0, e2.x) * step(R + 2.0, td));
+  }
+
+  // a neon tube along the parapet
+  if ((b.h >> 20) % 5u == 0u && md > 22.0 && ty != 99u) {
+    float dn = abs(ed - 5.0);
+    vec3 sc = pal3(fract(f4 * 3.7 + 0.2));
+    float side = ((b.h >> 23) % 2u == 0u) ? 1.0 : (e2.y < e2.x ? step(sz.y * 0.5, l.y) : step(sz.x * 0.5, l.x));
+    em += mix(sc, vec3(1.0), 0.4 * ss(0.8, 0.2, dn)) * (ss(0.8 + aa, 0.8 - aa, dn) * 0.80 + 0.24 * exp(-dn / 3.5)) * side * flick(b.h >> 2);
+  }
+  // red corner lights on the tall ones
+  if (b.full > 34.0) {
+    float cd = length(e2 - 2.6);
+    float bl = 0.35 + 0.65 * pow(0.5 + 0.5 * sin(uTime * 1.6 + f2 * 6.283), 3.0);
+    em += vec3(1.0, 0.14, 0.12) * (ss(1.1, 0.3, cd) + 0.35 * exp(-cd / 3.0)) * bl * 0.9;
+  }
+  // parapet: a light lip and a dark outline
+  col = mix(col, col * 1.5 + hz * 0.075, ss(3.2, 2.5, ed) * ss(1.0, 1.7, ed));
+  col *= 0.45 + 0.55 * ss(0.0, 1.2, ed);
+  col += hz * 0.085 * ss(0.42, 0.85, n.r) * (0.4 + 0.6 * n.a);   // puddles on the roof mirror the glow of the sky
+  col += nC * (0.6 + 0.8 * n.b) * 0.16 * rimL(s, 28.0);              // light of the plaza rim
+  col += em * (0.45 + 0.55 * act) * (1.0 - b.sc);
+  // burnt: a dark roof with holes; while it burns the holes glow from the fire inside
+  col = mix(col, vec3(0.036, 0.032, 0.031) * (0.6 + 0.8 * n.g), b.sc * 0.85);
+  float hv = N(q, 150.0).a, hole = ss(0.70, 0.76, hv);
+  col = mix(col, vec3(0.012), hole * b.sc * 0.85);
+  col += vec3(1.0, 0.34, 0.05) * ss(0.62, 0.72, hv) * (1.0 - 0.75 * ss(0.74, 0.80, hv)) * b.f * (0.50 + 0.20 * sin(uTime * 1.3 + n.r * 20.0));
+  return mix(plate(q, b.r, nC, s), col, ss(0.02, 0.5, b.a));
+}
+
+// ---------------------------------------------------------------- south walls: the faces of the city
+vec3 wall(Bld b, vec2 p, float s, vec3 nC, vec3 hz, float act) {
+  float w = b.r.z - b.r.x, u = p.x - b.r.x;
+  float vt = p.y - (b.r.w - b.hgt);                             // 0 under the roof edge .. hgt at the pavement
+  float gy = b.full - vt;                                       // height above the pavement of the standing building
+  float f1 = uf(b.h, 0u), f2 = uf(b.h, 8u), f3 = uf(b.h, 16u), f4 = uf(b.h, 24u);
+  float aa = 0.7 / uScale;
+  uint kind = (b.h >> 17) % 4u;                                 // 0 offices, 1 flats, 2 mixed, 3 a dark tower with light bands
+  vec3 col = mix(vec3(0.030, 0.034, 0.056), vec3(0.046, 0.038, 0.064), f1) * (0.8 + 0.4 * f2);
+  col += hz * 0.16 * ss(30.0, 0.0, gy) * ss(30.0, 0.0, gy);     // the glow of the street on the lower floors
+  vec3 em = vec3(0.0);
+  // windows
+  const vec2 cs = vec2(5.5, 5.0);
+  float off = mod(w - 3.0, cs.x) * 0.5 + 1.5;
+  bool screen = w > 52.0 && (b.h >> 14) % 4u == 1u && b.full > 22.0;
+  vec4 sr = vec4(0.0);                                          // a video wall: x0, top, x1, bottom (wall coordinates)
+  if (screen) {
+    float sw = w * (0.46 + 0.3 * f3);
+    float sx0 = 4.0 + (w - 8.0 - sw) * f4;
+    sr = vec4(sx0, 3.5, sx0 + sw, max(12.0, b.full * (0.5 + 0.25 * f1)));
+  }
+  float dscr = screen ? max(max(sr.x - u, u - sr.z), max(sr.y - vt, vt - sr.w)) : 1e3;
+  if (dscr > 0.0 && u > off && u < w - off && vt > 2.4 && gy > 6.0) {
+    vec2 wc = vec2(u - off, vt - 2.4) / cs, wi = floor(wc), wf = fract(wc);
+    float ax = aa / cs.x, ay = aa / cs.y;
+    float m = ss(0.13 - ax, 0.13 + ax, wf.x) * ss(0.87 + ax, 0.87 - ax, wf.x) * ss(0.18 - ay, 0.18 + ay, wf.y) * ss(0.82 + ay, 0.82 - ay, wf.y);
+    float hw = hash2(wi + vec2(f1, f3) * 211.0), h3 = fract(hw * 57.0);
+    float fl = hash2(vec2(wi.y, f1 * 97.0 + 3.0)), cl = hash2(vec2(wi.x, f3 * 131.0 + 5.0));
+    float occ = (kind == 0u ? 0.66 : kind == 1u ? 0.36 : kind == 2u ? 0.50 : 0.20) * (0.45 + 1.1 * fl) * step(0.10, cl) * (0.40 + 0.85 * act);
+    float lit = step(hw, occ);
+    vec3 warm = vec3(1.0, 0.70, 0.34), cool = vec3(0.66, 0.90, 1.0);
+    vec3 wl = kind == 0u ? mix(cool, warm, step(0.86, h3)) : kind == 1u ? mix(warm, cool, step(0.80, h3))
+            : h3 < 0.5 ? warm : h3 < 0.8 ? cool : mix(uB, vec3(1.0), 0.2);
+    wl *= 0.42 + 0.58 * fract(hw * 91.0);
+    if (fract(hw * 23.0) < 0.06) wl = vec3(0.45, 0.62, 1.0) * (0.55 + 0.35 * sin(uTime * (2.0 + 5.0 * h3) + hw * 60.0));   // a screen in the room
+    if (b.f > 0.05) {                                           // fire behind the windows
+      float fw = step(fract(hw * 37.0), b.f * 0.85);
+      wl = mix(wl, vec3(1.0, 0.45, 0.10) * (0.65 + 0.35 * sin(uTime * (3.0 + 4.0 * h3) + hw * 50.0)), fw);
+      lit = max(lit, fw);
+    } else lit *= 1.0 - b.sc;
+    col = mix(col, mix(col * 1.5 + hz * 0.05, wl, lit), m);
+    if (kind == 3u) {                                           // light bands every third floor
+      float band = step(0.5, mod(wi.y, 3.0)) * step(mod(wi.y, 3.0), 1.5);
+      em += pal3(f4) * 0.55 * band * ss(0.18, 0.06, abs(wf.y - 0.92)) * step(0.12, cl);
+    }
+  }
+  if (screen) {
+    if (dscr < 0.0) {                                           // a video wall: slow colour waves, a line of text, scan lines
+      vec3 c1 = pal3(f3), c2 = pal3(fract(f3 + 0.45));
+      float tt = uTime * 0.22 + f2 * 10.0;
+      float g = 0.5 + 0.5 * sin((u - sr.x) * 0.11 + sin((vt - sr.y) * 0.3 + tt) * 1.6 + tt * 2.0);
+      vec3 sc = mix(c1, c2, g) * (0.50 + 0.22 * sin(tt * 3.0 + u * 0.05));
+      float midv = (sr.y + sr.w) * 0.5;
+      float tx = glyphs(vec2(u - sr.x - 2.0 + uTime * 3.0 * step(0.5, f1), vt - midv + 3.0), vec2(5.0, 6.0), f2 * 19.0) * step(abs(vt - midv), 3.0);
+      sc = mix(sc, vec3(1.0, 0.98, 0.95), tx * 0.85);
+      sc *= 0.86 + 0.14 * step(0.5, fract(vt * 0.5 * uScale * 0.5));
+      col = sc * flick(b.h >> 3);
+    } else em += mix(pal3(f3), pal3(fract(f3 + 0.45)), 0.5) * 0.36 * exp(-dscr / 4.0);
+  } else if ((b.h >> 14) % 3u == 0u && w > 22.0) {              // a vertical sign
+    float sx0 = 6.0 + (w - 12.0) * f4;
+    vec3 sc = pal3(fract(f3 * 5.3));
+    float fk = flick(b.h >> 1);
+    float dbox = max(abs(u - sx0) - 2.6, max(2.0 - vt, 6.5 - gy));
+    if (dbox < 0.0) {
+      float g = glyphs(vec2(u - sx0 + 2.6, vt - 2.0), vec2(5.2, 5.8), f2 * 31.0);
+      col = (mix(sc * 0.16, mix(sc, vec3(1.0), 0.4) * 1.25, g) + sc * 0.05) * fk;
+    } else em += sc * 0.34 * exp(-dbox / 3.5) * fk;
+  }
+  // the front edge of the roof, shop fronts at street level and their light on the wall above
+  col = mix(col, vec3(0.085, 0.095, 0.135) * (0.7 + 0.6 * b.full / HMAX), ss(1.3, 0.7, vt));
+  vec3 sg, sn;
+  shop(p.x, b.h, sg, sn);
+  if (gy < 7.5) {
+    float fr = ss(0.10, 0.20, abs(fract(p.x / 5.67) - 0.5));       // window frames of the shops
+    col = mix(col, sg * fr, ss(5.0, 4.4, gy) * ss(0.3, 0.9, gy));
+    col += sn * 1.05 * ss(0.6 + aa, 0.6 - aa, abs(gy - 6.0));      // the sign above them
+  }
+  em += sn * 0.22 * exp(-max(gy - 6.2, 0.0) / 4.5);
+  em += nC * 0.16 * rimL(s, 32.0);
+  return col * (1.0 - 0.4 * b.sc * (1.0 - b.f)) + em * (1.0 - b.sc) + nC * 0.10 * b.f;
+}
+
+// ---------------------------------------------------------------- streets
+// the cars of one lane: x = distance ahead of the travel coordinate (px), y = distance across (px)
+vec3 lane(float a, float y, float dir, float v, float lid, float dens) {
+  if (abs(y) > 9.0) return vec3(0.0);
+  const float L = 54.0;
+  float u = a * dir - uTime * v + lid * 37.7;
+  float k = floor(u / L);
+  float hk = hash2(vec2(k, lid));
+  if (hk > dens) return vec3(0.0);
+  float x = u - (k + 0.3 + 0.4 * hash2(vec2(k + 7.0, lid))) * L;     // > 0: ahead of the car
+  float gy = exp(-y * y / 2.0);
+  float head = exp(-(x - 3.0) * (x - 3.0) / 1.3) * gy * 1.7;
+  float beam = ss(24.0, 4.0, x) * step(3.0, x) * exp(-y * y / 9.0) * 0.26;
+  float tail = exp(-(x + 3.5) * (x + 3.5) / 1.2) * gy * 1.2;
+  float glow = ss(-17.0, -3.5, x) * step(x, -3.5) * exp(-y * y / 6.0) * 0.20;
+  vec3 hc = mix(vec3(1.0, 0.96, 0.86), vec3(0.75, 0.92, 1.0), step(0.5, fract(hk * 31.0)));
+  return hc * (head + beam) + vec3(1.0, 0.10, 0.16) * (tail + glow);
+}
+// one street: a = along (px), y = across (px, positive = right-hand side of the traffic that moves toward +a)
+void street(float a, float y, float hw, bool ave, float id, float fade, bool kerb, inout vec3 col, inout vec3 L, inout vec3 em) {
+  float aa = 0.6 / uScale;
+  // markings
+  float dash = step(0.5, fract(a / 16.0));
+  float mk = ave ? max(ss(0.6 + aa, 0.6 - aa, abs(abs(y) - 1.4)), ss(0.5 + aa, 0.5 - aa, abs(abs(y) - hw * 0.47)) * dash)
+                 : ss(0.55 + aa, 0.55 - aa, abs(y)) * dash;
+  col += vec3(0.060, 0.064, 0.072) * mk;
+  if (kerb) col = mix(col, vec3(0.042, 0.048, 0.066), ss(hw - 1.7, hw - 0.9, abs(y)));
+  // lamps along one side
+  float la = a / 62.0 + id * 0.37, lk = floor(la);
+  vec2 ld = vec2((la - lk - 0.5) * 62.0, y + hw - 2.0);
+  float d2 = dot(ld, ld), lh = hash2(vec2(lk, id));
+  vec3 lc = lh < 0.7 ? vec3(1.0, 0.66, 0.34) : vec3(0.62, 0.84, 1.0);
+  L += lc * exp(-d2 / 260.0) * 0.30;
+  em += lc * exp(-d2 / 1.3) * 0.8;
+  // traffic
+  if (fade > 0.0 && uTraffic > 0.0) {
+    float dens = min(0.92, (ave ? 0.55 : 0.32) * uTraffic);
+    float d1 = (ave ? 0.25 : 0.44) * hw;
+    vec3 t = lane(a, y - d1, 1.0, 30.0 + 9.0 * hash2(vec2(id, 1.0)), id * 4.0 + 0.0, dens)
+           + lane(a, y + d1, -1.0, 30.0 + 9.0 * hash2(vec2(id, 2.0)), id * 4.0 + 1.0, dens);
+    if (ave) t += lane(a, y - 0.70 * hw, 1.0, 24.0 + 6.0 * hash2(vec2(id, 3.0)), id * 4.0 + 2.0, dens)
+                + lane(a, y + 0.70 * hw, -1.0, 24.0 + 6.0 * hash2(vec2(id, 4.0)), id * 4.0 + 3.0, dens);
+    em += t * fade;
+  }
+}
+
+// ---------------------------------------------------------------- the pavement (streets, alleys, folded buildings)
+vec3 ground(vec2 p, Blk k, float nx, float ny, int c, int r, int tn, Bld bn, float s, vec3 nC, vec3 hz) {
+  vec4 n = N(p, 520.0), n2 = N(p, 150.0);
+  float pud = ss(0.38, 0.80, n.g * 0.6 + n2.r * 0.4);                // puddles
+  vec3 col = vec3(0.014, 0.017, 0.028) * (0.8 + 0.4 * n2.g);
+  vec3 L = hz * (0.10 + 0.10 * n.b), em = vec3(0.0);                 // light that falls on the wet ground / lamps and cars
+  bool south = p.y > k.r.w, east = p.x > k.r.z;
+  float fade = ss(6.0, 40.0, s);                                     // the traffic stops before the plaza
+  float aa = 0.6 / uScale;
+  if (south) {
+    float hw = (ny - k.r.w) * 0.5, y = p.y - (k.r.w + hw);
+    street(p.x, y, hw, hw > 18.0, float(r) * 2.0 + 0.5, fade, !east, col, L, em);
+    if (!east) {
+      // zebra crossings at both ends of the block
+      float zx = min(abs(p.x - (k.r.z - 6.0)), abs(p.x - (k.r.x + 6.0)));
+      col += vec3(0.050, 0.052, 0.058) * ss(3.0 + aa, 3.0 - aa, zx) * step(0.5, fract(y / 3.4)) * step(abs(y), hw - 2.5) * (0.5 + 0.5 * n2.g);
+      // light of the shop fronts on the north side
+      Bld bw;
+      if (bldIn(k, vec2(p.x, k.r.w - 0.5), bw) == 1) {
+        vec3 sg, sn;
+        shop(p.x, bw.h, sg, sn);
+        L += (sg * 0.9 + sn * 0.6) * exp(-(p.y - k.r.w) / 10.0) * ss(0.5, 0.95, bw.a);
+      }
+    }
+  }
+  if (east) {
+    float hw = (nx - k.r.z) * 0.5, y = (k.r.z + hw) - p.x;
+    street(p.y, y, hw, hw > 12.0, float(c) * 2.0 + 1.5, fade, !south, col, L, em);
+    // an elevated rail line runs along some of the north-south avenues; a train passes every now and then
+    uint hr = ih(c + 1, 11, 1);
+    if (hw > 12.0 && ((hr >> 20) & 1u) == 0u) {
+      float ax = abs(y), a = p.y;
+      vec3 dk = vec3(0.034, 0.040, 0.060) * (0.75 + 0.5 * step(0.5, fract(a / 4.0)));          // sleepers
+      dk += vec3(0.15, 0.17, 0.21) * ss(0.5 + aa, 0.5 - aa, abs(ax - 2.6));                     // rails
+      dk = mix(dk, vec3(0.060, 0.066, 0.090), ss(5.0, 4.0, abs(fract(a / 46.0) - 0.5) * 46.0)); // pylon heads
+      col = mix(col, dk, ss(4.6 + aa, 4.6 - aa, ax) * 0.92);
+      const float LEN = 132.0, PER = 2600.0;
+      float dir = ((hr >> 21) & 1u) == 0u ? 1.0 : -1.0;
+      float u = mod(a * dir - uTime * 120.0 + float(c) * 517.0, PER);                           // 0 at the tail .. LEN at the nose
+      if (u < LEN + 34.0 && ax < 12.0 && fade > 0.0) {
+        float cu = fract(u / 26.4);
+        float body = step(u, LEN) * ss(3.5 + aa, 3.5 - aa, ax) * step(0.04, cu) * step(cu, 0.96);
+        vec3 tc = vec3(0.085, 0.095, 0.130);
+        tc += mix(vec3(1.0, 0.86, 0.60), uA, 0.3) * (0.55 * ss(0.7, 0.2, abs(ax - 2.2)) + 0.30 * ss(0.7, 0.2, ax));   // light strips along the cars
+        col = mix(col, tc, body * fade);
+        float nose = u - LEN;
+        vec3 tl = vec3(1.0, 0.97, 0.90) * (exp(-nose * nose / 6.0) * exp(-ax * ax / 4.0) * 1.6 + ss(34.0, 0.0, nose) * step(0.0, nose) * exp(-ax * ax / 14.0) * 0.32);
+        tl += vec3(1.0, 0.10, 0.15) * exp(-u * u / 5.0) * exp(-ax * ax / 5.0);
+        tl += mix(vec3(1.0, 0.86, 0.60), uA, 0.3) * 0.16 * step(u, LEN) * exp(-max(ax - 3.5, 0.0) / 3.5);            // glow on the street beside it
+        em += tl * fade;
+      }
+    }
+    if (!south) {
+      float zy = min(abs(p.y - (k.r.w - 6.0)), abs(p.y - (k.r.y + 6.0)));
+      col += vec3(0.050, 0.052, 0.058) * ss(3.0 + aa, 3.0 - aa, zy) * step(0.5, fract(y / 3.4)) * step(abs(y), hw - 2.5) * (0.5 + 0.5 * n2.g);
+      // side entrances of the block on the west side
+      float sg = p.y / 23.0, hs = hash2(vec2(floor(sg), float(k.h & 2047u)));
+      if (hs > 0.55) L += pal3(fract(hs * 9.0)) * ss(0.5, 0.2, abs(fract(sg) - 0.5)) * exp(-(p.x - k.r.z) / 6.0) * 0.5 * min(min(k.pres.x + k.pres.y, 1.0), 1.0);
+    }
+  }
+  if (!south && !east) {
+    col *= 0.8;
+    if (tn == 2) col = plate(p, bn.r, nC, s);
+  }
+  // in the zone the streets are scorched and dead: no lamps, no shop light
+  if (south || east || tn != 2) col = mix(vec3(0.052, 0.049, 0.048) * (0.85 + 0.3 * n2.g) + col * 0.5, col, 0.15 + 0.85 * ss(-6.0, 30.0, s));
+  col += (L * (0.50 + 0.75 * pud) + em) * ss(-6.0, 16.0, s);
+  return col;
+}
+
+float gGround;                     // 1 where the last scene() call hit the pavement (not a roof or a wall)
+// ---------------------------------------------------------------- the whole scene at p (px, origin top left)
+vec3 scene(vec2 p) {
+  float s = fieldS(p);
+  vec3 nC = vec3(0.0);
+  vec3 col = vec3(0.0);
+  gGround = 1.0;
+  {
+    vec3 hz = hazeAt(p);
+    float act = ss(0.30, 0.70, N(p + 300.0, 2900.0).b);            // busy districts and quiet ones
+    int c, rn; float x0, x1, nx, y0, y1, ny;
+    colAt(p.x, c, x0, x1, nx);
+    rowAt(p.y, rn, y0, y1, ny);
+    Blk kn = mkBlk(vec4(x0, y0, x1, y1), c, rn);
+    Blk kf = kn;
+    if (p.y + HMAX >= ny) {
+      int rf; float a0, a1, a2;
+      rowAt(p.y + HMAX, rf, a0, a1, a2);
+      kf = mkBlk(vec4(x0, a0, x1, a1), c, rf);
+    }
+    // a roof is shifted up by the height of its building, so the buildings to the south are in front: look there first
+    Bld b = Bld(vec4(0.0), 0u, 0.0, 0.0, 0.0, 0.0, 0.0);
+    bool hit = false, isWall = false;
+    int t = bldIn(kf, vec2(p.x, p.y + HMAX), b);
+    if (t == 1 && p.y + b.hgt >= b.r.y) hit = true;
+    if (!hit) {
+      float qy = p.y + HMAX * 0.5;
+      if (qy >= ny) t = bldIn(kf, vec2(p.x, qy), b); else t = bldIn(kn, vec2(p.x, qy), b);
+      if (t == 1 && p.y + b.hgt >= b.r.y) { hit = true; isWall = p.y + b.hgt > b.r.w; }
+    }
+    int tn = 0;
+    if (!hit) {
+      tn = bldIn(kn, p, b);
+      if (tn == 1) { hit = true; isWall = p.y + b.hgt > b.r.w; }
+    }
+    if (hit) gGround = 0.0;
+    if (hit) col = isWall ? wall(b, p, s, nC, hz, act) : roof(b, vec2(p.x, p.y + b.hgt), s, nC, hz, act);
+    else col = ground(p, kn, nx, ny, c, rn, tn, b, s, nC, hz);
+  }
+  return col;
+}
+
+// ---------------------------------------------------------------- rain
+float rainLayer(vec2 p, vec2 cell, float v, float sd, float dens) {
+  const vec2 dir = vec2(-0.292, 0.956);                              // falling toward the bottom, a little to the left
+  vec2 q = vec2(dot(p, vec2(dir.y, -dir.x)), dot(p, dir) - uRainT * v) / cell;
+  vec2 id = floor(q), f = q - id;
+  float h = hash2(id + sd);
+  if (h > dens) return 0.0;
+  float x = (f.x - 0.25 - 0.5 * fract(h * 57.0)) * cell.x;
+  float len = 0.35 + 0.45 * fract(h * 131.0);
+  return ss(0.9, 0.2, abs(x)) * ss(0.0, len, f.y) * ss(len + 0.04, len, f.y);
+}
+float ripples(vec2 p) {
+  vec2 g = floor(p / 30.0);
+  float h = hash2(g), tt = uTime * (0.55 + 0.5 * h) + h * 17.0;
+  float cyc = floor(tt), ph = tt - cyc;
+  vec2 c = (g + 0.5 + (vec2(hash2(g + cyc * 1.3 + 3.7), hash2(g + cyc * 1.7 + 9.1)) - 0.5) * 0.6) * 30.0;
+  float d = abs(length(p - c) - ph * 9.0);
+  return ss(1.0, 0.2, d) * (1.0 - ph) * (1.0 - ph);
+}
+
+void main() {
+  vec2 p = vec2(gl_FragCoord.x, uRes.y * uScale - gl_FragCoord.y) / uScale;
+  float s0 = fieldS(p);
+  float out0 = ss(-4.0, 26.0, s0);                                   // 0 on the plaza: nothing may flicker under the icons
+
+  // glitch: a few slices of the picture jump sideways and split into colours for a moment
+  vec2 q = p;
+  float ca = 0.0;
+  if (uGl.x > 0.0 && out0 > 0.0) {
+    float bh = 9.0 + 34.0 * hash2(vec2(uGl.y, 3.1));
+    float band = floor(p.y / bh);
+    if (hash2(vec2(band, uGl.y)) > 0.62) {
+      q.x += (hash2(vec2(band, uGl.y + 9.0)) - 0.5) * 2.0 * uGl.z * uGl.x * out0;
+      ca = uGl.w * uGl.x * out0;
+    }
+  }
+  vec3 col = scene(q);
+  float grd = gGround;
+  if (ca > 0.0) { col.r = scene(q + vec2(ca, 0.0)).r; col.b = scene(q - vec2(ca, 0.0)).b; }
+
+  // holograms: rings of light that turn slowly above some of the towers
+  for (int i = 0; i < 6; i++) {
+    vec4 h = uHolo[i];
+    if (h.w <= 0.0) continue;
+    vec2 d = p - h.xy;
+    float r = length(d);
+    if (r > h.z + 4.0) continue;
+    float fi = float(i), ang = atan(d.y, d.x) / 6.2832, aa = 0.7 / uScale, e = 0.0;
+    for (int k = 0; k < 3; k++) {
+      float fk = float(k), R = h.z * (1.0 - 0.27 * fk);
+      float arcs = step(0.30 + 0.1 * fk, fract((ang + uTime * (0.020 + 0.012 * fk) * (k == 1 ? -1.0 : 1.0)) * (3.0 + 2.0 * fk) + fi * 0.31));
+      e += (ss(0.8 + aa, 0.8 - aa, abs(r - R)) + 0.22 * exp(-abs(r - R) / 3.0)) * arcs * (1.0 - 0.22 * fk);
+    }
+    e += ss(0.5 + aa, 0.5 - aa, abs(r - h.z * 0.86)) * step(0.5, fract(ang * 72.0)) * 0.5;     // a ring of ticks
+    e += 0.045 * ss(h.z, h.z * 0.3, r) + exp(-r * r / 6.0) * 1.1 + 0.3 * exp(-r / 5.0);       // a faint disc and the emitter
+    col += mix(uA, uB, step(0.5, fract(fi * 0.37 + 0.2))) * e * 0.62 * h.w * out0;
+  }
+
+  // flying cars: the pool of their headlights, a light trail, the car itself
+  for (int i = 0; i < 5; i++) {
+    vec4 c = uCar[i];
+    if (c.w <= 0.0) continue;
+    vec2 d = p - c.xy;
+    if (abs(d.x) > 140.0 || abs(d.y) > 140.0) continue;
+    float ch = cos(c.z), sh = sin(c.z);
+    vec2 l = vec2(d.x * ch + d.y * sh, -d.x * sh + d.y * ch) / 1.5;  // x forward, y to the right (the car is 1.5 x the model)
+    vec2 hq = (l - vec2(36.0, 0.0)) / vec2(30.0, 17.0);
+    float pool = ss(1.0, 0.0, length(hq));
+    col += (min(col, vec3(0.5)) * 2.2 + vec3(0.016, 0.022, 0.032)) * pool * pool * c.w;
+    vec4 tr = uTrail[i];
+    float h1, h2;
+    float d1 = segD(p, c.xy, tr.xy, h1), d2 = segD(p, tr.xy, tr.zw, h2);
+    float tl = (exp(-d1 * d1 / 2.5) + 0.22 * exp(-d1 / 5.0)) * (1.0 - 0.5 * h1) + (exp(-d2 * d2 / 2.0) + 0.22 * exp(-d2 / 5.0)) * 0.5 * (1.0 - h2);
+    col += uA * tl * 0.75 * c.w;
+    // shadow on whatever is below, then the body
+    float sd = length((l - vec2(4.0 * ch + 7.0 * sh, -4.0 * sh + 7.0 * ch)) / vec2(8.5, 4.6));
+    col *= 1.0 - 0.35 * ss(1.3, 0.5, sd) * c.w;
+    float taper = 1.0 - 0.34 * ss(-1.0, 7.5, l.x);
+    vec2 bq = abs(l) - vec2(6.2, 3.4 * taper - 1.2);
+    float bd = length(max(bq, 0.0)) + min(max(bq.x, bq.y), 0.0) - 1.2;
+    vec3 bc = vec3(0.075, 0.085, 0.120) + uHaze * 0.05;
+    bc = mix(bc, uA * 0.30 + vec3(0.02, 0.03, 0.05), ss(1.0, 0.4, length((l - vec2(1.4, 0.0)) / vec2(2.9, 1.9))));   // canopy
+    bc = mix(bc, vec3(0.20, 0.22, 0.28), ss(-0.9, -0.2, bd));       // rim light
+    col = mix(col, bc, ss(0.5, -0.5, bd) * c.w);
+    float e1 = length(l - vec2(-7.0, 2.3)), e2 = length(l - vec2(-7.0, -2.3));
+    col += uB * (exp(-e1 * e1 / 2.2) + exp(-e2 * e2 / 2.2) + 0.25 * exp(-min(e1, e2) / 4.0)) * 1.1 * c.w;
+    float k1 = length(l - vec2(6.8, 1.9)), k2 = length(l - vec2(6.8, -1.9));
+    col += vec3(1.0, 0.97, 0.90) * (exp(-k1 * k1 / 1.4) + exp(-k2 * k2 / 1.4)) * c.w;
+  }
+
+  // smog that drifts over the roofs and catches the city light
+  vec2 sp = p + vec2(uTime * 5.0, uTime * 1.6);
+  float fog = ss(0.40, 0.86, N(sp, 1500.0).b * 0.65 + N(sp * 1.9 + 300.0, 1500.0).g * 0.35);
+  col = mix(col, col * 0.78 + hazeAt(p) * 0.15, fog * 0.6 * (0.15 + 0.85 * out0));
+
+  // fires: warm light on everything around, a smoke plume, tongues of flame above the burning roof, sparks
+  float calm = 0.3 + 0.7 * out0, plumeOk = ss(-16.0, 6.0, s0);
+  for (int i = 0; i < 12; i++) {
+    vec4 f = uFire[i];
+    if (f.w <= 0.0) continue;
+    vec2 d = p - f.xy;
+    float R = 150.0 + 110.0 * f.w;
+    if (abs(d.x) > R * 1.2 || d.y > R || d.y < -R * 1.7) continue;
+    float hw = floor(f.z), fi = fract(f.z) * 100.0, t = uTime, H = 34.0 + 46.0 * f.w;
+    float lg = exp(-dot(d, d) / (R * R * 0.16)) * min(f.w * 1.4, 1.2) * (0.85 + 0.10 * sin(t * 4.7 + fi) + 0.05 * sin(t * 9.1 + fi * 2.0));
+    col += (dot(col, vec3(0.4, 0.45, 0.15)) * 3.4 + col * 1.0 + 0.060) * vec3(1.0, 0.46, 0.13) * lg * calm;
+    // the plume leans with the wind, widens and thins
+    vec2 pd = d - vec2(0.0, -H * 0.5);
+    float al = dot(pd, vec2(0.42, -0.907)), sd = dot(pd, vec2(0.907, 0.42)), PL = 120.0 + 150.0 * f.w;
+    if (al > 0.0 && al < PL) {
+      float wd = hw * 0.35 + 5.0 + al * 0.21;
+      float wob = sin(al * 0.03 - t * 0.8 + fi) * al * 0.10;
+      float nz = N(p + vec2(-t * 14.0, t * 30.0), 260.0).r * 0.55 + N(p + vec2(-t * 20.0, t * 43.0), 90.0).g * 0.45;
+      float sm = ss(wd, wd * 0.2, abs(sd - wob)) * ss(0.0, 24.0, al) * ss(PL, PL * 0.35, al) * ss(0.30, 0.58, nz);
+      vec3 sc = mix(vec3(0.50, 0.22, 0.08), vec3(0.21, 0.20, 0.21), ss(0.0, 90.0, al)) * (0.75 + 0.5 * nz);
+      col = mix(col, sc, sm * 0.88 * min(f.w * 1.5, 1.0) * plumeOk);
+    }
+    if (abs(d.x) < hw + 22.0 && d.y < 10.0 && d.y > -H * 1.5) {
+      float fl = 0.0;
+      fl = clamp(1.0 - length(vec2(d.x / (hw * 0.85), (d.y + 2.0) / 9.0)), 0.0, 1.0) * 0.85;     // the fire on the roof itself
+      for (int k = 0; k < 6; k++) {
+        float fk = float(k), hk = hash2(vec2(fi * 7.0 + fk, 3.0));
+        float bx = (fk - 2.5) * 0.32 * hw + (hk - 0.5) * 6.0, by = (hash2(vec2(fi + fk, 9.0)) - 0.5) * 10.0;
+        float hh = H * (0.50 + 0.80 * hk) * (0.80 + 0.20 * sin(t * (2.0 + hk * 2.0) + fk * 2.0));
+        float y = (by - d.y) / hh;                                   // 0 at the foot of the tongue .. 1 at its tip
+        if (y < -0.15 || y > 1.0) continue;
+        float sway = (texture(uNoise, vec2(y * 0.22 - t * 0.30 + hk, fi * 0.13 + fk * 0.07)).r - 0.5) * 30.0 * y * y + sin(t * 1.7 + fk * 1.9 + fi) * 5.0 * y;
+        float wv = (5.0 + 7.0 * hk + hw * 0.14) * sqrt(max(y + 0.15, 0.0)) * (1.0 - y) * 1.7;
+        fl = max(fl, clamp(1.0 - abs(d.x - bx - sway) / max(wv, 0.5), 0.0, 1.0) * (1.0 - 0.3 * y));
+      }
+      fl *= 0.66 + 0.68 * texture(uNoise, (p * vec2(1.0, 0.55) + vec2(0.0, t * 42.0)) / 46.0).g;        // licks inside the tongues
+      vec3 fc = mix(vec3(0.95, 0.14, 0.02), vec3(1.0, 0.52, 0.06), ss(0.15, 0.50, fl));
+      fc = mix(fc, vec3(1.0, 0.94, 0.66), ss(0.55, 0.95, fl));
+      col = mix(col, fc * 1.15, ss(0.02, 0.22, fl) * min(f.w * 2.0, 1.0));
+    }
+    for (int k = 0; k < 5; k++) {
+      float fk = float(k), hk = hash2(vec2(fi * 3.0 + fk, 21.0));
+      float ph = fract(t * (0.30 + 0.2 * hk) + hk * 7.0);
+      vec2 sp = vec2((hash2(vec2(fi + fk, 31.0)) - 0.5) * hw * 1.4 + sin(ph * 9.0 + fk) * 5.0 + ph * 16.0, -ph * H * 2.0);
+      col += vec3(1.0, 0.62, 0.20) * ss(1.5, 0.4, length(d - sp)) * (1.0 - ph) * min(f.w * 2.0, 1.0);
+    }
+  }
+
+  // emergency units: the vehicle, its flashing lights, the water jet and the steam where the water lands
+  for (int i = 0; i < 8; i++) {
+    vec4 u = uUnit[i];
+    if (u.w < 0.0) continue;
+    vec2 d = p - u.xy;
+    if (abs(d.x) > 165.0 || abs(d.y) > 165.0) continue;
+    vec4 j = uJet[i];
+    int kind = int(u.w);
+    float vis = fract(u.w) / 0.98, fi = float(i), aa = 0.6 / uScale;
+    float ch = cos(u.z), sh = sin(u.z);
+    vec2 l = vec2(d.x * ch + d.y * sh, -d.x * sh + d.y * ch) / (kind == 0 ? 2.5 : kind == 3 ? 2.6 : 2.3);   // x forward, y to the right
+    // two lamps that take turns, swelling and fading (about one cycle a second: no strobe)
+    float e1 = pow(0.5 + 0.5 * sin(uTime * 6.5 + fi * 1.7), 2.0), e2 = pow(0.5 - 0.5 * sin(uTime * 6.5 + fi * 1.7), 2.0);
+    vec3 c1 = kind == 1 ? vec3(0.20, 0.42, 1.0) : vec3(1.0, 0.10, 0.08);
+    vec3 c2 = kind == 0 ? vec3(1.0, 0.62, 0.12) : kind == 1 ? vec3(1.0, 0.10, 0.08) : kind == 2 ? vec3(0.95, 0.97, 1.0) : vec3(0.20, 0.42, 1.0);
+    if (kind < 3) {
+      vec2 hs = kind == 0 ? vec2(9.0, 3.5) : kind == 1 ? vec2(5.6, 2.8) : vec2(6.4, 3.1);
+      vec2 bq = abs(l) - hs + 1.0;
+      float bd = length(max(bq, 0.0)) + min(max(bq.x, bq.y), 0.0) - 1.0;
+      vec3 bc = kind == 0 ? vec3(0.66, 0.07, 0.05) : kind == 1 ? vec3(0.08, 0.10, 0.22) : vec3(0.80, 0.82, 0.84);
+      if (kind == 0) {
+        bc = mix(bc, vec3(0.92, 0.92, 0.90), step(abs(abs(l.y) - 2.6), 0.35) * step(abs(l.x), 7.8));   // white stripes
+        bc = mix(bc, vec3(0.58, 0.60, 0.64), ss(1.1, 0.7, abs(l.y)) * step(-7.5, l.x) * step(l.x, 3.0) * (0.55 + 0.45 * step(0.5, fract(l.x / 2.2))));   // ladder
+        bc = mix(bc, vec3(0.10, 0.13, 0.18), step(5.4, l.x) * step(l.x, 7.2));                                                              // windscreen
+      } else if (kind == 1) bc = mix(bc, vec3(0.82, 0.84, 0.88), step(abs(l.x + 0.5), 1.7));
+      else bc = mix(bc, vec3(0.85, 0.10, 0.08), max(step(abs(l.y), 0.7) * step(abs(l.x), 3.0), step(abs(l.x), 0.7) * step(abs(l.y), 2.2)));  // a red cross
+      bc = mix(bc, bc * 0.3, ss(-0.9, -0.1, bd));
+      float body = ss(aa, -aa, bd) * vis * grd;
+      col = mix(col * (1.0 - 0.4 * ss(3.0, 0.0, bd) * vis * grd), bc, body);
+      vec2 b1 = l - vec2(hs.x * 0.42, 1.4), b2 = l - vec2(hs.x * 0.42, -1.4);
+      col += (c1 * e1 * exp(-dot(b1, b1) / 1.5) + c2 * e2 * exp(-dot(b2, b2) / 1.5)) * 1.5 * vis * grd;
+      vec2 hl = l - vec2(hs.x - 0.5, 0.0);
+      col += vec3(1.0, 0.95, 0.85) * exp(-(hl.x * hl.x + (abs(hl.y) - hs.y + 1.0) * (abs(hl.y) - hs.y + 1.0)) / 1.2) * 0.8 * vis * grd;
+      col += (c1 * e1 + c2 * e2) * exp(-length(d) / 20.0) * 0.34 * vis;                    // their light on the street and the walls
+    } else {
+      float r = length(l);
+      float arm = min(abs(l.x - l.y), abs(l.x + l.y)) * 0.7071;
+      float m = ss(0.9 + aa, 0.9 - aa, arm) * step(r, 8.0);
+      vec2 rq = abs(l) - 5.6;
+      float rr = length(rq);
+      m = max(m, ss(3.4 + aa, 3.4 - aa, rr) * 0.55 + ss(0.5 + aa, 0.5 - aa, abs(rr - 3.4)) * 0.4);          // rotors
+      vec3 bc = mix(vec3(0.16, 0.17, 0.20), vec3(0.95, 0.45, 0.08), ss(3.0 + aa, 3.0 - aa, r));
+      col = mix(col * (1.0 - 0.3 * ss(12.0, 4.0, length(d - vec2(5.0, 8.0))) * vis), bc, max(m, ss(3.0 + aa, 3.0 - aa, r)) * vis);
+      col += (c1 * e1 * exp(-dot(l - vec2(0.0, 2.0), l - vec2(0.0, 2.0)) / 1.2) + c2 * e2 * exp(-dot(l + vec2(0.0, 2.0), l + vec2(0.0, 2.0)) / 1.2)) * 1.3 * vis;
+      col += (c1 * e1 + c2 * e2) * exp(-r / 10.0) * 0.16 * vis;
+    }
+    if (j.z > 0.0) {
+      vec2 dj = j.xy - u.xy;
+      float len = max(length(dj), 1.0);
+      dj /= len;
+      float al = dot(d, dj), side = dot(d, vec2(-dj.y, dj.x)), h = clamp(al / len, 0.0, 1.0);
+      float wob = sin(h * 7.0 - uTime * 7.0 + fi) * 2.5 * h, wd = 2.0 + 4.5 * h;
+      float jm = exp(-(side - wob) * (side - wob) / (wd * wd)) * ss(1.0, 5.0, al) * ss(len, len - 6.0, al);
+      col = mix(col, vec3(0.80, 0.92, 1.0), jm * 0.80 * j.z * vis * (0.85 + 0.15 * sin(al * 0.35 - uTime * 14.0)));
+      vec2 sv = p - j.xy - vec2(2.0, -7.0);
+      float steam = ss(40.0, 6.0, length(sv)) * (0.40 + 0.60 * N(p + vec2(-uTime * 9.0, uTime * 24.0), 120.0).r);
+      col = mix(col, vec3(0.70, 0.72, 0.76), steam * 0.75 * j.z * vis * ss(-24.0, -10.0, s0));
+    }
+  }
+
+  // rain: ripples on everything wet and streaks in the air
+  if (uRain > 0.0 && out0 > 0.0) {
+    float lum = dot(col, vec3(0.30, 0.55, 0.15));
+    col += (col * 1.4 + 0.008) * ripples(p) * uRain * out0;
+    float rs = rainLayer(p, vec2(9.0, 46.0), 760.0, 0.0, 0.50 * uRain) * 0.070 + rainLayer(p, vec2(23.0, 95.0), 1050.0, 7.7, 0.55 * uRain) * 0.10;
+    col += vec3(0.55, 0.68, 0.85) * rs * (0.35 + 2.4 * lum) * out0;
+  }
+  // lightning: one soft sheet of light
+  col = col * (1.0 + 0.55 * uFlash * (0.25 + 0.75 * out0)) + vec3(0.020, 0.030, 0.050) * uFlash * (0.25 + 0.75 * out0);
+
+  vec2 vg = (p / uRes - 0.5) * vec2(1.0, 0.85);
+  col *= 1.0 - 0.30 * ss(0.30, 0.72, length(vg));
+  col += (hash2(gl_FragCoord.xy) - 0.5) / 255.0;                     // dither: no banding in the dark gradients
+  o = vec4(col, 1.0);
+}`;
+
+/* ======================================================================
+   WebGL
+   ====================================================================== */
+const cv = document.getElementById('art');
+const gl = cv.getContext('webgl2', { antialias: false });
+if (!gl) document.getElementById('nogl').style.display = 'grid';
+function program(fs) {
+  const mk = (type, src) => {
+    const s = gl.createShader(type);
+    gl.shaderSource(s, src); gl.compileShader(s);
+    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) { console.error(gl.getShaderInfoLog(s)); throw new Error('shader: ' + gl.getShaderInfoLog(s)); }
+    return s;
+  };
+  const p = gl.createProgram();
+  gl.attachShader(p, mk(gl.VERTEX_SHADER, VS));
+  gl.attachShader(p, mk(gl.FRAGMENT_SHADER, fs));
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) { console.error(gl.getProgramInfoLog(p)); throw new Error('link: ' + gl.getProgramInfoLog(p)); }
+  const U = {};
+  const n = gl.getProgramParameter(p, gl.ACTIVE_UNIFORMS);
+  for (let i = 0; i < n; i++) { const nm = gl.getActiveUniform(p, i).name.replace(/\[0\]$/, ''); U[nm] = gl.getUniformLocation(p, nm); }
+  return { p, U };
+}
+const PR = program(FS);
+gl.bindVertexArray(gl.createVertexArray());
+
+let noiseTex = null;
+function buildNoiseTex() {
+  const { S, d } = makeNoiseImage();
+  noiseTex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, noiseTex);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, S, S, 0, gl.RGBA, gl.UNSIGNED_BYTE, d);
+  gl.generateMipmap(gl.TEXTURE_2D);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.REPEAT);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.REPEAT);
+}
+// two field textures (R32F, linear filtering is fine on Apple GPUs; fall back to R16F otherwise)
+const F32LIN = !!gl.getExtension('OES_texture_float_linear');
+const ftex = [null, null];
+let fromI = 0, toI = 0, FA = null, FB = null;
+let morphT0 = -1e9, morphDur = MORPH_MS, curMix = 1;
+function allocField() {
+  for (let i = 0; i < 2; i++) {
+    if (ftex[i]) gl.deleteTexture(ftex[i]);
+    ftex[i] = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, ftex[i]);
+    if (F32LIN) gl.texImage2D(gl.TEXTURE_2D, 0, gl.R32F, Gw, Gh, 0, gl.RED, gl.FLOAT, null);
+    else gl.texImage2D(gl.TEXTURE_2D, 0, gl.R16F, Gw, Gh, 0, gl.RED, gl.FLOAT, null);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  }
+}
+function uploadField(i, Fd) {
+  gl.bindTexture(gl.TEXTURE_2D, ftex[i]);
+  gl.pixelStorei(gl.UNPACK_ALIGNMENT, 4);
+  gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, Gw, Gh, gl.RED, gl.FLOAT, Fd.s);
+}
+
+let icons = [];
+const iconRects = () => icons.map(ic => ({ cx: ic.x + ic.w / 2, cy: ic.y + ic.h / 2, hw: ic.w / 2 - 4, hh: ic.h / 2 - 2 }));
+// Field currently on screen (from -> to blended by curMix): a new transition must start from it, not from the
+// previous target, or the scenery jumps when icons move again while a transition is still running.
+function blendFields(A, B, m) {
+  const out = {};
+  for (const k in B) {
+    const a = A && A[k], b = B[k];
+    if (!(b instanceof Float32Array) || !(a instanceof Float32Array) || a.length !== b.length) return null;
+    const r = new Float32Array(b.length);
+    for (let i = 0; i < b.length; i++) r[i] = a[i] + (b[i] - a[i]) * m;
+    out[k] = r;
+  }
+  return out;
+}
+function commit(fromEmpty = false) {
+  const nf = computeField(iconRects());
+  const target = 1 - toI;
+  if (fromEmpty) { FA = computeField([]); uploadField(toI, FA); }
+  else if (FA && FB && curMix < 0.999 && (FA = blendFields(FA, FB, Math.max(0, curMix)))) uploadField(toI, FA);
+  else FA = FB || nf;
+  FB = nf;
+  uploadField(target, FB);
+  fromI = toI; toI = target;
+  morphT0 = performance.now();
+  morphDur = fromEmpty ? 2600 : MORPH_MS;
+  curMix = 0;
+  cityDirty = true;
+}
+function refresh() {
+  FA = FB = computeField(iconRects());
+  uploadField(toI, FB);
+  fromI = toI; morphT0 = -1e9; curMix = 1;
+  cityDirty = true; citySnap = true;
+}
+const curS = (x, y) => FB ? sampleArr(FA.s, x, y) * (1 - curMix) + sampleArr(FB.s, x, y) * curMix : S_FAR;
+
+/* ======================================================================
+   Buildings near a plaza fold into the ground: one presence value per building, animated here
+   ====================================================================== */
+const PC0 = -2, PR0 = -2;                     // index of the first block column / row in the presence texture
+const NHOLO = 6, NFIRE = 12;
+const fireU = new Float32Array(NFIRE * 4);
+const holoU = new Float32Array(NHOLO * 4);
+let city = null, cityDirty = true, citySnap = true;
+let fireT = 0;
+function buildCity() {
+  const cols = Math.ceil(W / GX) + 5, rows = Math.ceil((H + HMAX) / GY) + 5;
+  const list = [];
+  for (let r = 0; r < rows; r++) for (let c = 0; c < cols; c++)
+    for (const b of blockBuildings(c + PC0, r + PR0)) {
+      const k1 = hash2(c * 4 + b.idx, r, 77), k2 = hash2(c * 4 + b.idx, r, 78);
+      list.push({ o: (r * cols + c) * 12 + b.idx, x0: b.x0, y0: b.y0 - b.hgt, x1: b.x1, y1: b.y1, hgt: b.hgt,
+        cx: (b.x0 + b.x1) / 2, ry: (b.y0 + b.y1) / 2 - b.hgt,          // the middle of the roof on the screen
+        a: 1, tgt: 1, burn: 0, rim: 0, fuel: k2 < 0.6, big: 0.5 + 0.8 * k1 * k1, f: 0, wet: 0, scar: 0, up: 0.7 + 0.8 * k1, k: k2, per: 34 + 50 * k1, ph: k2 * 6.2832 });
+    }
+  if (city && city.tex) gl.deleteTexture(city.tex);
+  const tex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.texStorage2D(gl.TEXTURE_2D, 1, gl.RGBA8, cols * 3, rows);         // per block: presence, fire, scar
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  // holograms float above a few of the tall towers, well apart from each other
+  const holos = [];
+  for (const b of list.slice().sort((p, q) => p.k - q.k)) {
+    if (holos.length >= NHOLO) break;
+    const w = b.x1 - b.x0, d = b.y1 - b.y0 - b.hgt, cx = (b.x0 + b.x1) / 2, fy = b.y1 - d / 2;
+    if (b.hgt < 42 || Math.min(w, d) < 34 || cx < 30 || cx > W - 30 || fy - b.hgt < 30 || fy - b.hgt > H - 30) continue;
+    if (holos.some(h => Math.hypot(h.cx - cx, h.fy - fy) < 250)) continue;
+    holos.push({ b, cx, fy, R: Math.min(40, Math.max(24, Math.min(w, d) * 0.6)) });
+  }
+  city = { cols, rows, list, tex, holos, buf: new Uint8Array(cols * 3 * rows * 4), moving: false };
+  cityDirty = true; citySnap = true;
+}
+function updateCity(dt) {
+  if (!city) return;
+  const morphing = curMix < 1;
+  const retarget = cityDirty || morphing;
+  cityDirty = morphing;
+  const df = dt * P.speed;
+  fireT += df;
+  let moving = false;
+  for (const b of city.list) {
+    if (retarget) {
+      // the roof and the wall of a building cover its footprint and a strip to the north of it
+      let m = 1e9;
+      for (let j = 0; j < 4; j++) for (let i = 0; i < 4; i++) {
+        const v = curS(b.x0 + (b.x1 - b.x0) * i / 3, b.y0 + (b.y1 - b.y0) * j / 3);
+        if (v < m) m = v;
+      }
+      b.tgt = m > RETRACT ? 1 : 0;                                    // on the zone: collapsed
+      b.rim = b.tgt ? Math.min(1, Math.max(0, (BURN - m) / 18)) : 0;  // at its rim: burnt, and some of them on fire
+      b.burn = b.fuel ? b.rim : 0;
+    }
+    // the fire of each building flares up and dies down on its own slow rhythm; water knocks it down for a while
+    const cyc = sstep(-0.35, 0.6, Math.sin(fireT * 6.2832 / b.per + b.ph));
+    const ft = b.burn * (0.35 + 0.65 * cyc) * (1 - 0.7 * b.wet);
+    const hot = () => b.f > 0.12 || b.a < 0.6 || b.rim > 0.3;
+    if (citySnap) { b.a = b.tgt; b.f = ft; b.scar = hot() ? 1 : 0; }
+    else {
+      if (b.a !== b.tgt) {
+        // collapse is quick; the city takes its time to put a building back
+        b.a = Math.min(1, Math.max(0, b.a + (b.tgt > b.a ? dt / (4 * b.up) : -dt / 0.55)));
+        if (b.a !== b.tgt) moving = true;
+      }
+      b.f += Math.max(-df * 0.6, Math.min(df * 0.35, ft - b.f));
+      b.wet = Math.max(0, b.wet - df / 22);
+      b.scar = hot() ? Math.min(1, b.scar + dt * 0.6) : Math.max(0, b.scar - df / 40);
+    }
+    city.buf[b.o] = Math.round(b.a * 255);
+    city.buf[b.o + 4] = Math.round(b.f * 255);
+    city.buf[b.o + 8] = Math.round(b.scar * 255);
+  }
+  citySnap = false;
+  city.moving = moving;
+  // the strongest fires get flames, light and smoke
+  fireU.fill(0);
+  city.list.filter(b => b.f > 0.04 && b.a > 0.5 && b.cx > -40 && b.cx < W + 40 && b.ry > -40 && b.ry < H + 70).sort((p, q) => q.f * q.big - p.f * p.big).slice(0, NFIRE).forEach((b, i) =>
+    fireU.set([b.cx, b.ry, Math.floor((b.x1 - b.x0) / 2) + b.k * 0.99, Math.min(1.25, b.f * (0.4 + 0.75 * b.big))], i * 4));
+  holoU.fill(0);
+  city.holos.forEach((h, i) => { const e = h.b.a * h.b.a * (3 - 2 * h.b.a); holoU.set([h.cx, h.fy - h.b.hgt * e, h.R, e * (1 - h.b.scar)], i * 4); });
+  gl.bindTexture(gl.TEXTURE_2D, city.tex);
+  gl.pixelStorei(gl.UNPACK_ALIGNMENT, 4);
+  gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, city.cols * 3, city.rows, gl.RGBA, gl.UNSIGNED_BYTE, city.buf);
+}
+
+/* ======================================================================
+   Emergency units: fire engines, police and ambulances drive in along the streets, drones fly in; all stop at the
+   rim of a zone. Engines and drones spray the burning building nearest to them, then move on.
+   ====================================================================== */
+const NUNIT = 8;
+const unitU = new Float32Array(NUNIT * 4).fill(-1), jetU = new Float32Array(NUNIT * 4);
+let units = [], unitNext = 0;
+const tS = (x, y) => FB ? sampleArr(FB.s, x, y) : S_FAR;          // the field the scene is heading for
+const ctrX = c => { const e = edgeX(c); return (e[0] + e[1]) / 2; }, ctrY = r => { const e = edgeY(r); return (e[0] + e[1]) / 2; };
+function dispatch(kind) {
+  if (!icons.length) return null;
+  const ic = icons[(Math.random() * icons.length) | 0], cx = ic.x + ic.w / 2, cy = ic.y + ic.h / 2;
+  const u = { kind, mode: 'go', v: 0, jet: 0, tgt: null, idle: 0, workT: 0, stay: 45 + Math.random() * 70, pick: 0 };
+  if (kind === 3) {
+    // a drone flies in along a ray that points away from the icon and hovers just outside the zone
+    const ang = Math.random() * 6.2832, ux = Math.cos(ang), uy = Math.sin(ang);
+    let d = 30;
+    while (d < 500 && tS(cx + ux * d, cy + uy * d) < 12) d += 6;
+    u.hx = cx + ux * d; u.hy = cy + uy * d;
+    if (u.hx < 20 || u.hx > W - 20 || u.hy < 20 || u.hy > H - 20) return null;
+    let e = d;
+    while (e < 4000) { const x = cx + ux * e, y = cy + uy * e; if (x < -40 || x > W + 40 || y < -40 || y > H + 40) break; e += 20; }
+    u.x = cx + ux * e; u.y = cy + uy * e; u.ox = u.x; u.oy = u.y; u.hd = 0;
+    return u;
+  }
+  // a street that passes the icon; the unit drives along it from one end of the screen
+  u.vert = true;                                                // north-south streets only: roofs never hide them there
+  const off = ((Math.random() * 3) | 0) - 1;
+  if (u.vert) {
+    u.line = ctrX(Math.round(cx / GX) + off);
+    if (u.line < 8 || u.line > W - 8) return null;
+    u.dir = Math.random() < 0.5 ? 1 : -1; u.pos = u.dir > 0 ? -30 : H + 30; u.goal = cy;
+  } else {
+    u.line = ctrY(Math.round(cy / GY) + off);
+    if (u.line < 8 || u.line > H - 8) return null;
+    u.dir = Math.random() < 0.5 ? 1 : -1; u.pos = u.dir > 0 ? -30 : W + 30; u.goal = cx;
+  }
+  placeUnit(u);
+  return u;
+}
+function placeUnit(u) {                                           // right-hand traffic: keep to the right of the centre line
+  if (u.vert) { u.x = u.line - 1.5 * u.dir; u.y = u.pos; u.hd = u.dir > 0 ? Math.PI / 2 : -Math.PI / 2; }
+  else { u.x = u.pos; u.y = u.line + 3.2 * u.dir; u.hd = u.dir > 0 ? 0 : Math.PI; }
+}
+function burningNear(u, R) {
+  let best = null, bf = 0.2;
+  for (const b of city.list) {
+    if (b.f <= bf || b.wet > 0.85) continue;
+    if (Math.hypot(b.cx - u.x, b.ry - u.y) < R) { best = b; bf = b.f; }
+  }
+  return best;
+}
+function stepUnit(u, d) {
+  const sprays = u.kind === 0 || u.kind === 3, reach = u.kind === 3 ? 100 : 150;
+  if (u.mode === 'go') {
+    if (u.kind === 3) {
+      const dx = u.hx - u.x, dy = u.hy - u.y, dist = Math.hypot(dx, dy);
+      if (dist < 3 || tS(u.hx, u.hy) < 8) u.mode = dist < 3 ? 'work' : 'leave';
+      else { const st = Math.min(dist, (30 + Math.min(60, dist)) * d); u.x += dx / dist * st; u.y += dy / dist * st; }
+    } else {
+      // stop where the zone begins, or beside it if the street passes it and something burns within reach
+      const ax = u.vert ? u.x : u.x + u.dir * 36, ay = u.vert ? u.y + u.dir * 36 : u.y;
+      const passed = (u.pos - u.goal) * u.dir > 0;
+      if (tS(ax, ay) < 30) u.mode = 'work';
+      else if (passed && burningNear(u, reach)) u.mode = 'work';
+      else if (passed && (u.pos - u.goal) * u.dir > 160) u.mode = 'leave';
+      u.v += ((u.mode === 'go' ? 46 : 0) - u.v) * Math.min(1, d * 3);
+      u.pos += u.dir * u.v * d;
+      placeUnit(u);
+    }
+  } else if (u.mode === 'work') {
+    u.v *= Math.max(0, 1 - d * 4);
+    if (u.kind !== 3) { u.pos += u.dir * u.v * d; placeUnit(u); }
+    else { u.x = u.hx + Math.sin(u.workT * 0.9) * 2; u.y = u.hy + Math.cos(u.workT * 0.7) * 2; }   // hovering
+    u.workT += d;
+    if (sprays) {
+      u.pick -= d;
+      if (u.pick <= 0 || (u.tgt && u.tgt.burn <= 0)) { u.pick = 1.5; const b = burningNear(u, reach); if (b || !u.tgt || u.tgt.burn <= 0) u.tgt = b; }
+      if (u.tgt) { u.tgt.wet = Math.min(1, u.tgt.wet + d * 0.40); u.idle = 0; } else u.idle += d;
+      u.jet += ((u.tgt ? 1 : 0) - u.jet) * Math.min(1, d * 2.5);
+      if (u.tgt) { u.jx = u.tgt.cx; u.jy = u.tgt.ry; }
+    }
+    // done here: nothing left to do for a while, the shift is over, or the zone has moved away
+    const gone = tS(u.x, u.y) > 55 && !burningNear(u, reach + 60);
+    if ((sprays && u.idle > 8) || u.workT > u.stay || (gone && u.workT > 3)) { u.mode = 'leave'; u.tgt = null; if (u.kind !== 3) u.dir = -u.dir; }
+  } else {
+    u.jet *= Math.max(0, 1 - d * 3);
+    if (u.kind === 3) {
+      const dx = u.ox - u.x, dy = u.oy - u.y, dist = Math.hypot(dx, dy) || 1, st = 70 * d;
+      if (dist < st) return false;
+      u.x += dx / dist * st; u.y += dy / dist * st;
+    } else {
+      u.v += (46 - u.v) * Math.min(1, d * 2);
+      u.pos += u.dir * u.v * d;
+      placeUnit(u);
+      if (u.pos < -40 || u.pos > (u.vert ? H : W) + 40) return false;
+    }
+  }
+  return tS(u.x, u.y) > 2;                                        // an icon was dropped on it: gone
+}
+function stepUnits(dt, sp) {
+  const d = dt * sp;
+  const nDrone = icons.length ? Math.min(2, Math.round(1.2 * P.units)) : 0, nGround = icons.length ? Math.min(NUNIT - nDrone, Math.round(4 * P.units)) : 0;
+  const drones = units.filter(u => u.kind === 3).length, ground = units.length - drones;
+  unitNext -= d;
+  if (unitNext <= 0 && FB && (ground < nGround || drones < nDrone)) {
+    const kind = drones < nDrone && (ground >= nGround || Math.random() < 0.3) ? 3 : [0, 0, 1, 0, 2, 0][(Math.random() * 6) | 0];
+    const u = dispatch(kind);
+    if (u) {
+      if (LIFETEST) for (let i = 0; i < 900 && u.mode === 'go'; i++) stepUnit(u, 0.1);     // already on site
+      if (!LIFETEST || u.mode === 'work') units.push(u);
+    }
+    unitNext = LIFETEST ? 0 : 1.5 + Math.random() * 3.5;
+  }
+  if (ground > nGround || drones > nDrone) { const u = units.find(u => u.mode !== 'leave' && (u.kind === 3 ? drones > nDrone : ground > nGround)); if (u) { u.mode = 'leave'; u.tgt = null; if (u.kind !== 3 ) u.dir = -u.dir; } }
+  units = units.filter(u => stepUnit(u, d));
+  unitU.fill(-1); jetU.fill(0);
+  units.slice(0, NUNIT).forEach((u, i) => {
+    const vis = sstep(0, 14, curS(u.x, u.y));
+    unitU.set([u.x, u.y, u.hd, u.kind + 0.98 * vis], i * 4);
+    if (u.jet > 0.02 && u.jx !== undefined) jetU.set([u.jx, u.jy, u.jet, 0], i * 4);
+  });
+}
+
+/* ======================================================================
+   Palettes: two neon colours, an accent, the haze
+   ====================================================================== */
+const PALS = [
+  [[0.10, 0.90, 1.00], [1.00, 0.18, 0.70], [1.00, 0.66, 0.16], [0.42, 0.20, 0.75]],    // neon: cyan, magenta, amber
+  [[0.55, 1.00, 0.20], [1.00, 0.92, 0.16], [0.10, 0.95, 0.75], [0.10, 0.50, 0.38]],    // acid: green, yellow, teal
+  [[1.00, 0.52, 0.14], [1.00, 0.20, 0.52], [0.66, 0.42, 1.00], [0.62, 0.20, 0.42]],    // sunset: orange, hot pink, violet
+];
+let pal = null;
+function stepPalette(dt) {
+  const t = PALS[Math.min(PALS.length - 1, Math.max(0, Math.round(P.palette)))];
+  if (!pal) { pal = t.map(c => c.slice()); return; }
+  const k = Math.min(1, dt * 2.5);
+  for (let i = 0; i < 4; i++) for (let j = 0; j < 3; j++) pal[i][j] += (t[i][j] - pal[i][j]) * k;
+}
+
+/* ======================================================================
+   Life: flying cars between the plazas, lightning, glitches
+   ====================================================================== */
+const NCAR = 5;
+const carU = new Float32Array(NCAR * 4), trailU = new Float32Array(NCAR * 4);
+let cars = [], carNext = 0;
+function pickTarget() {
+  // usually the rim of a plaza (the car slows down and hovers there for a while), sometimes just somewhere over the city
+  if (icons.length && Math.random() < 0.8) {
+    const ic = icons[(Math.random() * icons.length) | 0];
+    const cx = ic.x + ic.w / 2, cy = ic.y + ic.h / 2, ang = Math.random() * 6.2832;
+    let d = 40;
+    while (d < 520 && curS(cx + Math.cos(ang) * d, cy + Math.sin(ang) * d) < 36) d += 10;
+    const x = cx + Math.cos(ang) * d, y = cy + Math.sin(ang) * d;
+    if (x > 24 && x < W - 24 && y > 24 && y < H - 24) return { x, y, hover: 2 + Math.random() * 4 };
+  }
+  return { x: W * (0.08 + 0.84 * Math.random()), y: H * (0.08 + 0.84 * Math.random()), hover: 0 };
+}
+function spawnCar(inside) {
+  let x, y, hd;
+  if (inside) { x = W * (0.2 + 0.6 * Math.random()); y = H * (0.2 + 0.6 * Math.random()); hd = Math.random() * 6.2832; }
+  else {
+    const side = (Math.random() * 4) | 0, u = 0.15 + 0.7 * Math.random();
+    if (side === 0) { x = -60; y = H * u; hd = 0; }
+    else if (side === 1) { x = W + 60; y = H * u; hd = Math.PI; }
+    else if (side === 2) { x = W * u; y = -60; hd = Math.PI / 2; }
+    else { x = W * u; y = H + 60; hd = -Math.PI / 2; }
+  }
+  return { x, y, hd, v: 40, vmax: 58 + Math.random() * 30, tgt: pickTarget(), hoverT: 0, leave: false, a: inside ? 0 : 1, t1: [x, y], t2: [x, y] };
+}
+function stepCars(dt, sp) {
+  const want = Math.min(NCAR, Math.round(P.traffic * 3));
+  if (cars.length > want) cars.forEach((c, i) => { if (i >= want) c.leave = true; });
+  carNext -= dt * sp;
+  if (cars.filter(c => !c.leave).length < want && carNext <= 0) { cars.push(spawnCar(LIFETEST && cars.length < want)); carNext = LIFETEST ? 0 : 1.5 + Math.random() * 3; }
+  const d = dt * sp;
+  cars = cars.filter(c => {
+    if (c.leave && !c.tgt.exit) {
+      // fly straight out of the nearest side
+      const ex = c.x < W / 2 ? -90 : W + 90;
+      c.tgt = { x: ex, y: c.y + (Math.random() - 0.5) * 200, hover: 0, exit: true };
+    }
+    let dx = c.tgt.x - c.x, dy = c.tgt.y - c.y;
+    const dist = Math.hypot(dx, dy) || 1;
+    dx /= dist; dy /= dist;
+    // keep clear of the plazas: look ahead and steer along the field gradient when one comes close
+    const ax = c.x + Math.cos(c.hd) * 46, ay = c.y + Math.sin(c.hd) * 46;
+    const sHere = curS(c.x, c.y), m = Math.min(sHere, curS(ax, ay));
+    if (m < 46) {
+      const qx = sHere < 20 ? c.x : ax, qy = sHere < 20 ? c.y : ay;
+      const gx = curS(qx + 6, qy) - curS(qx - 6, qy), gy = curS(qx, qy + 6) - curS(qx, qy - 6);
+      const gl2 = Math.hypot(gx, gy) || 1, k = (46 - m) / 46 * 3.2;
+      dx += gx / gl2 * k; dy += gy / gl2 * k;
+    }
+    let dh = Math.atan2(dy, dx) - c.hd;
+    dh = Math.atan2(Math.sin(dh), Math.cos(dh));
+    const tr = 1.5 * d;
+    c.hd += Math.max(-tr, Math.min(tr, dh));
+    let vt = c.vmax * (c.tgt.hover && dist < 90 ? Math.max(0.1, dist / 90) : 1);
+    vt *= 1 - 0.5 * Math.min(1, Math.abs(dh) / 1.5);
+    c.v += (vt - c.v) * Math.min(1, d * 1.5);
+    c.x += Math.cos(c.hd) * c.v * d; c.y += Math.sin(c.hd) * c.v * d;
+    // the light trail: two points that follow the car with a delay
+    const k1 = Math.min(1, d / 0.42);
+    c.t1[0] += (c.x - c.t1[0]) * k1; c.t1[1] += (c.y - c.t1[1]) * k1;
+    c.t2[0] += (c.t1[0] - c.t2[0]) * k1; c.t2[1] += (c.t1[1] - c.t2[1]) * k1;
+    // never visible over a plaza (an icon may be dropped right under a car)
+    c.a = Math.min(1, c.a + d * 1.2);
+    if (dist < 28 || (c.tgt.hover && curS(c.tgt.x, c.tgt.y) < 20)) {
+      c.hoverT += d;
+      if (c.hoverT >= c.tgt.hover) {
+        c.hoverT = 0;
+        if (c.tgt.exit) return false;
+        if (Math.random() < 0.25) c.leave = true; else c.tgt = pickTarget();
+      }
+    }
+    if (c.tgt.exit && (c.x < -80 || c.x > W + 80 || c.y < -80 || c.y > H + 80)) return false;
+    return true;
+  });
+  carU.fill(0); trailU.fill(0);
+  cars.slice(0, NCAR).forEach((c, i) => {
+    const vis = c.a * sstep(-4, 18, curS(c.x, c.y));
+    carU.set([c.x, c.y, c.hd, vis], i * 4);
+    trailU.set([c.t1[0], c.t1[1], c.t2[0], c.t2[1]], i * 4);
+  });
+}
+// lightning and glitches
+let flash = 0, flashT0 = -1e9, flashNext = 40 + Math.random() * 60;
+let glU = [0, 0, 0, 0], glT0 = -1e9, glDur = 0.25, glNext = 20 + Math.random() * 30;
+function stepFx(t, sp) {
+  // lightning: two soft pulses, only while it rains
+  if (t > flashNext && P.rain > 0.05 && sp > 0) { flashT0 = t; flashNext = t + 50 + Math.random() * 80; }
+  const x = t - flashT0;
+  flash = x < 1.6 ? 0.75 * (sstep(0, 0.07, x) * Math.exp(-x / 0.20) + 0.6 * sstep(0.33, 0.40, x) * Math.exp(-Math.max(x - 0.33, 0) / 0.28)) : 0;
+  if (FLASHTEST) flash = 0.7;
+  // glitch: rarer and weaker at low settings, never at zero
+  const g = P.glitch;
+  if (t > glNext && g > 0.01 && sp > 0) {
+    glT0 = t; glDur = 0.16 + 0.26 * g * Math.random();
+    glNext = t + lerp(110, 7, Math.sqrt(g)) * (0.6 + 0.8 * Math.random());
+  }
+  const y = (t - glT0) / glDur;
+  if ((y >= 0 && y < 1 && g > 0.01) || GLITCHTEST) {
+    const env = GLITCHTEST ? 1 : Math.sin(Math.PI * y);
+    glU = [env, Math.floor(t * 16) % 997, 3 + 15 * g, 0.8 + 3.2 * g];
+  } else glU = [0, 0, 0, 0];
+}
+
+/* ======================================================================
+   Frame loop
+   ====================================================================== */
+function resize() {
+  W = innerWidth; H = innerHeight;
+  const scale = PREVIEW ? 0.45 : Math.min(devicePixelRatio || 1, P.quality);
+  const box = cv.getBoundingClientRect();
+  cv.width = Math.round((box.width || W) * scale); cv.height = Math.round((box.height || H) * scale); cv._scale = scale;
+  Gw = Math.ceil(W / STEP) + 2; Gh = Math.ceil(H / STEP) + 2;
+  buildNoise();
+  allocField();
+  buildCity();
+  cars = []; units = [];
+}
+
+const T0 = performance.now();
+let lastT = 0, fpsEMA = 0, frameN = 0, frameMs = 0, lifeT = 0, animT = 0;
+let paused = false;
+function frame(now) {
+  requestAnimationFrame(frame);
+  if (paused) { lastT = 0; return; }
+  if (P.cap30 && now - lastT < 31) return;
+  const dt = lastT ? Math.min((now - lastT) / 1000, 0.1) : 0.03;
+  if (lastT) fpsEMA = fpsEMA ? fpsEMA * 0.9 + (1 / dt) * 0.1 : 1 / dt;
+  lastT = now;
+  lifeT += dt;
+  animT += dt * P.speed;
+  stepPalette(dt);
+  stepCars(dt, P.speed);
+  stepUnits(dt, P.speed);
+  stepFx(lifeT, P.speed);
+  draw(now, dt);
+  frameN++;
+}
+function draw(now, dt = 0) {
+  const t0 = performance.now();
+  const e = Math.min(Math.max((now - morphT0) / morphDur, 0), 1);
+  curMix = e < 0.5 ? 2 * e * e : 1 - Math.pow(-2 * e + 2, 2) / 2;
+  if (!pal) stepPalette(1);
+  updateCity(dt);
+  const { p, U } = PR;
+  gl.useProgram(p);
+  gl.viewport(0, 0, cv.width, cv.height);
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, noiseTex);
+  gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, ftex[fromI]);
+  gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D, ftex[toI]);
+  gl.activeTexture(gl.TEXTURE3); gl.bindTexture(gl.TEXTURE_2D, city.tex);
+  gl.uniform1i(U.uNoise, 0); gl.uniform1i(U.uFA, 1); gl.uniform1i(U.uFB, 2); gl.uniform1i(U.uPres, 3);
+  gl.uniform2f(U.uRes, cv.width / cv._scale, cv.height / cv._scale);
+  gl.uniform2f(U.uGrid, Gw, Gh);
+  gl.uniform2i(U.uPOff, -PC0, -PR0);
+  gl.uniform2i(U.uPMax, city.cols - 1, city.rows - 1);
+  gl.uniform1f(U.uScale, cv._scale);
+  gl.uniform1f(U.uSeed, (seed % 997) * 0.37);
+  gl.uniform1ui(U.uSeedU, (seed | 0) >>> 0);
+  gl.uniform1f(U.uStep, STEP);
+  gl.uniform1f(U.uMix, curMix);
+  gl.uniform1f(U.uTime, animT % 3600);
+  gl.uniform1f(U.uRainT, animT % 60);
+  gl.uniform1f(U.uTraffic, P.traffic);
+  gl.uniform1f(U.uRain, P.rain);
+  gl.uniform1f(U.uFlash, flash);
+  gl.uniform3fv(U.uA, pal[0]); gl.uniform3fv(U.uB, pal[1]); gl.uniform3fv(U.uC, pal[2]); gl.uniform3fv(U.uHaze, pal[3]);
+  gl.uniform4fv(U.uGl, glU);
+  gl.uniform4fv(U.uCar, carU);
+  gl.uniform4fv(U.uTrail, trailU);
+  gl.uniform4fv(U.uHolo, holoU);
+  gl.uniform4fv(U.uFire, fireU);
+  gl.uniform4fv(U.uUnit, unitU);
+  gl.uniform4fv(U.uJet, jetU);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+  frameMs = performance.now() - t0;
+}
+
+/* ======================================================================
+   Settings / hosted mode
+   ====================================================================== */
+let iconsSeen = !(WALL || PREVIEW);
+function reseed(v) {
+  seed = v; buildCity(); cars = []; units = [];
+  if (!iconsSeen) { refresh(); return; }
+  commit(true);
+}
+function applySettings(v) {
+  if (typeof v.seed === 'number' && v.seed !== seed) reseed(v.seed);
+  let field = false;
+  for (const k in v) {
+    if (!KEYS[k] || typeof v[k] !== 'number' || !isFinite(v[k]) || P[k] === v[k]) continue;
+    const [lo, hi] = KEYS[k];
+    let x = Math.min(Math.max(v[k], lo), hi);
+    if (k === 'palette') x = Math.round(x);
+    P[k] = x;
+    if (k === 'sigma') field = true;
+  }
+  if (field && FB) commit();                      // plaza size: smooth transition too
+}
+function drawGhosts() {
+  const box = document.getElementById('ghosts');
+  if (box) box.innerHTML = icons.map(ic => `<div class="ghost" style="left:${ic.x}px;top:${ic.y}px;width:${ic.w}px;height:${ic.h}px"><i></i><b></b></div>`).join('');
+}
+function startHostedMode() {
+  if (PREVIEW) {
+    document.body.classList.add('preview');
+    const g = document.createElement('div'); g.id = 'ghosts'; document.body.appendChild(g);
+  }
+  icons = [];
+  refresh();                                     // the whole city until we know where the icons are
+  let first = true;
+  const handle = m => {
+    if (!m || typeof m !== 'object') return;
+    if (m.t === 'pause') { paused = PREVIEW ? false : !!m.v; return; }
+    if (m.t === 'settings') { applySettings(m.v || {}); return; }
+    if (m.t === 'reset') { applySettings(Object.assign({}, DEFAULTS, m.v || {})); return; }
+    if (m.t !== 'icons') return;
+    const k = window.devicePixelRatio || 1;       // physical -> CSS pixels
+    icons = m.vis && Array.isArray(m.r) ? m.r.map(([l, t, r, b]) => ({ x: l / k, y: t / k, w: (r - l) / k, h: (b - t) / k })) : [];
+    if (PREVIEW) drawGhosts();
+    iconsSeen = true;
+    commit(first);                                // first time: the fire breaks out; later: it moves with the icons
+    if (first) unitNext = 0;                      // and the first units are sent out at once
+    first = false;
+  };
+  if (PREVIEW) {
+    addEventListener('message', ev => { if (ev.source === parent) { try { handle(typeof ev.data === 'string' ? JSON.parse(ev.data) : ev.data); } catch (e) {} } });
+    parent.postMessage(JSON.stringify({ t: 'ready' }), '*');
+    return;
+  }
+  const host = window.chrome && window.chrome.webview;
+  if (!host) return;
+  host.addEventListener('message', ev => { try { handle(JSON.parse(ev.data)); } catch (e) { console.error(e); } });
+  host.postMessage('ready');
+}
+function startDemo() {
+  // plain browser: a column of icons on the right and a few scattered ones
+  const list = [];
+  for (let r = 0; r < 6; r++) list.push({ x: W - 90, y: 10 + r * 100, w: 76, h: 92 });
+  list.push({ x: W * 0.22, y: H * 0.3, w: 76, h: 92 }, { x: W * 0.45, y: H * 0.62, w: 76, h: 92 }, { x: W * 0.52, y: H * 0.18, w: 76, h: 92 });
+  icons = list;
+  commit(true);
+}
+
+let resizeT = 0;
+addEventListener('resize', () => {
+  clearTimeout(resizeT);
+  resizeT = setTimeout(() => { resize(); refresh(); }, 100);
+});
+
+window.__dbg = { P, stats: () => ({ fieldMs, frameMs, fps: fpsEMA, cars: cars.length, units: units.map(u => u.kind + u.mode), moving: city && city.moving }) };
+resize();
+buildNoiseTex();
+if (WALL || PREVIEW) startHostedMode();
+else startDemo();
+requestAnimationFrame(frame);
+</script>
+<script src="share.js"></script>
+</body>
+</html>

@@ -1,0 +1,1252 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Iconland · Block World</title>
+<!--
+  Iconland · Block World theme (a blocky pixel-art world; pure WebGL2, one full-screen pass)
+  - The world is a small map of blocks (16 px each, 8x8 chunky texels) built on the CPU whenever the icons change:
+    lakes with sand shores, grass terraces, stone and snow on the high ground, cubic trees, boulders, and around the
+    icons a flat calm lawn ringed with a gravel walk and lantern posts. Neighbouring clearings are joined by dirt
+    paths with plank bridges over the water.
+  - Every block is a column with a height level. The shader draws the columns slightly from the south (each level
+    lifts a column by half a block), so every step shows its south wall; block patterns are generated per texel from
+    hashes, with lit north/west edges and short shadows to the south and east.
+  - When icons move the world is rebuilt block by block, not cross-faded: every changed block flips from the old map
+    to the new one at its own moment, sweeping outward from the icons that moved, with a short highlight.
+  - Life: sheep, cows, pigs and hens wander over the meadows (tiny sprites drawn from text art), square cloud
+    shadows drift across the land, the water shimmers, and the light follows the local clock: at night the lanterns
+    light the clearings in stepped block-light.
+-->
+<style>
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #4f8f3a; }
+  #art { position: fixed; inset: 0; width: 100vw; height: 100vh; display: block; }
+  /* preview mode (?preview=1, settings window): translucent boxes show where the real icons are */
+  #ghosts { position: fixed; inset: 0; pointer-events: none; display: none; }
+  body.preview #ghosts { display: block; }
+  .ghost { position: absolute; }
+  .ghost i { position: absolute; left: 50%; top: 4px; width: 48px; height: 48px; margin-left: -24px; border-radius: 9px;
+    background: rgba(255,255,255,.55); box-shadow: 0 1px 3px rgba(0,0,0,.25); }
+  .ghost b { position: absolute; left: 14%; right: 14%; top: 60px; height: 10px; border-radius: 5px; background: rgba(255,255,255,.75); }
+  #nogl { position: fixed; inset: 0; display: none; place-items: center; color: #fff; font: 16px system-ui, sans-serif; }
+</style>
+</head>
+<body>
+<canvas id="art"></canvas>
+<div id="nogl">WebGL2 is not available.</div>
+<script>
+'use strict';
+
+/* ======================================================================
+   Parameters
+   ====================================================================== */
+const CELL_W = 76, CELL_H = 100, GRID_X0 = 4, GRID_Y0 = 6, TASKBAR = 0;
+const BLOCK = 16;                        // CSS px per block
+const TPB = 8;                           // texels along one side of a block
+const TEXEL = BLOCK / TPB;               // CSS px per texel
+const LV = 4;                            // texels a column rises on screen per height level
+const L0 = 2;                            // height level of the clearings: drawn exactly where the icons are
+const MAXH = 8;                          // tallest column (a big tree on a hill)
+const PADX = 2, PADT = 2, PADB = 5;      // extra map blocks around the screen (tall columns lean in from the south)
+const MORPH_MS = 2200;                   // rebuilding after a move
+const GROW_MS = 3000;                    // building the clearings for the first time
+const FLASH = 0.07;                      // how long a freshly placed block stays highlighted (fraction of the rebuild)
+const S_FAR = 400;                       // field clamp far from every icon
+const RELIEF = 0.5;                      // how much of the land is hills and mountains (0..1)
+
+const QS = new URLSearchParams(location.search);
+const WALL = QS.has('wallpaper');        // real desktop: messages from the host
+const PREVIEW = QS.has('preview');       // settings window preview (iframe): messages from the parent page
+const LIFETEST = QS.has('lifetest');     // debug: put the animals in the middle of the view right away
+// Defaults must match themes.json
+const P = {
+  sigma: 68,        // clearing size around the icons (px)
+  trees: 0.5,       // how much of the land is forest
+  water: 0.5,       // how much of the world is lakes
+  animals: 6,       // sheep, cows, pigs and hens on the meadows
+  tod: 0,           // time of day: 0 auto (local clock), 1 day, 2 sunset, 3 night
+  speed: 1,         // animation speed
+  quality: 2, cap30: true,
+};
+const DEFAULTS = Object.assign({}, P);
+const KEYS = { sigma: [40, 200], trees: [0, 1], water: [0, 1], animals: [0, 12], tod: [0, 3], speed: [0, 3] };
+if (QS.has('nocap')) P.cap30 = false;    // debug: report the real frame rate
+
+// block types
+const WATER = 0, SAND = 1, GRASS = 2, LAWN = 3, RIM = 4, PATH = 5, STONE = 6, SNOW = 7, LEAF = 8, PLANK = 9, ROOF = 10, FIELD = 11;
+
+/* ======================================================================
+   Random / noise helpers (CPU)
+   ====================================================================== */
+let seed = (Math.random() * 1e6) | 0;
+function hash2(x, y, k = 0) {
+  let h = Math.imul(x | 0, 374761393) ^ Math.imul(y | 0, 668265263) ^ Math.imul(seed + k, 2246822519);
+  h = Math.imul(h ^ (h >>> 13), 1274126177);
+  return ((h ^ (h >>> 16)) >>> 0) / 4294967296;
+}
+function vnoise(x, y, k = 0) {
+  const ix = Math.floor(x), iy = Math.floor(y), fx = x - ix, fy = y - iy;
+  const ux = fx * fx * (3 - 2 * fx), uy = fy * fy * (3 - 2 * fy);
+  const a = hash2(ix, iy, k), b = hash2(ix + 1, iy, k), c = hash2(ix, iy + 1, k), d = hash2(ix + 1, iy + 1, k);
+  return a + (b - a) * ux + (c - a) * uy + (a - b - c + d) * ux * uy;
+}
+function fbm(x, y, k = 0) {
+  let a = 0.5, s = 0;
+  for (let i = 0; i < 4; i++) { s += a * vnoise(x, y, k + i * 7); x = x * 2.03 + 17.1; y = y * 2.03 + 17.1; a *= 0.5; }
+  return s;
+}
+// Tileable value noise (fixed, not seeded): the cloud-shadow pattern
+function tileNoise(x, y, px, py, k) {
+  const ix = Math.floor(x), iy = Math.floor(y), fx = x - ix, fy = y - iy;
+  const ux = fx * fx * (3 - 2 * fx), uy = fy * fy * (3 - 2 * fy);
+  const m = (v, p) => ((v % p) + p) % p;
+  const x0 = m(ix, px), x1 = m(ix + 1, px), y0 = m(iy, py), y1 = m(iy + 1, py);
+  const h = (a, b) => { let v = Math.imul(a, 374761393) ^ Math.imul(b, 668265263) ^ Math.imul(k, 2246822519); v = Math.imul(v ^ (v >>> 13), 1274126177); return ((v ^ (v >>> 16)) >>> 0) / 4294967296; };
+  const a = h(x0, y0), b = h(x1, y0), c = h(x0, y1), d = h(x1, y1);
+  return a + (b - a) * ux + (c - a) * uy + (a - b - c + d) * ux * uy;
+}
+const sstep = (a, b, x) => { const t = Math.min(Math.max((x - a) / (b - a), 0), 1); return t * t * (3 - 2 * t); };
+const lerp = (a, b, t) => a + (b - a) * t;
+
+/* ======================================================================
+   The block map (CPU). Map coordinates = world block coordinates + (PADX, PADT).
+   ====================================================================== */
+let W = innerWidth, H = innerHeight, Mw = 1, Mh = 1, NZ = null;
+const idx = (mx, my) => my * Mw + mx;
+// rank of every value among all of them (0..1): thresholds on ranks are area fractions, so every seed and every
+// screen size gets the same share of water, meadow, forest and mountain
+function rankOf(a) {
+  const n = a.length, order = Array.from({ length: n }, (_, i) => i).sort((p, q) => a[p] - a[q]), r = new Float32Array(n);
+  for (let i = 0; i < n; i++) r[order[i]] = i / n;
+  return r;
+}
+function buildNoise() {
+  const N = Mw * Mh, el = new Float32Array(N), fo = new Float32Array(N), bi = new Float32Array(N), fl = new Float32Array(N), rnd = new Uint8Array(N);
+  for (let my = 0; my < Mh; my++) for (let mx = 0; mx < Mw; mx++) {
+    const i = idx(mx, my), x = mx - PADX, y = my - PADT;
+    el[i] = 0.62 * fbm(x * 0.021, y * 0.021, 1) + 0.38 * fbm(x * 0.065, y * 0.065, 2);
+    fo[i] = fbm(x * 0.06, y * 0.06, 9);
+    bi[i] = fbm(x * 0.022, y * 0.022, 21);
+    fl[i] = fbm(x * 0.11, y * 0.11, 33);
+    rnd[i] = (hash2(x, y, 50) * 256) | 0;
+  }
+  // a light blur of the elevation: terraces with long clean edges instead of single-block specks
+  const sm = new Float32Array(N);
+  for (let my = 0; my < Mh; my++) for (let mx = 0; mx < Mw; mx++) {
+    let a = 0, c = 0;
+    for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+      const nx = mx + dx, ny = my + dy;
+      if (nx >= 0 && ny >= 0 && nx < Mw && ny < Mh) { a += el[idx(nx, ny)]; c++; }
+    }
+    sm[idx(mx, my)] = a / c;
+  }
+  NZ = { rank: rankOf(sm), forest: rankOf(fo), biome: rankOf(bi), flower: rankOf(fl), rnd };
+}
+// s = signed distance to the edge of the clearings (<0 inside), at block centres
+let fieldMs = 0;
+function computeField(rects) {
+  const N = Mw * Mh, f1 = new Float32Array(N), s = new Float32Array(N);
+  const sig = P.sigma, is1 = 1 / (sig * sig);
+  for (const r of rects) {
+    const R = 5.5 * sig + Math.max(r.hw, r.hh);
+    const x0 = Math.max(0, Math.floor((r.cx - R) / BLOCK) + PADX), x1 = Math.min(Mw - 1, Math.ceil((r.cx + R) / BLOCK) + PADX);
+    const y0 = Math.max(0, Math.floor((r.cy - R) / BLOCK) + PADT), y1 = Math.min(Mh - 1, Math.ceil((r.cy + R) / BLOCK) + PADT);
+    const chw = r.hw * 0.6, chh = r.hh * 0.6;
+    for (let my = y0; my <= y1; my++) for (let mx = x0; mx <= x1; mx++) {
+      let dx = Math.abs((mx - PADX + 0.5) * BLOCK - r.cx) - chw, dy = Math.abs((my - PADT + 0.5) * BLOCK - r.cy) - chh;
+      if (dx < 0) dx = 0; if (dy < 0) dy = 0;
+      f1[my * Mw + mx] += Math.exp(-(dx * dx + dy * dy) * is1);
+    }
+  }
+  const c0 = Math.sqrt(-Math.log(0.35)), fMin = Math.exp(-30);
+  for (let i = 0; i < N; i++) {
+    const g = Math.log(Math.max(f1[i], fMin));
+    s[i] = Math.min(S_FAR, sig * (Math.sqrt(Math.max(-g, 0)) - c0) - sig * 0.6 * Math.max(g, 0));
+  }
+  return s;
+}
+
+// Builds the whole world for a set of icon rectangles.
+// map: 4 bytes per block: type, height level, variant bits, extra (water depth / grass tint and decoration /
+// ground level under a tree); light: block light from the lanterns (level * 16).
+function buildWorld(rects) {
+  const t0 = performance.now();
+  const N = Mw * Mh, s = computeField(rects);
+  const type = new Uint8Array(N), hgt = new Uint8Array(N), vr = new Uint8Array(N), aux = new Uint8Array(N);
+
+  // ---- terrain from the ranked elevation; near a clearing the land is levelled toward the lawn ----
+  const wq = 0.36 * P.water, R = RELIEF;
+  const cS = 0.01 + 0.05 * R, c6 = cS + 0.03 + 0.07 * R, c5 = c6 + 0.04 + 0.09 * R, c4 = c5 + 0.06 + 0.14 * R, c3 = c4 + 0.10 + 0.16 * R;
+  const sandV = wq > 0.01 ? 0.05 : 0;
+  const qFlat = wq + (1 - wq) * (sandV + (1 - c3 - sandV) * 0.5);
+  const M = 3.5 * BLOCK;
+  for (let i = 0; i < N; i++) {
+    let q = NZ.rank[i];
+    const si = s[i];
+    vr[i] = NZ.rnd[i];
+    if (si <= 0) { type[i] = LAWN; hgt[i] = L0; continue; }
+    if (si < M) q = qFlat + (q - qFlat) * sstep(0, M, si);
+    if (q < wq) {
+      const dp = (wq - q) / wq;
+      type[i] = WATER; hgt[i] = 1; aux[i] = dp < 0.14 ? 0 : dp < 0.38 ? 1 : dp < 0.68 ? 2 : 3;
+      continue;
+    }
+    const v = (q - wq) / (1 - wq);
+    if (v < sandV) { type[i] = SAND; hgt[i] = 1; }
+    else if (v > 1 - cS) { type[i] = SNOW; hgt[i] = v > 1 - cS * 0.4 ? 8 : 7; }
+    else if (v > 1 - c6) { type[i] = STONE; hgt[i] = 6; }
+    else if (v > 1 - c5) { type[i] = STONE; hgt[i] = 5; }
+    else {
+      type[i] = GRASS; hgt[i] = v > 1 - c4 ? 4 : v > 1 - c3 ? 3 : 2;
+      // grass tint by region, little decorations by the flower-meadow noise
+      const h = vr[i], b = NZ.biome[i] + (hash2(i % Mw, (i / Mw) | 0, 61) - 0.5) * 0.07;
+      const tint = b < 0.30 ? 1 : b < 0.72 ? 0 : b < 0.86 ? 2 : 3;
+      let deco = 0;
+      if (NZ.flower[i] > 0.76 && h < 110) deco = 1 + (h % 3);
+      else if (h < 28) deco = 4; else if (h < 32) deco = 5; else if (h < 35) deco = 6;
+      aux[i] = tint | (deco << 2);
+    }
+  }
+
+  // ---- the gravel walk around every clearing, with lantern posts ----
+  const rim = [];
+  for (let my = 0; my < Mh; my++) for (let mx = 0; mx < Mw; mx++) {
+    const i = idx(mx, my);
+    if (type[i] !== LAWN) continue;
+    let edge = false;
+    for (let dy = -1; dy <= 1 && !edge; dy++) for (let dx = -1; dx <= 1; dx++) {
+      const nx = mx + dx, ny = my + dy;
+      if (nx < 0 || ny < 0 || nx >= Mw || ny >= Mh) continue;
+      if (type[idx(nx, ny)] !== LAWN) { edge = true; break; }
+    }
+    if (edge) rim.push(i);
+  }
+  for (const i of rim) {
+    const wx = (i % Mw) - PADX, wy = ((i / Mw) | 0) - PADT;
+    type[i] = RIM;
+    vr[i] = (vr[i] & 127) | ((((wx + 3 * wy) % 9) + 9) % 9 === 0 ? 128 : 0);
+  }
+
+  // ---- clearings (connected lawns) and the dirt paths that join them ----
+  const comp = new Int32Array(N).fill(-1), clusters = [];
+  for (let i0 = 0; i0 < N; i0++) {
+    if (comp[i0] >= 0 || (type[i0] !== LAWN && type[i0] !== RIM)) continue;
+    const id = clusters.length, list = [i0];
+    comp[i0] = id;
+    let sx = 0, sy = 0;
+    for (let k = 0; k < list.length; k++) {
+      const i = list[k], x = i % Mw, y = (i / Mw) | 0;
+      sx += x; sy += y;
+      for (const j of [x > 0 ? i - 1 : -1, x < Mw - 1 ? i + 1 : -1, y > 0 ? i - Mw : -1, y < Mh - 1 ? i + Mw : -1])
+        if (j >= 0 && comp[j] < 0 && (type[j] === LAWN || type[j] === RIM)) { comp[j] = id; list.push(j); }
+    }
+    const cx = sx / list.length, cy = sy / list.length;
+    let best = list[0], bd = 1e9;                  // a block of the clearing nearest to its centre
+    for (const i of list) { const d = Math.hypot((i % Mw) - cx, ((i / Mw) | 0) - cy); if (d < bd) { bd = d; best = i; } }
+    clusters.push({ cx, cy, ax: best % Mw, ay: (best / Mw) | 0, n: list.length });
+  }
+  const mark = (x, y, vertical) => {
+    if (x < 0 || y < 0 || x >= Mw || y >= Mh) return;
+    const i = idx(x, y), t = type[i];
+    if (t === LAWN || t === RIM) return;
+    if (t === WATER) { type[i] = PLANK; hgt[i] = 1; aux[i] = vertical ? 1 : 0; }
+    else { type[i] = PATH; aux[i] = t === STONE || t === SNOW ? 1 : 0; }
+  };
+  if (clusters.length > 1) {                       // minimum spanning tree over the clearings
+    const inT = new Uint8Array(clusters.length), edges = [];
+    inT[0] = 1;
+    for (let n = 1; n < clusters.length; n++) {
+      let best = null;
+      for (let a = 0; a < clusters.length; a++) if (inT[a]) for (let b = 0; b < clusters.length; b++) if (!inT[b]) {
+        const d = Math.hypot(clusters[a].cx - clusters[b].cx, clusters[a].cy - clusters[b].cy);
+        if (!best || d < best[2]) best = [a, b, d];
+      }
+      inT[best[1]] = 1; edges.push(best);
+    }
+    for (const [ia, ib] of edges) {                // a blocky Z-shaped route: straight, one jog, straight
+      const a = clusters[ia], b = clusters[ib];
+      let x = a.ax, y = a.ay;
+      const X = b.ax, Y = b.ay;
+      const hs = hash2(Math.min(x, X) + 7 * Math.max(x, X), Math.min(y, Y) + 13 * Math.max(y, Y), 71);
+      const pts = [];
+      if (Math.abs(X - x) >= Math.abs(Y - y)) { const xm = Math.round(x + (X - x) * (0.3 + 0.4 * hs)); pts.push([xm, y], [xm, Y], [X, Y]); }
+      else { const ym = Math.round(y + (Y - y) * (0.3 + 0.4 * hs)); pts.push([x, ym], [X, ym], [X, Y]); }
+      for (const [px, py] of pts) while (x !== px || y !== py) {
+        const vertical = x === px;
+        mark(x, y, vertical);
+        if (!vertical) x += Math.sign(px - x); else y += Math.sign(py - y);
+      }
+    }
+  }
+
+  const gnd = new Uint8Array(hgt);                 // true ground level of every block (trees stand on it)
+
+  // ---- a few cottages, each with a small field, on flat meadows away from the icons ----
+  const doors = [];
+  for (let cy = -1; cy * 16 < Mh; cy++) for (let cx = -1; cx * 22 < Mw; cx++) {
+    if (hash2(cx, cy, 81) > 0.72) continue;
+    const mx = cx * 22 + 2 + Math.floor(hash2(cx, cy, 82) * 16) + PADX, my = cy * 16 + 2 + Math.floor(hash2(cx, cy, 83) * 11) + PADT;
+    if (mx < 1 || my < 1 || mx + 4 >= Mw || my + 3 >= Mh) continue;
+    const g = gnd[idx(mx, my)];
+    let ok = g <= 3;                               // the 3x2 footprint, a block around it and the row in front: flat free meadow
+    for (let dy = 0; dy < 3 && ok; dy++) for (let dx = -1; dx <= 3; dx++) {
+      const i = idx(mx + dx, my + dy);
+      if (type[i] !== GRASS || gnd[i] !== g || s[i] < 4.5 * BLOCK) { ok = false; break; }
+    }
+    if (!ok) continue;
+    const kind = Math.floor(hash2(cx, cy, 84) * 3);
+    for (let dy = 0; dy < 2; dy++) for (let dx = 0; dx < 3; dx++) {
+      const i = idx(mx + dx, my + dy);
+      type[i] = ROOF; hgt[i] = g + (dy === 0 ? 3 : 2); vr[i] = dx | (dy << 2) | (kind << 3); aux[i] = 0;
+    }
+    doors.push(idx(mx + 1, my + 2));
+    const fx0 = hash2(cx, cy, 85) < 0.5 ? mx - 4 : mx + 4, crop = hash2(cx, cy, 86) < 0.6 ? 0 : 1;
+    for (let dy = 0; dy < 3; dy++) for (let dx = 0; dx < 3; dx++) {
+      const x = fx0 + dx, y = my + dy;
+      if (x < 0 || x >= Mw) continue;
+      const i = idx(x, y);
+      if (type[i] === GRASS && gnd[i] === g && s[i] > 3 * BLOCK) { type[i] = FIELD; vr[i] = crop; aux[i] = 0; }
+    }
+  }
+
+  // ---- boulders and berry bushes on the meadows ----
+  for (let i = 0; i < N; i++) {
+    if (type[i] !== GRASS || s[i] < 2.2 * BLOCK) continue;
+    const h = vr[i];
+    if (h >= 35 && h < 38) { type[i] = STONE; hgt[i] = gnd[i] + 1; aux[i] = 0; }
+    else if (h >= 38 && h < 43 && P.trees > 0.02) { type[i] = LEAF; hgt[i] = gnd[i] + 1; vr[i] = 6 | (1 << 3) | (1 << 5); aux[i] = gnd[i] - 1; }
+  }
+
+  // ---- trees: one candidate per 4x4 cell, denser in the forest regions ----
+  const leaf = (mx, my, top, sp, dx, dy, open, gC) => {
+    if (mx < 0 || my < 0 || mx >= Mw || my >= Mh) return;
+    const i = idx(mx, my);
+    if (type[i] === LEAF) { if (hgt[i] >= top) return; }          // a taller tree already owns this block
+    else if (type[i] !== GRASS) return;
+    const g = gnd[i];
+    if (top <= g) return;
+    type[i] = LEAF; hgt[i] = top;
+    vr[i] = sp | ((dx + 1) << 3) | ((dy + 1) << 5);
+    aux[i] = open && top - gC >= 2 ? gC : Math.max(g - 1, 0);     // open: air and a trunk under the crown, from the same height all round
+  };
+  const lone = 0.05 * Math.min(1, P.trees * 3);
+  const cx0 = Math.floor(-PADX / 4) - 1, cx1 = Math.ceil((Mw - PADX) / 4), cy0 = Math.floor(-PADT / 4) - 1, cy1 = Math.ceil((Mh - PADT) / 4);
+  for (let cy = cy0; cy <= cy1; cy++) for (let cx = cx0; cx <= cx1; cx++) {
+    const mx = cx * 4 + 1 + (hash2(cx, cy, 31) < 0.5 ? 0 : 1) + PADX, my = cy * 4 + 1 + (hash2(cx, cy, 32) < 0.5 ? 0 : 1) + PADT;
+    if (mx < 0 || my < 0 || mx >= Mw || my >= Mh) continue;
+    const i = idx(mx, my);
+    if (type[i] !== GRASS || s[i] < 2.6 * BLOCK) continue;
+    const dens = Math.min(1, Math.max(0, (NZ.forest[i] - (1 - P.trees * 1.15)) / 0.18)) * 0.95 + lone;
+    if (hash2(cx, cy, 33) >= dens) continue;
+    const g = gnd[i], b = NZ.biome[i], hs = hash2(cx, cy, 34), hv = hash2(cx, cy, 35);
+    let sp;                                                       // 0 oak, 1 pine, 2 birch, 3 blossom, 4 gold, 5 red
+    if (g >= 4) sp = hs < 0.8 ? 1 : 0;
+    else if (b < 0.30) sp = hs < 0.85 ? 1 : 0;
+    else if (b < 0.72) sp = hs < 0.72 ? 0 : hs < 0.90 ? 2 : hs < 0.94 ? 3 : 4;
+    else if (b < 0.86) sp = hs < 0.65 ? 2 : hs < 0.88 ? 0 : 3;
+    else sp = hs < 0.45 ? 4 : hs < 0.72 ? 5 : 0;
+    if (sp === 1) {                                               // pine: a low cross with a tall middle
+      const top = g + (hv < 0.3 ? 3 : 4);
+      leaf(mx, my, top, 1, 0, 0, false, g);
+      leaf(mx - 1, my, top - 2, 1, -1, 0, false, g); leaf(mx + 1, my, top - 2, 1, 1, 0, false, g);
+      leaf(mx, my - 1, top - 2, 1, 0, -1, false, g); leaf(mx, my + 1, top - 2, 1, 0, 1, false, g);
+    } else if (sp === 2) {                                        // birch: a slim 2x2 crown
+      const top = g + (hv < 0.5 ? 3 : 4);
+      for (let dy = 0; dy <= 1; dy++) for (let dx = 0; dx <= 1; dx++) leaf(mx + dx, my + dy, top, 2, dx, dy, true, g);
+    } else {                                                      // broad 3x3 crown, some corners missing
+      const top = g + (hv < 0.22 ? 2 : hv < 0.85 ? 3 : 4);
+      for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+        if (dx && dy && hash2(mx * 3 + dx, my * 3 + dy, 36) < 0.38) continue;
+        leaf(mx + dx, my + dy, top, sp, dx, dy, true, g);
+      }
+    }
+  }
+
+  // ---- block light from the lanterns: one level less per block (seen at night) ----
+  const lightLv = new Uint8Array(N), queue = [];
+  for (let i = 0; i < N; i++) if (type[i] === RIM && (vr[i] & 128)) { lightLv[i] = 13; queue.push(i); }
+  for (const i of doors) if (lightLv[i] < 10) { lightLv[i] = 10; queue.push(i); }   // light from the cottage windows
+  for (let qi = 0; qi < queue.length; qi++) {       // (a block may be queued again when a brighter light reaches it)
+    const i = queue[qi], l = lightLv[i] - 1, x = i % Mw, y = (i / Mw) | 0;
+    if (l <= 0) continue;
+    if (x > 0 && lightLv[i - 1] < l) { lightLv[i - 1] = l; queue.push(i - 1); }
+    if (x < Mw - 1 && lightLv[i + 1] < l) { lightLv[i + 1] = l; queue.push(i + 1); }
+    if (y > 0 && lightLv[i - Mw] < l) { lightLv[i - Mw] = l; queue.push(i - Mw); }
+    if (y < Mh - 1 && lightLv[i + Mw] < l) { lightLv[i + Mw] = l; queue.push(i + Mw); }
+  }
+
+  const map = new Uint8Array(N * 4), light = new Uint8Array(N);
+  for (let i = 0, o = 0; i < N; i++, o += 4) { map[o] = type[i]; map[o + 1] = hgt[i]; map[o + 2] = vr[i]; map[o + 3] = aux[i]; light[i] = lightLv[i] * 16; }
+  fieldMs = performance.now() - t0;
+  return { map, light, s, type, hgt, gnd };
+}
+
+/* ======================================================================
+   Rebuilding block by block: every changed block gets its own moment (0..0.9 of the transition)
+   ====================================================================== */
+let flipN = 0;
+function planFlips(A, B, origins) {
+  const N = Mw * Mh, thr = new Uint8Array(N).fill(255), changed = [];
+  for (let i = 0, o = 0; i < N; i++, o += 4)
+    if (A[o] !== B[o] || A[o + 1] !== B[o + 1] || A[o + 2] !== B[o + 2] || A[o + 3] !== B[o + 3]) changed.push(i);
+  if (!changed.length) return thr;
+  let org = origins;
+  if (!org.length) {                               // no icon moved (a setting or the seed changed): start in the middle of what changed
+    let sx = 0, sy = 0;
+    for (const i of changed) { sx += i % Mw; sy += (i / Mw) | 0; }
+    org = [{ x: sx / changed.length, y: sy / changed.length }];
+  }
+  const dist = new Float32Array(changed.length);
+  let dmax = 10;
+  changed.forEach((i, n) => {
+    const x = i % Mw, y = (i / Mw) | 0;
+    let d = 1e9;
+    for (const o of org) d = Math.min(d, Math.hypot(x - o.x, y - o.y));
+    dist[n] = d; if (d > dmax) dmax = d;
+  });
+  flipN++;
+  changed.forEach((i, n) => {
+    const t = 0.03 + 0.84 * Math.pow(dist[n] / dmax, 0.6) + (hash2(i % Mw, (i / Mw) | 0, 77 + flipN) - 0.5) * 0.07;
+    thr[i] = Math.round(Math.min(Math.max(t, 0.02), 0.9) * 255);
+  });
+  return thr;
+}
+// icons that appeared or disappeared since the last world, in map block coordinates
+function movedIcons(oldR, newR) {
+  const key = r => Math.round(r.cx) + ',' + Math.round(r.cy);
+  const a = new Set(oldR.map(key)), b = new Set(newR.map(key)), out = [];
+  for (const r of newR) if (!a.has(key(r))) out.push({ x: r.cx / BLOCK + PADX, y: r.cy / BLOCK + PADT });
+  for (const r of oldR) if (!b.has(key(r))) out.push({ x: r.cx / BLOCK + PADX, y: r.cy / BLOCK + PADT });
+  return out;
+}
+
+/* ======================================================================
+   Animal sprites: text art, facing right; three frames each (stand, step, graze)
+   ====================================================================== */
+const SPR_W = 12, SPR_H = 10, ANI = 12;
+const SHADOW = [0, 0, 0, 72];
+const SPRITES = [
+  { pal: { w: [246, 243, 234, 255], s: [212, 208, 200, 255], k: [62, 55, 62, 255], h: SHADOW }, frames: [[   // sheep
+    '............', '............', '...wwwww....', '..wwwwwwwkk.', '..wwwwwwwkk.', '..wwwwwwww..', '..swwwwwws..', '...k....k...', '...k....k...', '..hhhhhhhh..'], [
+    '............', '............', '...wwwww....', '..wwwwwwwkk.', '..wwwwwwwkk.', '..wwwwwwww..', '..swwwwwws..', '....k..k....', '....k..k....', '..hhhhhhhh..'], [
+    '............', '............', '...wwwww....', '..wwwwwwww..', '..wwwwwwww..', '..wwwwwwwwk.', '..swwwwwwskk', '...k....k.kk', '...k....k...', '..hhhhhhhhh.']] },
+  { pal: { w: [242, 238, 228, 255], b: [116, 78, 54, 255], k: [64, 50, 46, 255], p: [238, 164, 164, 255], h: SHADOW }, frames: [[   // cow
+    '............', '.........k.k', '..bbwwwbbwww', '.wbbwwwwwwkp', '.wwwwbbwwwwp', '.wwwwbbwww..', '.wwwwwwwww..', '..k.....k...', '..k.....k...', '.hhhhhhhhh..'], [
+    '............', '.........k.k', '..bbwwwbbwww', '.wbbwwwwwwkp', '.wwwwbbwwwwp', '.wwwwbbwww..', '.wwwwwwwww..', '...k...k....', '...k...k....', '.hhhhhhhhh..'], [
+    '............', '............', '..bbwwwbb...', '.wbbwwwwwk.k', '.wwwwbbwwwww', '.wwwwbbwwwkp', '.wwwwwwwwwwp', '..k.....k...', '..k.....k...', '.hhhhhhhhhh.']] },
+  { pal: { p: [242, 172, 176, 255], d: [216, 132, 142, 255], k: [152, 92, 100, 255], h: SHADOW }, frames: [[   // pig
+    '............', '............', '............', '........d...', '..ppppppppp.', '.dppppppppkd', '..pppppppppd', '..ppppppp...', '...k....k...', '..hhhhhhhh..'], [
+    '............', '............', '............', '........d...', '..ppppppppp.', '.dppppppppkd', '..pppppppppd', '..ppppppp...', '....k..k....', '..hhhhhhhh..'], [
+    '............', '............', '............', '............', '..pppppppd..', '.dppppppppp.', '..ppppppppkd', '..pppppppppd', '...k....k...', '..hhhhhhhhh.']] },
+  { pal: { w: [248, 246, 238, 255], r: [222, 62, 52, 255], y: [246, 184, 62, 255], o: [228, 142, 52, 255], k: [50, 46, 50, 255], h: SHADOW }, frames: [[   // hen
+    '............', '............', '............', '............', '.......r....', '..w...wwk...', '..wwwwwwwy..', '...wwwww....', '....o.o.....', '...hhhhh....'], [
+    '............', '............', '............', '............', '.......r....', '..w...wwk...', '..wwwwwwwy..', '...wwwww....', '.....o.o....', '...hhhhh....'], [
+    '............', '............', '............', '............', '............', '..w.........', '..wwwwwwr...', '...wwwwwwk..', '....o.o.wy..', '...hhhhhh...']] },
+];
+function makeSprites() {
+  const w = SPR_W * 3, h = SPR_H * SPRITES.length, data = new Uint8Array(w * h * 4);
+  SPRITES.forEach((k, ki) => k.frames.forEach((rows, fi) => rows.forEach((row, y) => {
+    for (let x = 0; x < SPR_W; x++) {
+      const c = k.pal[row[x]];
+      if (c) data.set(c, ((ki * SPR_H + y) * w + fi * SPR_W + x) * 4);
+    }
+  })));
+  return { w, h, data };
+}
+
+/* ======================================================================
+   Shaders
+   ====================================================================== */
+const VS = `#version 300 es
+void main() {
+  vec2 p = vec2(float((gl_VertexID << 1) & 2), float(gl_VertexID & 2));
+  gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);
+}`;
+
+const FS = `#version 300 es
+precision highp float;
+precision highp int;
+uniform sampler2D uMapA, uMapB, uThr, uLight, uSprite, uCloudTex;
+uniform vec2 uRes;
+uniform ivec2 uMap, uCloud;      // map size in blocks; cloud-shadow drift in texels
+uniform int uSeed;
+uniform float uScale, uMix, uIdle, uTime, uCloudAmt;
+uniform vec3 uTod;               // weights: day, sunset, night (sum 1)
+uniform vec4 uAni[${ANI}];       // animals: x, y of the feet (world texels), height level, kind*8 + frame*2 + flip; w < 0 = none
+out vec4 o;
+
+const int LV = ${LV}, L0 = ${L0}, MAXH = ${MAXH}, PADX = ${PADX}, PADT = ${PADT};
+const float TEX = ${TEXEL.toFixed(1)}, FLASH = ${FLASH};
+const int WATER = ${WATER}, SAND = ${SAND}, GRASS = ${GRASS}, LAWN = ${LAWN}, RIM = ${RIM}, PATH = ${PATH}, STONE = ${STONE}, SNOW = ${SNOW}, LEAF = ${LEAF}, PLANK = ${PLANK}, ROOF = ${ROOF}, FIELD = ${FIELD};
+
+// ---- palette ----
+const vec3 LAWNC = vec3(0.33, 0.57, 0.28);
+const vec3 DIRT = vec3(0.50, 0.35, 0.23);
+const vec3 STONE_SIDE = vec3(0.41, 0.43, 0.49);
+const vec3 UNDER = vec3(0.15, 0.27, 0.16);       // shaded ground under a tree crown
+const vec3 FOAM = vec3(0.90, 0.97, 0.98);
+
+float gEmis;                                     // set by topColor for texels that glow (lantern lamps)
+
+uint hu(uint x) { x ^= x >> 16; x *= 0x7feb352dU; x ^= x >> 15; x *= 0x846ca68bU; x ^= x >> 16; return x; }
+float h2(int x, int y) { return float(hu(uint(x) * 0x9E3779B1U + hu(uint(y) + uint(uSeed) * 0x632BE5ABU)) >> 8) / 16777216.0; }
+float h3(int x, int y, int k) { return float(hu(uint(x) * 0x9E3779B1U + hu(uint(y) * 0x85EBCA77U + hu(uint(k) + uint(uSeed)))) >> 8) / 16777216.0; }
+
+struct Cell { int t; int h; int v; int a; float fl; };
+// the block at world block coordinates (cx, cy): the old map until its own moment, the new one after
+Cell cell(int cx, int cy) {
+  ivec2 m = clamp(ivec2(cx + PADX, cy + PADT), ivec2(0), uMap - 1);
+  Cell k;
+  vec4 d;
+  k.fl = 0.0;
+  if (uIdle > 0.5) d = texelFetch(uMapB, m, 0);
+  else {
+    float thr = texelFetch(uThr, m, 0).r;
+    if (uMix >= thr) {
+      d = texelFetch(uMapB, m, 0);
+      if (thr < 0.99) k.fl = clamp(1.0 - (uMix - thr) / FLASH, 0.0, 1.0);
+    } else d = texelFetch(uMapA, m, 0);
+  }
+  ivec4 iv = ivec4(d * 255.0 + 0.5);
+  k.t = iv.r; k.h = iv.g; k.v = iv.b; k.a = iv.a;
+  return k;
+}
+
+vec3 grassBase(Cell k) {
+  int tint = k.a & 3;
+  vec3 g = tint == 0 ? vec3(0.42, 0.68, 0.29) : tint == 1 ? vec3(0.35, 0.62, 0.34) : tint == 2 ? vec3(0.50, 0.71, 0.28) : vec3(0.49, 0.65, 0.27);
+  return g * (1.0 + 0.04 * float(k.h - 2));      // higher meadows are a little lighter
+}
+vec3 flowerCol(int kind, float h) {
+  if (kind == 1) return h < 0.5 ? vec3(0.93, 0.30, 0.27) : vec3(0.98, 0.80, 0.25);
+  if (kind == 2) return h < 0.6 ? vec3(0.97, 0.96, 0.92) : vec3(0.97, 0.70, 0.80);
+  return h < 0.5 ? vec3(0.47, 0.52, 0.93) : vec3(0.72, 0.50, 0.90);
+}
+// tone: 0 dark, 1 base, 2 light
+vec3 leafPal(int sp, int tone) {
+  vec3 d, b, l;
+  if (sp == 1)      { d = vec3(0.11, 0.31, 0.25); b = vec3(0.16, 0.41, 0.30); l = vec3(0.23, 0.52, 0.36); }   // pine
+  else if (sp == 2) { d = vec3(0.37, 0.58, 0.23); b = vec3(0.49, 0.70, 0.27); l = vec3(0.62, 0.80, 0.34); }   // birch
+  else if (sp == 3) { d = vec3(0.80, 0.45, 0.62); b = vec3(0.92, 0.60, 0.73); l = vec3(0.98, 0.77, 0.85); }   // blossom
+  else if (sp == 4) { d = vec3(0.72, 0.39, 0.16); b = vec3(0.87, 0.55, 0.19); l = vec3(0.95, 0.70, 0.27); }   // gold
+  else if (sp == 5) { d = vec3(0.56, 0.21, 0.17); b = vec3(0.74, 0.30, 0.20); l = vec3(0.86, 0.42, 0.24); }   // red
+  else if (sp == 6) { d = vec3(0.14, 0.38, 0.20); b = vec3(0.20, 0.48, 0.24); l = vec3(0.28, 0.58, 0.28); }   // berry bush
+  else              { d = vec3(0.17, 0.43, 0.20); b = vec3(0.24, 0.55, 0.23); l = vec3(0.35, 0.66, 0.27); }   // oak
+  return tone == 0 ? d : tone == 1 ? b : l;
+}
+
+// ---- the top of a block; (fx, fy) texel inside the block, (X, Y) world texel ----
+vec3 topColor(Cell k, int bx, int by, int fx, int fy, int X, int Y) {
+  float n = h2(X, Y);                            // per texel
+  float n2 = h2(X >> 1, (Y >> 1) + 7777);        // 2x2 clumps
+  int t = k.t;
+  if (t == LAWN) {                               // the clearing: an even lawn with a faint checker, nothing else
+    vec3 col = LAWNC * (((bx + by) & 1) == 0 ? 1.0 : 0.962);
+    return col * (1.0 + (n - 0.5) * 0.035);
+  }
+  if (t == GRASS) {
+    vec3 g = grassBase(k), col = g;
+    if (n2 < 0.22) col = g * 0.92; else if (n2 > 0.80) col = g * 1.07;
+    if (n < 0.05) col = g * 0.84; else if (n > 0.965) col = g * 1.14;
+    int deco = (k.a >> 2) & 7;
+    if (deco == 0) return col;
+    if (deco <= 4) {                             // flowers on short stems, or tufts of tall grass
+      for (int j = 0; j < 3; j++) {
+        int px = 1 + int(h3(bx, by, 10 + j) * 6.0), py = int(h3(bx, by, 20 + j) * 6.0);
+        if (deco == 4) {
+          if (fx == px && fy == py) return g * 1.24;
+          if ((fx == px || fx == px + 1) && fy == py + 1) return g * 0.72;
+        } else {
+          if (fx == px && fy == py) return flowerCol(deco, h3(bx, by, 30 + j));
+          if (fx == px && fy == py + 1) return g * 0.70;
+        }
+      }
+      return col;
+    }
+    int px = 2 + (k.v & 3), py = 2 + ((k.v >> 2) & 3);
+    if (deco == 5) {                             // a pebble
+      if (fy == py && (fx == px || fx == px + 1)) return vec3(0.70, 0.71, 0.73);
+      if (fy == py + 1 && (fx == px || fx == px + 1)) return vec3(0.52, 0.54, 0.58);
+      return col;
+    }
+    if (fy == py && (fx == px || fx == px + 1)) return fx == px ? vec3(0.86, 0.26, 0.22) : vec3(0.96, 0.92, 0.86);   // a mushroom
+    if (fy == py + 1 && fx == px) return vec3(0.93, 0.89, 0.80);
+    return col;
+  }
+  if (t == RIM) {                                // gravel walk; some blocks carry a lantern post
+    vec3 col = vec3(0.64, 0.60, 0.51);
+    if (n2 < 0.30) col *= 0.93;
+    if (n > 0.90) col *= 1.09; else if (n < 0.08) col *= 0.82;
+    if ((k.v & 128) != 0) {
+      if ((fy == 1 || fy == 4) && (fx == 3 || fx == 4)) return vec3(0.22, 0.19, 0.20);
+      if ((fy == 2 || fy == 3) && (fx == 2 || fx == 5)) return vec3(0.22, 0.19, 0.20);
+      if ((fy == 2 || fy == 3) && (fx == 3 || fx == 4)) { gEmis = 1.0; return fy == 2 ? vec3(1.0, 0.95, 0.66) : vec3(1.0, 0.80, 0.36); }
+      if ((fy == 5 || fy == 6) && (fx == 3 || fx == 4)) return fx == 3 ? vec3(0.42, 0.30, 0.20) : vec3(0.30, 0.21, 0.15);
+      if (fy == 6 && (fx == 5 || fx == 6)) return col * 0.72;
+    }
+    return col;
+  }
+  if (t == PATH) {
+    if ((k.a & 1) == 1) {                        // stone steps where the path crosses rock and snow
+      vec3 col = vec3(0.50, 0.49, 0.49);
+      if (n2 < 0.3) col *= 0.92;
+      if (fy == 3 || fy == 7) col *= 0.80; else if (fy == 0 || fy == 4) col *= 1.10;
+      return col;
+    }
+    vec3 col = vec3(0.67, 0.54, 0.37);
+    if (n2 < 0.28) col *= 0.93;
+    if (n > 0.93) col = vec3(0.78, 0.70, 0.57); else if (n < 0.07) col *= 0.80;
+    return col;
+  }
+  if (t == SAND) {
+    vec3 col = vec3(0.91, 0.83, 0.59);
+    if (n2 < 0.25) col *= 0.95;
+    if (n > 0.95) col *= 1.05; else if (n < 0.04) col = vec3(0.79, 0.69, 0.48);
+    return col;
+  }
+  if (t == WATER) {
+    int band = k.a & 3;
+    vec3 col = band == 0 ? vec3(0.34, 0.72, 0.84) : band == 1 ? vec3(0.24, 0.61, 0.82) : band == 2 ? vec3(0.19, 0.50, 0.77) : vec3(0.15, 0.41, 0.69);
+    if (n2 < 0.18) col *= 0.955;
+    // light dashes drifting along every texel row, each row at its own pace
+    float rs = h2(Y, 911);
+    int cx = X + int(floor(uTime * (0.8 + 2.2 * rs))) + int(rs * 64.0);
+    float hc = h3(cx >> 3, Y, 5);
+    if (hc < 0.15 && (cx & 7) < 2 + int(hc * 22.0))
+      col = mix(col, vec3(0.80, 0.95, 0.98), 0.16 + 0.20 * (0.5 + 0.5 * sin(uTime * 1.3 + hc * 80.0)));
+    if (h3(X, Y, int(floor(uTime * 2.5))) < 0.0022) col = mix(col, vec3(1.0), 0.7);    // a sparkle
+    if (band >= 1 && (k.v & 31) == 7) {                          // a lily pad on some blocks, a flower on a few
+      int qx = fx - 1 - ((k.v >> 5) & 3), qy = fy - 2 - ((k.v >> 7) & 1) * 2;
+      if (qx >= 0 && qx < 3 && qy >= 0 && qy < 3 && !(qx == 2 && qy == 0)) {
+        col = qx == 1 && qy == 1 ? ((k.v & 96) == 32 ? vec3(0.96, 0.66, 0.78) : vec3(0.40, 0.70, 0.34)) : vec3(0.27, 0.58, 0.30);
+        if (qy == 2) col *= 0.88;
+      }
+    }
+    return col;
+  }
+  if (t == STONE) {
+    vec3 col = k.h >= 6 ? vec3(0.62, 0.64, 0.69) : vec3(0.55, 0.57, 0.62);
+    float n4 = h2(X >> 2, (Y >> 2) + 2222);                      // 4x4 slabs
+    if (n4 < 0.30) col *= 0.95; else if (n4 > 0.75) col *= 1.04;
+    if (n2 < 0.14) col *= 0.95;
+    if (n < 0.025) col *= 0.84;
+    int cy = 2 + (k.v & 3), cx = (k.v >> 2) & 3;                 // a short crack in some blocks
+    if ((k.v & 64) != 0 && ((fy == cy && fx >= cx && fx <= cx + 2) || (fy == cy + 1 && fx == cx + 2))) col *= 0.78;
+    if ((k.v & 15) == 5) {                                       // ore specks in a few blocks
+      int kind = (k.v >> 4) & 3;
+      vec3 oc = kind == 0 ? vec3(0.20, 0.21, 0.26) : kind == 1 ? vec3(0.85, 0.52, 0.27) : kind == 2 ? vec3(0.35, 0.80, 0.76) : vec3(0.95, 0.80, 0.30);
+      for (int j = 0; j < 2; j++) {
+        int ox = 1 + int(h3(bx, by, 40 + j) * 6.0), oy = 1 + int(h3(bx, by, 50 + j) * 6.0);
+        if ((fx == ox || fx == ox + 1) && fy == oy) col = fx == ox ? oc : oc * 0.8;
+      }
+    }
+    return col;
+  }
+  if (t == SNOW) {
+    vec3 col = vec3(0.92, 0.95, 0.99);
+    if (n2 < 0.24) col = vec3(0.84, 0.89, 0.97);
+    if (n > 0.985) col = vec3(1.0); else if (n < 0.012) col = vec3(0.62, 0.65, 0.72);
+    return col;
+  }
+  if (t == LEAF) {
+    int sp = k.v & 7, dx = ((k.v >> 3) & 3) - 1, dy = ((k.v >> 5) & 3) - 1;
+    // lit from the north-west: three flat tones across the whole crown, dithered by the clumps
+    int g = fx + fy + (dx + dy) * 8 + (sp == 2 ? 8 : 16);
+    int tone = g < 13 ? 2 : g > 31 ? 0 : 1;
+    if (n2 < 0.25) tone = max(tone - 1, 0); else if (n2 > 0.80) tone = min(tone + 1, 2);
+    vec3 col = leafPal(sp, tone);
+    if (n < 0.045) col = leafPal(sp, 0) * 0.72;                  // dark gaps between the leaves
+    else if (n > 0.97) col = leafPal(sp, 2) * 1.08;
+    if (sp == 6 && n > 0.90) col = vec3(0.86, 0.22, 0.26);       // berries
+    return col;
+  }
+  if (t == ROOF) {                               // cottage roof: courses of tiles, a chimney on one corner
+    int dx = k.v & 3, dy = (k.v >> 2) & 1, kind = (k.v >> 3) & 3;
+    vec3 col = (kind == 0 ? vec3(0.74, 0.32, 0.24) : kind == 1 ? vec3(0.37, 0.44, 0.58) : vec3(0.82, 0.64, 0.32)) * (dy == 0 ? 1.06 : 0.96);
+    if ((fy & 1) == 1) col *= ((fx + (fy >> 1) * 2 + dx) & 3) == 0 ? 0.72 : 0.86;
+    else if (n < 0.10) col *= 0.93;
+    if (dx == 2 && dy == 0) {
+      if ((fx == 4 || fx == 5) && (fy == 3 || fy == 4)) return fy == 3 ? vec3(0.50, 0.48, 0.50) : vec3(0.33, 0.31, 0.34);
+      int ph = int(floor(uTime * 1.4)) & 3;                      // a wisp of smoke
+      if (fx == 4 + (ph & 1) && fy == 2 - (ph >> 1) - (ph & 1)) col = mix(col, vec3(0.95), 0.55);
+    }
+    return col;
+  }
+  if (t == FIELD) {                              // a small field: furrows and rows of wheat or greens
+    if ((fy & 3) == 3) return vec3(0.44, 0.31, 0.21) * (n < 0.3 ? 0.90 : 1.0);
+    vec3 col = (k.v & 1) == 0 ? vec3(0.90, 0.74, 0.31) : vec3(0.40, 0.66, 0.27);
+    if ((fy & 3) == 0) col *= 1.10; else if ((fy & 3) == 2) col *= 0.88;
+    if (n < 0.14) col *= 0.90;
+    return col;
+  }
+  // plank bridge: boards across the walking direction, a darker rail on both sides
+  vec3 col = vec3(0.73, 0.57, 0.36);
+  bool vert = (k.a & 1) == 1;
+  int along = vert ? fy : fx, across = vert ? fx : fy;
+  if ((along & 3) == 3) col *= 0.80;
+  if (across == 0 || across == 7) col = vec3(0.45, 0.32, 0.20);
+  else if (n > 0.93) col *= 0.90;
+  return col;
+}
+
+// ---- the south wall of a column; d = texel rows below the top edge, hk = a row id for the hash ----
+vec3 sideColor(Cell k, int fx, int d, int X, int hk) {
+  float n = h2(X, hk + 31337), n2 = h2(X >> 1, (hk >> 1) + 4242);
+  int t = k.t;
+  vec3 dirt = DIRT;
+  if (n2 < 0.30) dirt *= 0.90;
+  if (n > 0.94) dirt = DIRT * 1.22; else if (n < 0.07) dirt *= 0.78;
+  if (t == GRASS || t == LAWN) {                 // a lip of grass hanging over the dirt
+    if (d == 0 || (d == 1 && n2 > 0.5)) return (t == LAWN ? LAWNC : grassBase(k)) * 0.72;
+    return dirt;
+  }
+  if (t == PATH && (k.a & 1) == 1) return STONE_SIDE * (n2 < 0.3 ? 0.92 : 1.02);
+  if (t == RIM || t == PATH) return d == 0 ? dirt * 1.16 : dirt;
+  if (t == SAND) return vec3(0.76, 0.66, 0.44) * ((d & 3) == 3 ? 0.90 : 1.0);
+  if (t == STONE || t == SNOW) {
+    if (t == SNOW && (d < 2 || (d == 2 && n2 > 0.5))) return vec3(0.78, 0.85, 0.95);
+    vec3 c = STONE_SIDE;
+    if (n2 < 0.30) c *= 0.90;
+    if ((d & 3) == 2 && n < 0.55) c *= 0.84;
+    return c;
+  }
+  if (t == LEAF) {
+    int sp = k.v & 7, dx = ((k.v >> 3) & 3) - 1;
+    int under = (k.h - k.a - 1) * LV;            // rows from the top edge down to the open space under the crown
+    if (d >= under) {                            // open space: shaded ground and, in the middle, the trunk
+      bool trunk = sp == 2 ? ((dx == 0 && fx == 7) || (dx == 1 && fx == 0)) : (dx == 0 && (fx == 3 || fx == 4));
+      if (!trunk) return UNDER;
+      if (sp == 2) return d - under == (dx == 0 ? 1 : 3) ? vec3(0.31, 0.30, 0.29) : dx == 0 ? vec3(0.88, 0.88, 0.82) : vec3(0.74, 0.75, 0.72);
+      return fx == 4 ? vec3(0.32, 0.22, 0.14) : vec3(0.45, 0.31, 0.19);
+    }
+    vec3 c = leafPal(sp, 0) * (n2 < 0.30 ? 0.78 : 0.90);
+    if (n < 0.06) c *= 0.75;
+    if (d == under - 1 && n2 > 0.55) c = UNDER;  // ragged lower edge of the crown
+    return c;
+  }
+  if (t == ROOF) {
+    int dx = k.v & 3, dy = (k.v >> 2) & 1, kind = (k.v >> 3) & 3;
+    vec3 tile = kind == 0 ? vec3(0.74, 0.32, 0.24) : kind == 1 ? vec3(0.37, 0.44, 0.58) : vec3(0.82, 0.64, 0.32);
+    if (dy == 0) return tile * ((d & 1) == 1 ? 0.66 : 0.80);    // the step up to the back half of the roof
+    // front wall: plaster between dark beams, a door in the middle, a window on either side
+    if (d == 0) return tile * 0.52;                              // shadow under the eaves
+    vec3 beam = vec3(0.36, 0.25, 0.17);
+    if ((dx == 0 && fx == 0) || (dx == 2 && fx == 7) || d == 7) return beam;
+    if (dx == 1) {
+      if (fx >= 3 && fx <= 5 && d >= 3) return fx == 5 && d == 5 ? vec3(0.92, 0.78, 0.34) : d == 3 ? vec3(0.30, 0.20, 0.14) : vec3(0.44, 0.29, 0.18);
+    } else if (fx >= 3 && fx <= 4 && d >= 3 && d <= 4) {
+      float nt = min(uTod.z + 0.6 * uTod.y, 1.0);                // the windows are lit at dusk and at night
+      gEmis = max(gEmis, nt);
+      return mix(vec3(0.58, 0.78, 0.92), vec3(1.0, 0.86, 0.45), nt);
+    } else if ((fx == 2 || fx == 5) && d >= 2 && d <= 5 || (fx >= 2 && fx <= 5 && (d == 2 || d == 5))) return beam;
+    return vec3(0.86, 0.77, 0.60) * (n2 < 0.3 ? 0.95 : 1.0);
+  }
+  if (t == PLANK) return vec3(0.42, 0.30, 0.18);
+  if (t == FIELD) return d == 0 ? dirt * 0.9 : dirt;
+  return vec3(0.12, 0.33, 0.55);
+}
+
+void main() {
+  vec2 p = vec2(gl_FragCoord.x, uRes.y * uScale - gl_FragCoord.y) / uScale;
+  int tx = int(floor(p.x / TEX)), sy = int(floor(p.y / TEX));
+  int bx = tx >> 3, fx = tx & 7;
+
+  // ---------- which column does this texel show? ----------
+  // A column of height h in row r shows its top on rows [8r - (h-L0)*LV, +8) and its south wall below that.
+  // Walk from the southmost column that could reach this texel toward the north; the first hit is in front.
+  int K = sy - L0 * LV;
+  int r = (K + MAXH * LV) >> 3;
+  Cell c;
+  int hS = -1, fy = 0, d = 0;
+  bool wall = false;
+  for (int i = 0; i < 8; i++) {
+    c = cell(bx, r);
+    int top = 8 * r - c.h * LV;
+    if (K >= top + 8) { wall = true; d = K - top - 8; break; }
+    if (K >= top) { fy = K - top; break; }
+    hS = c.h; r--;
+  }
+
+  vec3 col;
+  float shade = 1.0;
+  gEmis = 0.0;
+  if (wall) {
+    if (hS < 0) hS = cell(bx, r + 1).h;
+    col = sideColor(c, fx, d, tx, r * 64 + d);
+    if (d >= (c.h - hS) * LV - 1) shade *= 0.80;                 // contact shadow at the foot of the wall
+    if (fx == 0) { if (cell(bx - 1, r).h < c.h) shade *= 1.10; }
+    else if (fx == 7) { if (cell(bx + 1, r).h < c.h) shade *= 0.86; }
+  } else {
+    int Y = 8 * r + fy;
+    col = topColor(c, bx, r, fx, fy, tx, Y);
+    Cell n = cell(bx, r - 1), w = cell(bx - 1, r);
+    int dn = n.h - c.h, dw = w.h - c.h;
+    // light from the north-west: taller neighbours cast a short shadow to the south and east
+    float sh = 1.0;
+    if (dn > 0 && fy < min(dn * 2, 6)) sh = fy == 0 ? 0.62 : 0.78;
+    if (dw > 0 && fx < min(dw * 2, 6)) sh = min(sh, fx == 0 ? 0.68 : 0.80);
+    if (sh == 1.0 && dn <= 0 && dw <= 0 && fx < 4 && fy < 4) {
+      int dq = min((cell(bx - 1, r - 1).h - c.h) * 2, 4);
+      if (fx < dq && fy < dq) sh = 0.82;
+    }
+    shade *= sh;
+    if (dn < 0 && fy == 0) shade *= 1.13;                        // lit north and west edges of a step
+    if (dw < 0 && fx == 0) shade *= 1.08;
+    bool shore = c.t == WATER && ((fy == 0 && n.t != WATER) || (fx == 0 && w.t != WATER));
+    if (fx == 7) { Cell e = cell(bx + 1, r); if (e.h < c.h) shade *= 0.88; if (c.t == WATER && e.t != WATER) shore = true; }
+    if (fy == 7) { Cell s = cell(bx, r + 1); if (s.h < c.h) shade *= 0.93; if (c.t == WATER && s.t != WATER) shore = true; }
+    // foam where the water meets land: texel pairs that come and go
+    if (shore && h3(tx >> 1, Y >> 1, int(floor(uTime * 1.2 + h2(tx >> 2, Y >> 2) * 4.0))) < 0.62) col = mix(col, FOAM, 0.78);
+  }
+  col *= shade;
+
+  // a freshly placed block lights up for a moment, its outline a little longer
+  if (c.fl > 0.0) {
+    bool rimTexel = !wall && (fx == 0 || fx == 7 || fy == 0 || fy == 7);
+    col = mix(col, vec3(1.0, 1.0, 0.90), c.fl * (rimTexel ? 0.85 : 0.5));
+  }
+
+  // square cloud shadows drifting over everything
+  float cl = texelFetch(uCloudTex, ivec2((tx - uCloud.x) >> 4, (sy - uCloud.y) >> 4) & 127, 0).r;
+  col *= 1.0 - uCloudAmt * cl;
+
+  // ---------- animals ----------
+  for (int i = 0; i < ${ANI}; i++) {
+    vec4 a = uAni[i];
+    if (a.w < 0.0) continue;
+    int ax = int(a.x), ay = int(a.y);
+    int lx = tx - ax + ${SPR_W / 2};
+    if (lx < 0 || lx >= ${SPR_W}) continue;
+    int ly = sy - (ay - int(floor((a.z - float(L0)) * float(LV) + 0.5))) + ${SPR_H - 2};   // sprite row ${SPR_H - 2} is the feet
+    if (ly < 0 || ly >= ${SPR_H}) continue;
+    if (r > (ay >> 3)) continue;                 // something nearer to the viewer covers this texel
+    int code = int(a.w + 0.5);
+    if ((code & 1) == 1) lx = ${SPR_W - 1} - lx;
+    vec4 sp = texelFetch(uSprite, ivec2(((code >> 1) & 3) * ${SPR_W} + lx, (code >> 3) * ${SPR_H} + ly), 0);
+    col = mix(col, sp.rgb, sp.a);
+  }
+
+  // ---------- time of day: ambient tint, lantern block light at dusk and night ----------
+  vec3 amb = vec3(1.0) * uTod.x + vec3(1.04, 0.86, 0.72) * uTod.y + vec3(0.33, 0.41, 0.66) * uTod.z;
+  vec2 lg = texelFetch(uLight, clamp(ivec2(bx + PADX, r + PADT), ivec2(0), uMap - 1), 0).rg;
+  float lt = mix(lg.r, lg.g, uMix) * (255.0 / 208.0);
+  float glow = lt * lt * (uTod.z + 0.3 * uTod.y);
+  vec3 lit = col * amb + col * vec3(1.05, 0.74, 0.40) * glow;
+  if (uTod.z > 0.2 && !wall && (c.t == GRASS || c.t == LEAF)) {  // fireflies
+    int ph = int(floor(uTime * 0.7 + h2(tx >> 2, sy >> 2) * 5.0));
+    if (h3(tx >> 1, sy >> 1, ph) < 0.0016) lit = mix(lit, vec3(0.95, 1.0, 0.45), 0.85 * uTod.z);
+  }
+  lit = mix(lit, col, gEmis * 0.9);              // lamps stay bright
+  o = vec4(lit, 1.0);
+}`;
+
+/* ======================================================================
+   WebGL
+   ====================================================================== */
+const cv = document.getElementById('art');
+const gl = cv.getContext('webgl2', { antialias: false });
+if (!gl) document.getElementById('nogl').style.display = 'grid';
+function program(fs) {
+  const mk = (type, src) => {
+    const s = gl.createShader(type);
+    gl.shaderSource(s, src); gl.compileShader(s);
+    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) { console.error(gl.getShaderInfoLog(s)); throw new Error('shader: ' + gl.getShaderInfoLog(s)); }
+    return s;
+  };
+  const p = gl.createProgram();
+  gl.attachShader(p, mk(gl.VERTEX_SHADER, VS));
+  gl.attachShader(p, mk(gl.FRAGMENT_SHADER, fs));
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) console.error(gl.getProgramInfoLog(p));
+  const U = {};
+  const n = gl.getProgramParameter(p, gl.ACTIVE_UNIFORMS);
+  for (let i = 0; i < n; i++) { const nm = gl.getActiveUniform(p, i).name.replace(/\[0\]$/, ''); U[nm] = gl.getUniformLocation(p, nm); }
+  return { p, U };
+}
+const PR = program(FS);
+gl.bindVertexArray(gl.createVertexArray());
+
+function dataTex(ifmt, w, h, repeat) {
+  const t = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, t);
+  gl.texStorage2D(gl.TEXTURE_2D, 1, ifmt, w, h);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, repeat ? gl.REPEAT : gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, repeat ? gl.REPEAT : gl.CLAMP_TO_EDGE);
+  return t;
+}
+let sprTex = null, cloudTex = null;
+function buildFixedTex() {
+  gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+  const sp = makeSprites();
+  sprTex = dataTex(gl.RGBA8, sp.w, sp.h, false);
+  gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, sp.w, sp.h, gl.RGBA, gl.UNSIGNED_BYTE, sp.data);
+  // cloud shadows: a tileable pattern of square cells (one cell = 2 blocks), thresholded noise
+  const S = 128, d = new Uint8Array(S * S);
+  for (let y = 0; y < S; y++) for (let x = 0; x < S; x++) {
+    const u = x / S, v = y / S;
+    d[y * S + x] = 0.6 * tileNoise(u * 6, v * 6, 6, 6, 301) + 0.4 * tileNoise(u * 14, v * 14, 14, 14, 302) > 0.60 ? 255 : 0;
+  }
+  cloudTex = dataTex(gl.R8, S, S, true);
+  gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, S, S, gl.RED, gl.UNSIGNED_BYTE, d);
+}
+// the maps on the GPU: from, to, the moment of every block, light (old, new)
+const mapTex = [null, null];
+let thrTex = null, lightTex = null;
+function allocMaps() {
+  for (const t of [mapTex[0], mapTex[1], thrTex, lightTex]) if (t) gl.deleteTexture(t);
+  mapTex[0] = dataTex(gl.RGBA8, Mw, Mh, false);
+  mapTex[1] = dataTex(gl.RGBA8, Mw, Mh, false);
+  thrTex = dataTex(gl.R8, Mw, Mh, false);
+  lightTex = dataTex(gl.RG8, Mw, Mh, false);
+}
+// what is being shown: map A turns into map B block by block (thr = the moment of each block), light LA -> LB
+let cur = { A: null, B: null, thr: null, LA: null, LB: null, land: null };
+let morphT0 = -1e9, morphDur = MORPH_MS, curMix = 1;
+function upload() {
+  const N = Mw * Mh, lg = new Uint8Array(N * 2);
+  for (let i = 0; i < N; i++) { lg[i * 2] = cur.LA[i]; lg[i * 2 + 1] = cur.LB[i]; }
+  gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+  gl.bindTexture(gl.TEXTURE_2D, mapTex[0]); gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, Mw, Mh, gl.RGBA, gl.UNSIGNED_BYTE, cur.A);
+  gl.bindTexture(gl.TEXTURE_2D, mapTex[1]); gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, Mw, Mh, gl.RGBA, gl.UNSIGNED_BYTE, cur.B);
+  gl.bindTexture(gl.TEXTURE_2D, thrTex); gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, Mw, Mh, gl.RED, gl.UNSIGNED_BYTE, cur.thr);
+  gl.bindTexture(gl.TEXTURE_2D, lightTex); gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, Mw, Mh, gl.RG, gl.UNSIGNED_BYTE, lg);
+}
+
+let icons = [], lastRects = [];
+const iconRects = () => icons.map(ic => ({ cx: ic.x + ic.w / 2, cy: ic.y + ic.h / 2, hw: ic.w / 2 - 4, hh: ic.h / 2 - 2 }));
+// The map as it is on screen right now: a new rebuild must start from it, not from the previous target, or the
+// world jumps when icons move again while blocks are still being placed.
+function shownMap() {
+  if (curMix >= 1 || cur.A === cur.B) return cur.B;
+  const N = Mw * Mh, A = cur.A, t = cur.thr, out = new Uint8Array(cur.B);
+  for (let i = 0, o = 0; i < N; i++, o += 4)
+    if (curMix < t[i] / 255) { out[o] = A[o]; out[o + 1] = A[o + 1]; out[o + 2] = A[o + 2]; out[o + 3] = A[o + 3]; }
+  return out;
+}
+function shownLight() {
+  if (curMix >= 1) return cur.LB;
+  const out = new Uint8Array(cur.LB.length);
+  for (let i = 0; i < out.length; i++) out[i] = Math.round(cur.LA[i] + (cur.LB[i] - cur.LA[i]) * curMix);
+  return out;
+}
+function commit(fromEmpty = false) {
+  const rects = iconRects(), land = buildWorld(rects);
+  let A, LA;
+  if (fromEmpty || !cur.B) { const e = buildWorld([]); A = e.map; LA = e.light; lastRects = []; }
+  else { A = shownMap(); LA = shownLight(); }
+  cur = { A, B: land.map, thr: planFlips(A, land.map, movedIcons(lastRects, rects)), LA, LB: land.light, land };
+  lastRects = rects;
+  upload();
+  morphT0 = performance.now();
+  morphDur = fromEmpty ? GROW_MS : MORPH_MS;
+  curMix = 0;
+}
+function refresh() {
+  const rects = iconRects(), land = buildWorld(rects);
+  cur = { A: land.map, B: land.map, thr: new Uint8Array(Mw * Mh).fill(255), LA: land.light, LB: land.light, land };
+  lastRects = rects;
+  upload();
+  morphT0 = -1e9; curMix = 1;
+}
+
+/* ======================================================================
+   Time of day: weights (day, sunset, night) from the local clock or the chosen mood
+   ====================================================================== */
+const TODTEST = parseFloat(QS.get('hour'));       // debug: ?hour=18.5 pretends it is that time
+function clockWeights() {
+  const now = new Date();
+  const hr = isFinite(TODTEST) ? TODTEST : now.getHours() + now.getMinutes() / 60;
+  // a gentle seasonal shift: longer evenings in summer, shorter in winter (northern hemisphere)
+  const doy = (now - new Date(now.getFullYear(), 0, 0)) / 864e5;
+  const sh = 1.2 * Math.cos((doy - 172) / 365 * 2 * Math.PI);
+  const rise = 6.3 - sh, set = 18.3 + sh;
+  const dawn = sstep(rise - 1.2, rise - 0.2, hr) * (1 - sstep(rise + 0.4, rise + 1.4, hr));
+  const dusk = sstep(set - 1.3, set - 0.3, hr) * (1 - sstep(set + 0.5, set + 1.5, hr));
+  const dayW = sstep(rise + 0.4, rise + 1.4, hr) * (1 - sstep(set - 1.3, set - 0.3, hr));
+  const k = Math.max(dawn, dusk);
+  return [dayW, k, Math.max(0, 1 - k - dayW)];
+}
+function targetWeights() {
+  if (P.tod === 1) return [1, 0, 0];
+  if (P.tod === 2) return [0, 1, 0];
+  if (P.tod === 3) return [0, 0, 1];
+  return clockWeights();
+}
+let tod = null, todTarget = [1, 0, 0], todCheck = -1e9;
+function stepTod(t, dt) {
+  if (t - todCheck > 10 || !tod) { todTarget = targetWeights(); todCheck = t; }
+  if (!tod) tod = todTarget.slice();
+  const k = Math.min(1, dt * 1.6);
+  for (let i = 0; i < 3; i++) tod[i] += (todTarget[i] - tod[i]) * k;
+  const s = tod[0] + tod[1] + tod[2] || 1;
+  for (let i = 0; i < 3; i++) tod[i] /= s;
+}
+
+/* ======================================================================
+   Life: animals that wander block by block over the meadows
+   ====================================================================== */
+const aniU = new Float32Array(ANI * 4);
+const KINDS = [0, 0, 0, 1, 1, 3, 3, 2, 0, 1, 3, 2];              // little herds: sheep, cows, hens, a pig...
+const PACE = [0.55, 0.42, 0.5, 0.8];                             // blocks per second
+const DIRS = [[1, 0], [0, 1], [-1, 0], [0, -1]];
+let animals = [];
+const isWalk = (land, i) => { const t = land.type[i]; return t === GRASS || t === PATH || t === SAND; };
+// nothing tall right in front (to the south) that would hide an animal standing here
+function isOpen(land, mx, my) {
+  const g = land.gnd[idx(mx, my)];
+  for (const [dx, dy] of [[0, 1], [-1, 1], [1, 1], [0, 2]]) {
+    const nx = mx + dx, ny = my + dy;
+    if (nx < 0 || ny < 0 || nx >= Mw || ny >= Mh) continue;
+    if (land.hgt[idx(nx, ny)] >= g + 2) return false;
+  }
+  return true;
+}
+const onScreen = (mx, my) => mx - PADX >= 1 && my - PADT >= 1 && mx - PADX < W / BLOCK - 2 && my - PADT < H / BLOCK - 2;
+function spawnAnimal(land, kind, near) {
+  for (let tries = 0; tries < 80; tries++) {
+    let mx, my;
+    if (near && tries < 30) { mx = near.bx + Math.round((Math.random() - 0.5) * 6); my = near.by + Math.round((Math.random() - 0.5) * 6); }
+    else if (LIFETEST) { mx = PADX + Math.floor(W / BLOCK * (0.18 + Math.random() * 0.5)); my = PADT + Math.floor(H / BLOCK * (0.3 + Math.random() * 0.5)); }
+    else { mx = PADX + 1 + Math.floor(Math.random() * (W / BLOCK - 3)); my = PADT + 1 + Math.floor(Math.random() * (H / BLOCK - 3)); }
+    if (mx < 0 || my < 0 || mx >= Mw || my >= Mh || !onScreen(mx, my)) continue;
+    const i = idx(mx, my);
+    if (land.type[i] !== GRASS || land.s[i] < 2.5 * BLOCK || !isOpen(land, mx, my)) continue;
+    if (animals.some(a => Math.abs(a.tx - mx) + Math.abs(a.ty - my) < 2)) continue;
+    return { kind, bx: mx, by: my, tx: mx, ty: my, u: 1, flip: Math.random() < 0.5 ? 1 : 0, dir: (Math.random() * 4) | 0,
+      wait: Math.random() * 3, graze: Math.random() < 0.5, ph: Math.random() * 10, path: null, flee: false };
+  }
+  return null;
+}
+// the ground changed under an animal: the way to the nearest free meadow (not through trees or water)
+function fleePath(land, bx, by) {
+  const start = idx(bx, by), prev = new Int32Array(Mw * Mh).fill(-1), q = [start];
+  prev[start] = start;
+  for (let qi = 0; qi < q.length; qi++) {
+    const i = q[qi], x = i % Mw, y = (i / Mw) | 0;
+    if (i !== start) {
+      if (isWalk(land, i) && onScreen(x, y) && land.s[i] > BLOCK) {
+        const path = [];
+        for (let j = i; j !== start; j = prev[j]) path.push(j);
+        return path.reverse();
+      }
+      if (land.type[i] === LEAF || land.type[i] === WATER) continue;
+    }
+    for (const [dx, dy] of DIRS) {
+      const nx = x + dx, ny = y + dy;
+      if (nx < 0 || ny < 0 || nx >= Mw || ny >= Mh) continue;
+      const j = idx(nx, ny);
+      if (prev[j] < 0) { prev[j] = i; q.push(j); }
+    }
+  }
+  return null;
+}
+function stepAnimals(dt, sp) {
+  const land = cur.land;
+  if (!land) return;
+  const want = Math.round(P.animals);
+  if (animals.length > want) animals.length = want;
+  while (animals.length < want) {
+    const n = animals.length, k = KINDS[n % KINDS.length];
+    const a = spawnAnimal(land, k, n > 0 && KINDS[(n - 1) % KINDS.length] === k ? animals[n - 1] : null);
+    if (!a) break;
+    animals.push(a);
+  }
+  aniU.fill(-1);
+  animals.forEach((a, n) => {
+    if (a.u < 1) {
+      a.u = Math.min(1, a.u + dt * sp * PACE[a.kind] * (a.flee ? 2.6 : 1));
+      a.ph += dt * Math.max(sp, 0.3) * (a.flee ? 9 : 5);
+    }
+    if (a.u >= 1) {
+      a.bx = a.tx; a.by = a.ty;
+      const here = idx(a.bx, a.by);
+      if (!isWalk(land, here) || land.s[here] <= 0) {            // the meadow is gone: run for the nearest one
+        if (!a.path || !a.path.length) a.path = fleePath(land, a.bx, a.by);
+        if (!a.path || !a.path.length) { const b = spawnAnimal(land, a.kind, null); if (b) animals[n] = a = b; }
+        else {
+          const j = a.path.shift();
+          a.tx = j % Mw; a.ty = (j / Mw) | 0; a.u = 0; a.flee = true;
+          if (a.tx !== a.bx) a.flip = a.tx < a.bx ? 1 : 0;
+        }
+      } else {
+        a.flee = false; a.path = null;
+        a.wait -= dt * sp;
+        if (a.wait <= 0) {
+          const opts = [];
+          let total = 0;
+          for (let d = 0; d < 4; d++) {
+            const nx = a.bx + DIRS[d][0], ny = a.by + DIRS[d][1];
+            if (!onScreen(nx, ny)) continue;
+            const j = idx(nx, ny);
+            if (!isWalk(land, j) || Math.abs(land.gnd[j] - land.gnd[here]) > 1 || land.s[j] < BLOCK * 0.6 || !isOpen(land, nx, ny)) continue;
+            if (animals.some(o => o !== a && o.tx === nx && o.ty === ny)) continue;
+            const wgt = d === a.dir ? 3 : (d + 2) % 4 === a.dir ? 0.25 : 1;
+            opts.push([d, wgt]); total += wgt;
+          }
+          if (!opts.length) a.wait = 1 + Math.random() * 2;
+          else {
+            let pick = Math.random() * total, d = opts[0][0];
+            for (const [dd, wgt] of opts) { pick -= wgt; if (pick <= 0) { d = dd; break; } }
+            a.dir = d; a.tx = a.bx + DIRS[d][0]; a.ty = a.by + DIRS[d][1]; a.u = 0;
+            if (DIRS[d][0]) a.flip = DIRS[d][0] < 0 ? 1 : 0;
+            // after this step: keep walking, or stop to graze for a while
+            if (Math.random() < 0.4) { a.wait = 1.5 + Math.random() * 6; a.graze = Math.random() < 0.65; } else a.wait = 0;
+          }
+        }
+      }
+    }
+    const z0 = land.gnd[idx(a.bx, a.by)], z1 = land.gnd[idx(a.tx, a.ty)], u = a.u;
+    const X = (a.bx + (a.tx - a.bx) * u - PADX) * TPB + TPB / 2, Y = (a.by + (a.ty - a.by) * u - PADT) * TPB + TPB - 2;
+    const z = z0 + (z1 - z0) * u + (z0 !== z1 ? Math.sin(Math.PI * u) * 0.5 : 0);
+    const frame = u < 1 ? (Math.floor(a.ph) & 1) : (a.graze && a.wait > 0.4 ? 2 : 0);
+    aniU.set([Math.floor(X), Math.floor(Y), z, a.kind * 8 + frame * 2 + a.flip], n * 4);
+  });
+}
+
+/* ======================================================================
+   Frame loop
+   ====================================================================== */
+function resize() {
+  W = innerWidth; H = innerHeight;
+  // the preview is a full-size page shrunk by the settings window: render 1:1 so the texels survive the shrink
+  const scale = PREVIEW ? 1 : Math.min(devicePixelRatio || 1, P.quality);
+  const box = cv.getBoundingClientRect();
+  cv.width = Math.round((box.width || W) * scale); cv.height = Math.round((box.height || H) * scale); cv._scale = scale;
+  Mw = Math.ceil(W / BLOCK) + 2 * PADX; Mh = Math.ceil(H / BLOCK) + PADT + PADB;
+  buildNoise();
+  allocMaps();
+  animals = [];
+}
+
+const T0 = performance.now();
+let lastT = 0, fpsEMA = 0, frameN = 0, frameMs = 0, lifeT = 0, animT = 0, cloudX = 0, cloudY = 0;
+let paused = false;
+function frame(now) {
+  requestAnimationFrame(frame);
+  if (paused) { lastT = 0; return; }
+  if (P.cap30 && now - lastT < 31) return;
+  const dt = lastT ? Math.min((now - lastT) / 1000, 0.1) : 0.03;
+  if (lastT) fpsEMA = fpsEMA ? fpsEMA * 0.9 + (1 / dt) * 0.1 : 1 / dt;
+  lastT = now;
+  lifeT += dt;
+  animT += dt * P.speed;
+  cloudX += dt * P.speed * 2.5; cloudY += dt * P.speed;
+  stepTod(lifeT, dt);
+  stepAnimals(dt, P.speed);
+  draw(now);
+  frameN++;
+}
+function draw(now) {
+  const t0 = performance.now();
+  curMix = Math.min(Math.max((now - morphT0) / morphDur, 0), 1);
+  if (!tod) stepTod(lifeT, 1);
+  const [wd, wk, wn] = tod;
+  const { p, U } = PR;
+  gl.useProgram(p);
+  gl.viewport(0, 0, cv.width, cv.height);
+  const texs = [mapTex[0], mapTex[1], thrTex, lightTex, sprTex, cloudTex];
+  for (let i = 0; i < texs.length; i++) { gl.activeTexture(gl.TEXTURE0 + i); gl.bindTexture(gl.TEXTURE_2D, texs[i]); }
+  gl.uniform1i(U.uMapA, 0); gl.uniform1i(U.uMapB, 1); gl.uniform1i(U.uThr, 2); gl.uniform1i(U.uLight, 3);
+  gl.uniform1i(U.uSprite, 4); gl.uniform1i(U.uCloudTex, 5);
+  gl.uniform2f(U.uRes, cv.width / cv._scale, cv.height / cv._scale);
+  gl.uniform2i(U.uMap, Mw, Mh);
+  gl.uniform2i(U.uCloud, Math.floor(cloudX), Math.floor(cloudY));
+  gl.uniform1i(U.uSeed, seed % 1000003);
+  gl.uniform1f(U.uScale, cv._scale);
+  gl.uniform1f(U.uMix, curMix);
+  gl.uniform1f(U.uIdle, curMix >= 1 ? 1 : 0);
+  gl.uniform1f(U.uTime, animT % 3600);
+  gl.uniform1f(U.uCloudAmt, 0.13 * wd + 0.10 * wk + 0.05 * wn);
+  gl.uniform3f(U.uTod, wd, wk, wn);
+  gl.uniform4fv(U.uAni, aniU);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+  frameMs = performance.now() - t0;
+}
+
+/* ======================================================================
+   Settings / hosted mode
+   ====================================================================== */
+let iconsSeen = !(WALL || PREVIEW);
+function reseed(v) {
+  seed = v; buildNoise(); animals = [];
+  if (!iconsSeen) { refresh(); return; }
+  commit();                                       // a new world, built block by block over the old one
+}
+function applySettings(v) {
+  if (typeof v.seed === 'number' && v.seed !== seed) reseed(v.seed);
+  let rebuild = false;
+  for (const k in v) {
+    if (!KEYS[k] || typeof v[k] !== 'number' || !isFinite(v[k]) || P[k] === v[k]) continue;
+    const [lo, hi] = KEYS[k];
+    let x = Math.min(Math.max(v[k], lo), hi);
+    if (k === 'tod') { x = Math.round(x); todCheck = -1e9; }
+    if (k === 'animals') x = Math.round(x);
+    P[k] = x;
+    if (k === 'sigma' || k === 'trees' || k === 'water') rebuild = true;
+  }
+  if (rebuild && cur.B) commit();                 // the land is rebuilt block by block too
+}
+function drawGhosts() {
+  const box = document.getElementById('ghosts');
+  if (box) box.innerHTML = icons.map(ic => `<div class="ghost" style="left:${ic.x}px;top:${ic.y}px;width:${ic.w}px;height:${ic.h}px"><i></i><b></b></div>`).join('');
+}
+function startHostedMode() {
+  if (PREVIEW) {
+    document.body.classList.add('preview');
+    const g = document.createElement('div'); g.id = 'ghosts'; document.body.appendChild(g);
+  }
+  icons = [];
+  refresh();                                     // untouched land until we know where the icons are
+  let first = true;
+  const handle = m => {
+    if (!m || typeof m !== 'object') return;
+    if (m.t === 'pause') { paused = PREVIEW ? false : !!m.v; return; }
+    if (m.t === 'settings') { applySettings(m.v || {}); return; }
+    if (m.t === 'reset') { applySettings(Object.assign({}, DEFAULTS, m.v || {})); return; }
+    if (m.t !== 'icons') return;
+    const k = window.devicePixelRatio || 1;       // physical -> CSS pixels
+    icons = m.vis && Array.isArray(m.r) ? m.r.map(([l, t, r, b]) => ({ x: l / k, y: t / k, w: (r - l) / k, h: (b - t) / k })) : [];
+    if (PREVIEW) drawGhosts();
+    iconsSeen = true;
+    commit(first);                                // first time: the clearings are built; later: rebuilt where icons moved
+    first = false;
+  };
+  if (PREVIEW) {
+    addEventListener('message', ev => { if (ev.source === parent) { try { handle(typeof ev.data === 'string' ? JSON.parse(ev.data) : ev.data); } catch (e) {} } });
+    parent.postMessage(JSON.stringify({ t: 'ready' }), '*');
+    return;
+  }
+  const host = window.chrome && window.chrome.webview;
+  if (!host) return;
+  host.addEventListener('message', ev => { try { handle(JSON.parse(ev.data)); } catch (e) { console.error(e); } });
+  host.postMessage('ready');
+}
+function startDemo() {
+  // plain browser: a column of icons on the right and a few scattered ones
+  const list = [];
+  for (let r = 0; r < 6; r++) list.push({ x: W - 90, y: 10 + r * 100, w: 76, h: 92 });
+  list.push({ x: W * 0.22, y: H * 0.3, w: 76, h: 92 }, { x: W * 0.45, y: H * 0.62, w: 76, h: 92 }, { x: W * 0.52, y: H * 0.18, w: 76, h: 92 });
+  icons = list;
+  commit(true);
+}
+
+let resizeT = 0;
+addEventListener('resize', () => {
+  clearTimeout(resizeT);
+  resizeT = setTimeout(() => { resize(); refresh(); }, 100);
+});
+
+window.__dbg = { P, stats: () => ({ fieldMs, frameMs, fps: fpsEMA, tod, animals: animals.length, map: [Mw, Mh] }) };
+resize();
+buildFixedTex();
+if (WALL || PREVIEW) startHostedMode();
+else startDemo();
+requestAnimationFrame(frame);
+</script>
+<script src="share.js"></script>
+</body>
+</html>

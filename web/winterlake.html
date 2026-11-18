@@ -1,0 +1,1525 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Iconland · Winter Lake</title>
+<!--
+  Iconland · Winter Lake theme (a frozen lake seen from straight above; WebGL2, one full-screen pass)
+  - Melt field (CPU, only when icons change): gaussian metaballs + noise warp -> signed distance s to the edge of the
+    open water (<0 = a pool the icons have melted, >0 = ice). Two channels: clamped near the edge (so the edge moves
+    evenly while a pool freezes over or thaws) and unclamped (how far out on the ice a point is).
+  - Ice: washes of frosted and clear dark ice, wind-blown snow drifts with soft shadows; cracks, trapped bubbles and
+    old scratches are drawn once per seed into a detail texture (2D canvas in CSS pixels, independent of the canvas scale).
+  - Around a pool: wet ice, thin see-through ice, floes, steam, the submerged shelf, a lit ice wall and its shadow.
+  - Memory (CPU, CSS pixels): skate traces and the cracks that shoot out of a thawing pool are drawn into an RG8
+    buffer that fades slowly; "new ice" (where a pool was a moment ago) lives on the field grid and frosts over.
+  - Life: skaters (steered on the CPU, drawn as small SDF figures with long shadows), a snowman and an ice fisherman
+    that move elsewhere when the icons come too close, snowfall.
+  Debug: ?nocap (no 30 fps cap), ?lifetest (everything on stage right away), ?falltest (a skater falls in).
+-->
+<style>
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #cfe3ef; }
+  #art { position: fixed; inset: 0; width: 100vw; height: 100vh; display: block; }
+  /* preview mode (?preview=1, settings window): translucent boxes show where the real icons are */
+  #ghosts { position: fixed; inset: 0; pointer-events: none; display: none; }
+  body.preview #ghosts { display: block; }
+  .ghost { position: absolute; }
+  .ghost i { position: absolute; left: 50%; top: 4px; width: 48px; height: 48px; margin-left: -24px; border-radius: 9px;
+    background: rgba(255,255,255,.55); box-shadow: 0 1px 3px rgba(0,0,0,.25); }
+  .ghost b { position: absolute; left: 14%; right: 14%; top: 60px; height: 10px; border-radius: 5px; background: rgba(255,255,255,.75); }
+  #nogl { position: fixed; inset: 0; display: none; place-items: center; color: #234; font: 16px system-ui, sans-serif; }
+</style>
+</head>
+<body>
+<canvas id="art"></canvas>
+<div id="nogl">WebGL2 is not available.</div>
+<script>
+'use strict';
+
+/* ======================================================================
+   Parameters
+   ====================================================================== */
+const CELL_W = 76, CELL_H = 100, GRID_X0 = 4, GRID_Y0 = 6, TASKBAR = 0;
+const STEP = 5;
+const MORPH_MS = 2600;
+const WARP = 38;                         // how much the pool outline is bent by noise (px)
+const S_CLAMP = 60, D_CLAMP = 220;       // edge channel clamp / distance channel clamp (px)
+
+const QS = new URLSearchParams(location.search);
+const WALL = QS.has('wallpaper');        // real desktop: messages from the host
+const PREVIEW = QS.has('preview');       // settings window preview (iframe): messages from the parent page
+const LIFETEST = QS.has('lifetest');     // debug: skaters, snowman and fisherman on stage right away
+const FALLTEST = QS.has('falltest');     // debug: a skater falls through the ice about 3.5 s after the icons arrive
+// Defaults must match themes.json
+const P = {
+  sigma: 72,        // size of the melted pool around the icons (px)
+  skaters: 5,       // how many people skate
+  snowfall: 0.5,    // falling snow
+  cover: 0.5,       // how much of the ice is covered by snow drifts
+  extras: 1,        // snowman and ice fisherman: 0 hide, 1 show
+  cracks: 0.3,      // how cracked the ice is
+  speed: 1,         // animation speed
+  quality: 2, cap30: true,
+};
+const DEFAULTS = Object.assign({}, P);
+if (QS.has('nocap')) P.cap30 = false;    // debug: the reported fps is the real one
+const KEYS = { sigma: [40, 200], skaters: [0, 10], snowfall: [0, 1], cover: [0, 1], extras: [0, 1], cracks: [0, 1], speed: [0, 3] };
+
+/* ======================================================================
+   Random / noise helpers (CPU)
+   ====================================================================== */
+let seed = (Math.random() * 1e6) | 0;
+function hash2(x, y, k = 0) {
+  let h = Math.imul(x | 0, 374761393) ^ Math.imul(y | 0, 668265263) ^ Math.imul(seed + k, 2246822519);
+  h = Math.imul(h ^ (h >>> 13), 1274126177);
+  return ((h ^ (h >>> 16)) >>> 0) / 4294967296;
+}
+function vnoise(x, y, k = 0) {
+  const ix = Math.floor(x), iy = Math.floor(y), fx = x - ix, fy = y - iy;
+  const ux = fx * fx * (3 - 2 * fx), uy = fy * fy * (3 - 2 * fy);
+  const a = hash2(ix, iy, k), b = hash2(ix + 1, iy, k), c = hash2(ix, iy + 1, k), d = hash2(ix + 1, iy + 1, k);
+  return a + (b - a) * ux + (c - a) * uy + (a - b - c + d) * ux * uy;
+}
+function fbm(x, y, k = 0) {
+  let a = 0.5, s = 0;
+  for (let i = 0; i < 4; i++) { s += a * vnoise(x, y, k + i * 7); x = x * 2.03 + 17.1; y = y * 2.03 + 17.1; a *= 0.5; }
+  return s;
+}
+// Tileable noise texture (fixed): 4 channels of fbm at different scales
+function tileNoise(x, y, px, py, k) {
+  const ix = Math.floor(x), iy = Math.floor(y), fx = x - ix, fy = y - iy;
+  const ux = fx * fx * (3 - 2 * fx), uy = fy * fy * (3 - 2 * fy);
+  const m = (v, p) => ((v % p) + p) % p;
+  const x0 = m(ix, px), x1 = m(ix + 1, px), y0 = m(iy, py), y1 = m(iy + 1, py);
+  const h = (a, b) => { let v = Math.imul(a, 374761393) ^ Math.imul(b, 668265263) ^ Math.imul(k, 2246822519); v = Math.imul(v ^ (v >>> 13), 1274126177); return ((v ^ (v >>> 16)) >>> 0) / 4294967296; };
+  const a = h(x0, y0), b = h(x1, y0), c = h(x0, y1), d = h(x1, y1);
+  return a + (b - a) * ux + (c - a) * uy + (a - b - c + d) * ux * uy;
+}
+function makeNoiseImage() {
+  const S = 256, d = new Uint8Array(S * S * 4);
+  const chans = [[4, 8, 16, 32], [8, 16, 32, 64], [2, 4, 8, 16], [16, 32, 64, 128]];
+  for (let y = 0; y < S; y++) for (let x = 0; x < S; x++) {
+    const u = x / S, v = y / S, i = (y * S + x) * 4;
+    for (let c = 0; c < 4; c++) {
+      let s = 0, w = 0.5, tw = 0;
+      for (let j = 0; j < chans[c].length; j++) { const p = chans[c][j]; s += w * tileNoise(u * p, v * p, p, p, 100 + c * 50 + j * 13); tw += w; w *= 0.5; }
+      d[i + c] = Math.min(Math.max((s / tw - 0.5) * 1.9 + 0.5, 0), 1) * 255;
+    }
+  }
+  return { S, d };
+}
+const sstep = (a, b, x) => { const t = Math.min(Math.max((x - a) / (b - a), 0), 1); return t * t * (3 - 2 * t); };
+// small seeded generator for everything that is drawn once per seed
+function rng32(a) {
+  return () => { a |= 0; a = (a + 0x6D2B79F5) | 0; let t = Math.imul(a ^ (a >>> 15), 1 | a); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
+}
+
+/* ======================================================================
+   Melt field (CPU): s = signed distance to the edge of the open water (<0 pool around icons, >0 ice)
+   ====================================================================== */
+let W = innerWidth, H = innerHeight, Gw = 1, Gh = 1, NZ = null;
+function buildNoise() {
+  const N = Gw * Gh;
+  NZ = { wx: new Float32Array(N), wy: new Float32Array(N) };
+  for (let gy = 0; gy < Gh; gy++) for (let gx = 0; gx < Gw; gx++) {
+    const i = gy * Gw + gx, x = gx * STEP, y = gy * STEP;
+    NZ.wx[i] = fbm(x * 0.0028, y * 0.0028, 1) - 0.47;
+    NZ.wy[i] = fbm(x * 0.0028, y * 0.0028, 2) - 0.47;
+  }
+}
+let fieldMs = 0;
+function computeField(rects) {
+  const t0 = performance.now();
+  const N = Gw * Gh, f1 = new Float32Array(N);
+  const sig = P.sigma, is1 = 1 / (sig * sig);
+  const wa = WARP * 2.2, wmax = wa * 0.5;
+  for (const r of rects) {
+    const Rf = sig * Math.min(5.5, 300 / sig + 1.1), Rf2 = Rf * Rf;       // far enough for the distance channel
+    const R = Rf + Math.max(r.hw, r.hh) * 0.5 + wmax;
+    const gx0 = Math.max(0, Math.floor((r.cx - R) / STEP)), gx1 = Math.min(Gw - 1, Math.ceil((r.cx + R) / STEP));
+    const gy0 = Math.max(0, Math.floor((r.cy - R) / STEP)), gy1 = Math.min(Gh - 1, Math.ceil((r.cy + R) / STEP));
+    const chw = r.hw * 0.5, chh = r.hh * 0.5;
+    for (let gy = gy0; gy <= gy1; gy++) for (let gx = gx0; gx <= gx1; gx++) {
+      const i = gy * Gw + gx;
+      const qx = gx * STEP + NZ.wx[i] * wa, qy = gy * STEP + NZ.wy[i] * wa;
+      let dx = Math.abs(qx - r.cx) - chw, dy = Math.abs(qy - r.cy) - chh;
+      if (dx < 0) dx = 0; if (dy < 0) dy = 0;
+      const d2 = dx * dx + dy * dy;
+      if (d2 < Rf2) f1[i] += Math.exp(-d2 * is1);
+    }
+  }
+  const c0 = Math.sqrt(-Math.log(0.35)), s = new Float32Array(N), fMin = Math.exp(-60);
+  for (let i = 0; i < N; i++) {
+    const g = Math.log(Math.max(f1[i], fMin));
+    s[i] = Math.min(D_CLAMP, sig * (Math.sqrt(Math.max(-g, 0)) - c0) - sig * 0.6 * Math.max(g, 0));
+  }
+  fieldMs = performance.now() - t0;
+  return { s };
+}
+function sampleArr(a, x, y) {
+  const fx = Math.min(Math.max(x / STEP, 0), Gw - 1.001), fy = Math.min(Math.max(y / STEP, 0), Gh - 1.001);
+  const ix = Math.floor(fx), iy = Math.floor(fy), tx = fx - ix, ty = fy - iy, i = iy * Gw + ix;
+  return (a[i] * (1 - tx) + a[i + 1] * tx) * (1 - ty) + (a[i + Gw] * (1 - tx) + a[i + Gw + 1] * tx) * ty;
+}
+
+/* ======================================================================
+   Shaders
+   ====================================================================== */
+const VS = `#version 300 es
+void main() {
+  vec2 p = vec2(float((gl_VertexID << 1) & 2), float(gl_VertexID & 2));
+  gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);
+}`;
+
+const FS = `#version 300 es
+precision highp float;
+uniform sampler2D uNoise, uFA, uFB, uDet, uMark, uScar;
+uniform vec2 uRes, uGrid;
+uniform float uScale, uSeed, uStep, uMix, uTime, uCover, uSnow, uRim;
+uniform vec4 uSk[10];            // skaters: x, y, heading, stride phase
+uniform vec4 uSkB[10];           // size (0 = none), kind + colour hash, -, alpha
+uniform vec4 uProp[2];           // snowman, fisherman: x, y, facing, alpha
+uniform vec4 uFall[2];           // someone fell through the ice: x, y, seconds since (<0 = none), colour hash
+out vec4 o;
+
+const vec2 SHDIR = vec2(0.58, 0.81);          // shadows fall to the lower right: a low winter sun in the upper left
+const vec2 WIND = vec2(0.985, 0.171);         // the wind that laid the snow drifts and carries the snowflakes
+const vec2 WINDP = vec2(-0.171, 0.985);
+const vec3 SHADE = vec3(0.60, 0.70, 0.86);    // shadow tint on snow and ice
+const vec3 SHADOW = vec3(0.47, 0.60, 0.82);   // the long shadows of people and things
+const float SHK = 54.0;                       // length of a standing adult's shadow (px)
+const vec3 PAL[9] = vec3[9](vec3(0.86, 0.20, 0.20), vec3(0.95, 0.52, 0.13), vec3(0.97, 0.80, 0.24), vec3(0.14, 0.56, 0.58),
+  vec3(0.20, 0.38, 0.78), vec3(0.56, 0.30, 0.70), vec3(0.93, 0.44, 0.62), vec3(0.24, 0.60, 0.34), vec3(0.93, 0.93, 0.90));
+
+float hash2(vec2 p) {
+  vec3 p3 = fract(vec3(p.xyx) * 0.1031);
+  p3 += dot(p3, p3.yzx + 33.33);
+  return fract((p3.x + p3.y) * p3.z);
+}
+float ss(float a, float b, float x) { float t = clamp((x - a) / (b - a), 0.0, 1.0); return t * t * (3.0 - 2.0 * t); }
+vec4 N(vec2 p, float scale) { return texture(uNoise, p / scale + uSeed * 0.013); }
+vec2 field(vec2 p) {
+  vec2 uv = (p / uStep + 0.5) / uGrid;
+  return mix(texture(uFA, uv).rg, texture(uFB, uv).rg, uMix);
+}
+// distance to the pool edge that stays continuous while the clamped and unclamped channels cross-fade
+float sdist(vec2 f) { return min(f.y, f.x + ss(40.0, 59.0, f.x) * max(f.y - f.x, 0.0)); }
+float segD(vec2 p, vec2 a, vec2 b) { vec2 pa = p - a, ba = b - a; return length(pa - ba * clamp(dot(pa, ba) / dot(ba, ba), 0.0, 1.0)); }
+float segT(vec2 p, vec2 a, vec2 b) { vec2 pa = p - a, ba = b - a; return clamp(dot(pa, ba) / dot(ba, ba), 0.0, 1.0); }
+float ellD(vec2 p, vec2 r) { return (length(p / r) - 1.0) * min(r.x, r.y); }
+mat2 rot(float a) { float c = cos(a), s = sin(a); return mat2(c, s, -s, c); }
+
+// height of the wind-blown snow: long streaks along the wind
+float snowH(vec2 pw) {
+  vec2 q = pw * vec2(0.5, 1.0);
+  return N(q, 1500.0).r * 0.62 + N(q + 431.0, 600.0).g * 0.38;
+}
+
+// ---- small floes drifting at the edge of a pool: one at most per cell ----
+vec4 floes(vec2 p, out float skirt) {
+  const float FG = 28.0;
+  skirt = 0.0;
+  vec4 res = vec4(0.0);
+  vec2 c0 = floor(p / FG);
+  for (int j = -1; j <= 1; j++) for (int i = -1; i <= 1; i++) {
+    vec2 c = c0 + vec2(i, j);
+    float h = hash2(c + 0.61);
+    if (h > 0.58) continue;
+    vec2 ctr = (c + 0.5 + (vec2(hash2(c + 1.7), hash2(c + 2.9)) - 0.5) * 0.62) * FG;
+    ctr += vec2(sin(uTime * 0.23 + h * 40.0), cos(uTime * 0.19 + h * 30.0)) * 2.4;
+    vec2 dv = p - ctr;
+    if (dot(dv, dv) > 230.0) continue;
+    float sc = sdist(field(ctr));
+    float g = ss(-uRim - 6.0, -uRim * 0.6, sc) * ss(-2.0, -7.0, sc);       // only in the rim band of the pool
+    if (g <= 0.03) continue;
+    float R = (3.4 + 6.2 * hash2(c + 3.3)) * (0.45 + 0.55 * g) * min(1.0, uRim / 34.0);
+    vec2 q = rot(hash2(c + 5.1) * 6.283 + sin(uTime * 0.11 + h * 20.0) * 0.3) * dv;
+    // a chunky polygon: five cuts at uneven distances
+    float dd = -1e9;
+    for (int k = 0; k < 5; k++) {
+      float a = (float(k) + 0.6 * hash2(c + float(k) * 3.1 + 7.0)) * 1.2566;
+      dd = max(dd, dot(q, vec2(cos(a), sin(a))) - R * (0.72 + 0.28 * hash2(c + float(k) * 5.3 + 9.0)));
+    }
+    skirt = max(skirt, ss(4.5, 0.0, dd) * g);
+    float m = ss(0.6, -0.6, dd * uScale) * ss(0.03, 0.3, g);
+    if (m <= 0.0) continue;
+    vec3 fc = mix(vec3(0.90, 0.955, 0.99), vec3(0.76, 0.88, 0.95), hash2(c + 8.1));
+    fc = mix(fc, vec3(0.58, 0.75, 0.88), ss(-0.2, 1.0, dot(dv / R, SHDIR)) * 0.6);    // shaded far side
+    fc = mix(fc, vec3(0.50, 0.70, 0.84), ss(-1.8, 0.0, dd) * 0.55);                     // painted edge
+    res = vec4(mix(res.rgb, fc, m), max(res.a, m));
+  }
+  return res;
+}
+
+// ---- skater seen from above (local px, forward = +x). kind: 0 adult, 1 kid, 2 / 3 a pair holding hands ----
+void skaterPose(float ph, float kind, out vec2 fl, out vec2 fr, out vec2 hl, out vec2 hr) {
+  float sw = sin(ph);
+  bool kid = kind > 0.5 && kind < 1.5;
+  float st = kid ? 2.4 : 4.2;                                      // stride
+  fl = vec2(st * sw - 0.5, 3.0 + 1.6 * max(-sw, 0.0));             // the pushing foot goes back and out to the side
+  fr = vec2(-st * sw - 0.5, -3.0 - 1.6 * max(sw, 0.0));
+  hl = vec2(-4.4 * sw + 0.9, 6.9);                                 // arms swing against the legs
+  hr = vec2(4.4 * sw + 0.9, -6.9);
+  if (kid) { hl = vec2(0.6 + 1.3 * sin(ph * 2.3), 10.0); hr = vec2(0.6 - 1.3 * sin(ph * 2.3 + 1.0), -10.0); }   // arms out for balance
+  if (kind > 1.5 && kind < 2.5) hl = vec2(0.4, 9.2);               // holding the partner's hand
+  if (kind > 2.5 && kind < 3.5) hr = vec2(0.4, -9.2);
+  if (kind > 3.5) { hl = vec2(-2.0 + 3.0 * sin(ph * 3.1), 9.6); hr = vec2(-2.0 - 3.0 * sin(ph * 3.1 + 0.8), -9.6); }   // braking: arms flail
+}
+vec4 skater(vec2 q, float ph, float kind, float hue, vec2 lightL, float aa) {
+  vec2 fl, fr, hl, hr;
+  skaterPose(ph, kind, fl, fr, hl, hr);
+  vec3 jac = PAL[int(fract(hue * 7.13) * 9.0)], hat = PAL[int(fract(hue * 13.7 + 0.3) * 9.0)], scf = PAL[int(fract(hue * 29.3 + 0.7) * 9.0)];
+  vec3 trs = fract(hue * 3.7) < 0.5 ? vec3(0.13, 0.17, 0.30) : vec3(0.22, 0.21, 0.24);
+  vec3 col = vec3(0.0); float a = 0.0, m;
+  // legs and skates
+  m = ss(aa, -aa, min(segD(q, vec2(-0.6, 2.2), fl), segD(q, vec2(-0.6, -2.2), fr)) - 1.6);
+  col = mix(col, trs, m); a = max(a, m);
+  m = ss(aa, -aa, min(segD(q, fl + vec2(-2.4, 0.0), fl + vec2(3.0, 0.0)), segD(q, fr + vec2(-2.4, 0.0), fr + vec2(3.0, 0.0))) - 1.1);
+  col = mix(col, vec3(0.11, 0.11, 0.13), m); a = max(a, m);
+  // arms and mittens
+  m = ss(aa, -aa, min(segD(q, vec2(0.4, 5.0), hl), segD(q, vec2(0.4, -5.0), hr)) - 1.45);
+  col = mix(col, jac * 0.84, m); a = max(a, m);
+  m = ss(aa, -aa, min(length(q - hl), length(q - hr)) - 1.6);
+  col = mix(col, scf, m); a = max(a, m);
+  // shoulders
+  vec2 tq = (q - vec2(0.2, 0.0)) / vec2(3.5, 6.3);
+  float dT = (length(tq) - 1.0) * 3.5;
+  vec3 tc = jac * (0.86 + 0.26 * ss(-0.7, 0.8, dot(tq, lightL)));
+  tc = mix(tc, jac * 0.60, ss(-1.3, -0.1, dT) * 0.6);                    // painted rim
+  m = ss(aa, -aa, dT); col = mix(col, tc, m); a = max(a, m);
+  // scarf streaming behind
+  vec2 s0 = vec2(-1.2, 1.6), s1 = vec2(-7.6, 2.6 + 1.5 * sin(ph * 1.7 + hue * 30.0));
+  m = ss(aa, -aa, segD(q, s0, s1) - mix(1.4, 0.7, segT(q, s0, s1)));
+  col = mix(col, scf * 0.92, m); a = max(a, m);
+  // head: a woolly hat with a pom-pom
+  vec2 hq = q - vec2(1.9, 0.0);
+  float dH = length(hq) - 3.2;
+  vec3 hc = hat * (0.88 + 0.24 * ss(-0.8, 0.8, dot(hq / 3.2, lightL)));
+  hc = mix(hc, hat * 0.58, ss(-1.1, -0.1, dH) * 0.6);
+  hc = mix(hc, mix(hat, vec3(1.0), 0.75), ss(aa, -aa, length(hq + vec2(0.5, 0.0)) - 1.25));
+  m = ss(aa, -aa, dH); col = mix(col, hc, m); a = max(a, m);
+  return vec4(col, a);
+}
+// the long shadow shows the whole figure: legs, body, arms, head (sh: shadow offset per px of height, local frame)
+float skaterShadow(vec2 q, vec2 sh, float ph, float kind) {
+  vec2 fl, fr, hl, hr;
+  skaterPose(ph, kind, fl, fr, hl, hr);
+  vec2 hip = sh * 24.0, shd = vec2(0.4, 0.0) + sh * 39.0, head = vec2(1.6, 0.0) + sh * 44.5;
+  float d = min(segD(q, fl, hip + vec2(0.0, 1.8)), segD(q, fr, hip - vec2(0.0, 1.8))) - 1.5;
+  d = min(d, segD(q, hip, shd) - 3.3);
+  d = min(d, min(segD(q, shd + vec2(0.0, 4.8), hl + sh * 24.0), segD(q, shd - vec2(0.0, 4.8), hr + sh * 24.0)) - 1.3);
+  d = min(d, length(q - head) - 3.2);
+  return d;
+}
+
+// ---- snowman (screen-aligned px; face = the way the carrot points). Drawn leaning a touch "up" the screen,
+//      as from a high window rather than from straight above, so the three balls read as a stack ----
+vec4 snowman(vec2 q, float face, float aa) {
+  vec2 fd = vec2(cos(face), sin(face)), sd = vec2(-fd.y, fd.x);
+  const vec3 SN = vec3(0.955, 0.975, 1.0), SS = vec3(0.66, 0.77, 0.92);
+  vec3 col = vec3(0.0), c; float a = 0.0, m;
+  vec2 q2 = q - vec2(0.4, -4.2), hq = q - vec2(0.7, -8.0) - fd * 0.6;
+  float d1 = length(q) - 11.5, d2 = length(q2) - 8.4, d3 = length(hq) - 5.8;
+  // bottom ball: lit from the upper left, blue on the far side, the middle ball's shadow on it
+  c = mix(SN, SS, ss(-0.3, 1.1, dot(q / 11.5, SHDIR)) * 0.9);
+  c = mix(c, SS * 0.9, ss(3.5, -1.0, length(q2 - SHDIR * 3.2) - 8.4) * 0.65);
+  c = mix(c, SS * 0.78, ss(-1.5, 0.0, d1) * 0.6);
+  m = ss(aa, -aa, d1); col = mix(col, c, m); a = max(a, m);
+  // stick arms
+  float dA = min(segD(q2, sd * 6.5 + fd, sd * 17.5 + fd * 4.0), segD(q2, -sd * 6.5 + fd, -sd * 17.0 + fd * 2.5));
+  dA = min(dA, min(segD(q2, sd * 14.0 + fd * 3.0, sd * 16.0 + fd * 6.8), segD(q2, -sd * 13.5 + fd * 2.0, -sd * 16.5 - fd * 1.2)));
+  m = ss(aa, -aa, dA - 0.8); col = mix(col, vec3(0.36, 0.24, 0.15), m); a = max(a, m);
+  // middle ball, with two coal buttons
+  c = mix(SN, SS, ss(-0.3, 1.1, dot(q2 / 8.4, SHDIR)) * 0.85);
+  c = mix(c, SS * 0.9, ss(3.0, -1.0, length(hq - SHDIR * 2.8) - 5.8) * 0.65);
+  c = mix(c, SS * 0.78, ss(-1.4, 0.0, d2) * 0.6);
+  c = mix(c, vec3(0.12), ss(aa, -aa, min(length(q2 - fd * 6.4), length(q2 - fd * 3.6 - vec2(0.0, 1.5))) - 0.8));
+  m = ss(aa, -aa, d2); col = mix(col, c, m); a = max(a, m);
+  // scarf: a red band at the neck and a tail down the front
+  float dS = min(abs(length(hq - vec2(0.0, 1.6)) - 5.4) - 1.0, segD(hq, fd * 4.6 + sd * 3.0 + vec2(0.0, 1.6), fd * 9.6 + sd * 4.6 + vec2(0.0, 3.0)) - 1.15);
+  c = vec3(0.84, 0.20, 0.18) * (0.84 + 0.22 * step(0.5, fract(dot(q, sd) * 0.42)));
+  m = ss(aa, -aa, dS); col = mix(col, c, m); a = max(a, m);
+  // head with coal eyes
+  c = mix(SN, SS, ss(-0.3, 1.1, dot(hq / 5.8, SHDIR)) * 0.85);
+  c = mix(c, SS * 0.78, ss(-1.3, 0.0, d3) * 0.6);
+  c = mix(c, vec3(0.10), ss(aa, -aa, min(length(hq - fd * 3.5 - sd * 2.0), length(hq - fd * 3.5 + sd * 2.0)) - 0.9));
+  m = ss(aa, -aa, d3); col = mix(col, c, m); a = max(a, m);
+  // carrot nose
+  float tn = segT(hq, fd * 3.0, fd * 10.5);
+  m = ss(aa, -aa, segD(hq, fd * 3.0, fd * 10.5) - mix(1.5, 0.25, tn));
+  col = mix(col, mix(vec3(0.97, 0.53, 0.12), vec3(0.86, 0.36, 0.08), tn), m); a = max(a, m);
+  // top hat: brim, a red band, the crown standing a little higher up the screen
+  vec2 tq = hq - vec2(0.0, -1.2) + fd * 1.2;
+  float tl = length(tq), tl2 = length(tq - vec2(0.0, -1.6));
+  c = mix(vec3(0.27, 0.27, 0.32), vec3(0.15, 0.15, 0.18), ss(-0.8, 0.8, dot(tq / 4.6, SHDIR)));
+  m = ss(aa, -aa, tl - 4.6); col = mix(col, c, m); a = max(a, m);
+  m = ss(aa, -aa, min(tl, tl2) - 3.3); col = mix(col, vec3(0.80, 0.18, 0.16), m); a = max(a, m);
+  c = mix(vec3(0.33, 0.33, 0.38), vec3(0.17, 0.17, 0.20), ss(-0.6, 0.9, dot((tq - vec2(0.0, -1.6)) / 3.0, SHDIR)));
+  m = ss(aa, -aa, tl2 - 3.0); col = mix(col, c, m); a = max(a, m);
+  return vec4(col, a);
+}
+float snowmanShadow(vec2 q, float face, float k) {        // k: shadow px per px of height
+  vec2 fd = vec2(cos(face), sin(face)), sd = vec2(-fd.y, fd.x);
+  float d = length(q - SHDIR * k * 10.0) - 11.0;
+  d = min(d, length(q - SHDIR * k * 26.0) - 8.0);
+  d = min(d, length(q - SHDIR * k * 38.0) - 5.6);
+  d = min(d, max(abs(dot(q - SHDIR * k * 46.0, vec2(SHDIR.y, -SHDIR.x))) - 3.0, abs(dot(q - SHDIR * k * 46.0, SHDIR)) - 4.0));   // the hat
+  d = min(d, abs(dot(q - SHDIR * k * 42.5, SHDIR)) < 0.8 ? abs(dot(q - SHDIR * k * 42.5, vec2(SHDIR.y, -SHDIR.x))) - 5.0 : 1e9);  // its brim
+  vec2 qa = q - SHDIR * k * 27.0;
+  d = min(d, min(segD(qa, sd * 6.5, sd * 17.5 + fd * 4.0), segD(qa, -sd * 6.5, -sd * 17.0 + fd * 2.5)) - 0.9);
+  return d;
+}
+
+// ---- ice fisherman seen from above (local px; he faces +x, the hole is in front of him) ----
+vec4 fisher(vec2 q, float t, vec2 lightL, float aa) {
+  vec3 col = vec3(0.0), c; float a = 0.0, m;
+  // the hole: a ring of slush, dark water, a red float
+  vec2 hq = q - vec2(25.0, 0.0);
+  float hl = length(hq), ha = atan(hq.y, hq.x);
+  m = ss(1.6, -1.6, hl - 9.4 - 1.5 * sin(ha * 3.0 + 1.0) - 0.9 * sin(ha * 7.0 + 2.0) - 2.2 * (N(q * 3.0, 60.0).a - 0.5));
+  c = mix(vec3(0.93, 0.97, 1.0), vec3(0.72, 0.83, 0.94), ss(-0.6, 0.9, dot(hq / 9.0, lightL * -1.0)) * 0.7);
+  c *= 0.94 + 0.12 * N(q * 4.0, 40.0).r;
+  col = mix(col, c, m); a = max(a, m * 0.92);
+  c = vec3(0.045, 0.155, 0.215);
+  c = mix(c, vec3(0.50, 0.84, 0.90), ss(4.3, 6.2, hl) * ss(-0.5, 0.6, dot(hq / 6.0, lightL * -1.0)) * 0.8);   // lit wall of the hole
+  float bob = sin(t * 2.1) * 0.5 + 0.5 * sin(t * 0.37) * step(0.9, sin(t * 0.21));
+  c *= 1.0 + 0.5 * (1.0 - ss(0.0, 0.8, abs(hl - 2.6 - 1.2 * fract(t * 0.35)))) * (1.0 - fract(t * 0.35));       // a ripple from the float
+  vec2 fq = hq - vec2(0.5 + bob * 0.3, 0.3);
+  c = mix(c, vec3(0.90, 0.16, 0.12), ss(aa, -aa, length(fq) - 1.4));
+  c = mix(c, vec3(1.0), ss(aa, -aa, length(fq + vec2(0.35)) - 0.55));
+  m = ss(aa, -aa, hl - 6.0); col = mix(col, c, m);
+  // the box he sits on
+  m = ss(aa, -aa, max(abs(q.x + 2.6) - 4.4, abs(q.y) - 5.0) - 1.0);
+  col = mix(col, vec3(0.52, 0.35, 0.19), m); a = max(a, m);
+  // legs and boots
+  m = ss(aa, -aa, min(segD(q, vec2(1.0, 2.8), vec2(9.6, 3.6)), segD(q, vec2(1.0, -2.8), vec2(9.6, -3.6))) - 1.75);
+  col = mix(col, vec3(0.22, 0.27, 0.22), m); a = max(a, m);
+  m = ss(aa, -aa, min(segD(q, vec2(10.2, 3.7), vec2(13.4, 3.9)), segD(q, vec2(10.2, -3.7), vec2(13.4, -3.9))) - 1.6);
+  col = mix(col, vec3(0.13, 0.11, 0.10), m); a = max(a, m);
+  // rod and line
+  vec2 tip = vec2(21.5, 0.5 + sin(t * 0.9) * sin(t * 3.7) * 0.5);
+  m = ss(aa, -aa, segD(q, vec2(7.0, 0.0), tip) - 0.55);
+  col = mix(col, vec3(0.23, 0.16, 0.10), m); a = max(a, m);
+  m = ss(aa, -aa, segD(q, tip, vec2(25.5 + bob * 0.3, 0.3)) - 0.22) * 0.75;
+  col = mix(col, vec3(0.94, 0.96, 0.98), m); a = max(a, m);
+  // arms reach forward to the rod
+  const vec3 PARKA = vec3(0.80, 0.52, 0.14);
+  m = ss(aa, -aa, min(segD(q, vec2(0.6, 5.6), vec2(7.6, 1.3)), segD(q, vec2(0.6, -5.6), vec2(7.6, -1.3))) - 1.6);
+  col = mix(col, PARKA * 0.84, m); a = max(a, m);
+  m = ss(aa, -aa, min(length(q - vec2(7.8, 1.3)), length(q - vec2(7.8, -1.3))) - 1.6);
+  col = mix(col, vec3(0.20, 0.18, 0.17), m); a = max(a, m);
+  // shoulders
+  vec2 tq = (q - vec2(-0.6, 0.0)) / vec2(4.4, 6.8);
+  float dT = (length(tq) - 1.0) * 4.4;
+  c = PARKA * (0.86 + 0.26 * ss(-0.7, 0.8, dot(tq, lightL)));
+  c = mix(c, PARKA * 0.60, ss(-1.3, -0.1, dT) * 0.6);
+  m = ss(aa, -aa, dT); col = mix(col, c, m); a = max(a, m);
+  // fur hat with ear flaps
+  vec2 hd = q - vec2(1.6, 0.0);
+  float dH = min(length(hd) - 3.4, ellD(vec2(hd.x + 0.4, abs(hd.y) - 3.1), vec2(1.9, 1.5)));
+  const vec3 FUR = vec3(0.44, 0.30, 0.19);
+  c = FUR * (0.86 + 0.30 * ss(-0.8, 0.8, dot(hd / 3.4, lightL)));
+  c = mix(c, FUR * 0.6, ss(-1.1, -0.1, dH) * 0.6);
+  c = mix(c, FUR * 1.5, ss(aa, -aa, abs(length(hd) - 1.6) - 0.35) * 0.5);
+  m = ss(aa, -aa, dH); col = mix(col, c, m); a = max(a, m);
+  // a bucket with the catch beside him
+  vec2 bq = q - vec2(5.0, -15.5);
+  float bl = length(bq);
+  c = mix(vec3(0.86, 0.89, 0.92), vec3(0.52, 0.58, 0.66), ss(-0.8, 0.8, dot(bq / 5.0, lightL * -1.0)));
+  c = mix(c, mix(vec3(0.10, 0.20, 0.27), vec3(0.20, 0.34, 0.42), ss(-0.6, 0.8, dot(bq / 3.8, lightL))), ss(aa, -aa, bl - 3.7));
+  m = ss(aa, -aa, bl - 5.0); col = mix(col, c, m); a = max(a, m);
+  // the catch: two small fish on the ice
+  for (int i = 0; i < 2; i++) {
+    vec2 fq2 = rot(i == 0 ? 0.5 : -0.4) * (q - (i == 0 ? vec2(13.0, -15.0) : vec2(11.0, -19.5)));
+    float df = min(ellD(fq2, vec2(3.4, 1.25)), max(abs(fq2.y) - (fq2.x + 4.9) * 0.9, abs(fq2.x + 3.9) - 1.0));
+    c = mix(vec3(0.52, 0.62, 0.70), vec3(0.86, 0.90, 0.92), ss(-0.6, 0.6, fq2.y));
+    c = mix(c, vec3(0.12), ss(aa, -aa, length(fq2 - vec2(2.2, -0.3)) - 0.35));
+    m = ss(aa, -aa, df); col = mix(col, c, m); a = max(a, m);
+  }
+  return vec4(col, a);
+}
+float fisherShadow(vec2 q, vec2 sh) {
+  vec2 hip = vec2(-1.0, 0.0) + sh * 12.0, shd = vec2(-0.6, 0.0) + sh * 28.0;
+  float d = segD(q, hip, shd) - 4.2;
+  d = min(d, length(q - vec2(1.6, 0.0) - sh * 33.0) - 3.5);
+  d = min(d, segD(q, vec2(1.0, 0.0) + sh * 12.0, vec2(11.0, 0.0) + sh * 9.0) - 3.4);
+  d = min(d, segD(q, vec2(11.0, 0.0) + sh * 9.0, vec2(12.5, 0.0)) - 2.6);
+  d = min(d, length(q - vec2(5.0, -15.5) - sh * 5.0) - 4.8);
+  d = min(d, segD(q, vec2(7.5, 0.0) + sh * 17.0, vec2(21.5, 0.5) + sh * 12.0) - 0.5);
+  return d;
+}
+
+// ---- someone has fallen through the ice at the rim of a pool. Small and brief: a splash, ripple rings, head and
+//      shoulders with waving arms, a couple of bobs, then under with bubbles; the hat stays afloat for a while ----
+vec3 drawFall(vec3 col, vec2 p, vec4 f) {
+  float t = f.z;
+  vec2 q = (p - f.xy) / 1.2;
+  float r = length(q);
+  if (t < 0.0 || r > 26.0) return col;
+  float aa = 0.6 / (uScale * 1.2), m;
+  vec3 hat = PAL[int(fract(f.w * 13.7 + 0.3) * 9.0)], jac = PAL[int(fract(f.w * 7.13) * 9.0)], scf = PAL[int(fract(f.w * 29.3 + 0.7) * 9.0)];
+  // the hole he made and ripple rings spreading from it (dark water, gentle: labels nearby stay readable)
+  col = mix(col, vec3(0.05, 0.17, 0.23), ss(9.0, 5.5, r + 1.5 * sin(atan(q.y, q.x) * 5.0 + f.w * 9.0)) * ss(9.5, 7.0, t));
+  float calm = ss(10.5, 4.0, t);
+  for (int k = 0; k < 3; k++) {
+    float tt = t - float(k) * (k < 1 ? 0.0 : 1.5) - (k == 2 ? 0.6 : 0.0);          // the splash, then one ring per bob
+    if (tt <= 0.0) continue;
+    float x = (r - 3.0 - 7.5 * tt) / 1.4;
+    col *= 1.0 + 0.9 * x * exp(-x * x) * exp(-tt * 0.7) * calm * ss(24.0, 16.0, r);
+  }
+  // splash: a ring of drops thrown outwards
+  if (t < 0.8) {
+    float an = atan(q.y, q.x), c = floor(an * 11.0 / 6.2832), h = hash2(vec2(c, f.w * 50.0));
+    float ac = (c + 0.5) * 6.2832 / 11.0;
+    vec2 dp = vec2(cos(ac), sin(ac)) * (5.0 + (9.0 + 9.0 * h) * (1.0 - (1.0 - t / 0.8) * (1.0 - t / 0.8)));
+    col = mix(col, vec3(0.90, 0.97, 1.0), ss(aa, -aa, length(q - dp) - (0.6 + 1.2 * h) * (1.0 - t / 0.8)) * 0.9);
+    col = mix(col, vec3(0.85, 0.95, 0.99), (1.0 - ss(0.0, 1.6, abs(r - 4.0 - 10.0 * t))) * (1.0 - t / 0.8) * 0.6);
+  }
+  // in the water up to the shoulders, arms waving; bobs, then sinks
+  float under = ss(3.5, 4.5, t);
+  if (t > 0.12 && under < 1.0) {
+    float bob = 1.0 - 0.16 * ss(0.6, 1.0, sin(t * 2.1 + 0.4)) - 0.55 * under;
+    vec2 b = q / bob;
+    float wv = sin(t * 11.0), al = (1.0 - under) * ss(0.12, 0.35, t);
+    // arms up out of the water
+    vec2 hl = vec2(1.0 + 4.0 * wv, 10.6 - 1.2 * wv), hr = vec2(1.0 - 4.0 * wv, -10.6 - 1.2 * wv);
+    m = ss(aa, -aa, min(segD(b, vec2(0.0, 4.2), hl), segD(b, vec2(0.0, -4.2), hr)) - 1.6) * al;
+    col = mix(col, jac * 0.75, m);
+    m = ss(aa, -aa, min(length(b - hl), length(b - hr)) - 1.9) * al;
+    col = mix(col, scf, m);
+    // shoulders, half under: a ring of foam around them
+    float dT = ellD(b, vec2(3.0, 5.2));
+    col = mix(col, vec3(0.86, 0.95, 0.99), (1.0 - ss(0.0, 1.3, abs(dT - 1.4))) * al * 0.3);
+    m = ss(aa, -aa, dT) * al; col = mix(col, jac * 0.62, m);
+    float dH = length(b - vec2(1.2, 0.0)) - 3.2;
+    vec3 hc = mix(hat * 0.95, hat * 0.6, ss(-1.1, -0.1, dH) * 0.6);
+    hc = mix(hc, mix(hat, vec3(1.0), 0.75), ss(aa, -aa, length(b - vec2(0.7, 0.0)) - 1.25));
+    m = ss(aa, -aa, dH) * al; col = mix(col, hc, m);
+  }
+  // bubbles where he went under
+  if (t > 3.3 && t < 7.0) {
+    for (int k = 0; k < 6; k++) {
+      float fk = float(k), bt = fract((t - 3.3) * 0.75 + fk * 0.37);
+      vec2 bp = vec2(hash2(vec2(fk, 1.0 + f.w)) - 0.5, hash2(vec2(fk, 7.0 + f.w)) - 0.5) * 9.0;
+      col = mix(col, vec3(0.75, 0.92, 0.96), (1.0 - ss(0.0, 0.7, abs(length(q - bp) - (0.5 + 1.8 * bt)))) * (1.0 - bt) * ss(7.0, 5.0, t) * 0.75);
+    }
+  }
+  // the hat stays afloat, drifting a little, until it too is gone
+  if (t > 3.9 && t < 11.0) {
+    vec2 hq = q - vec2(1.5 + 0.5 * (t - 3.9), 0.6 * sin(t * 0.8)) - 0.6 * vec2(sin(t * 1.7), cos(t * 1.3));
+    float dH = length(hq) - 3.0;
+    vec3 hc = mix(hat * 0.9, hat * 0.55, ss(-1.1, -0.1, dH) * 0.6);
+    hc = mix(hc, mix(hat, vec3(1.0), 0.75), ss(aa, -aa, length(hq + vec2(0.4, 0.0)) - 1.2));
+    col = mix(col, hc, ss(aa, -aa, dH) * ss(3.9, 4.4, t) * ss(11.0, 9.5, t));
+  }
+  return col;
+}
+
+// ---- snowfall: three layers of flakes carried by the wind; each casts a tiny soft shadow on the ice ----
+vec3 snowfall(vec3 col, vec2 p, float calm) {
+  float shadow = 0.0, flake = 0.0;
+  for (int l = 0; l < 3; l++) {
+    float fl = float(l);
+    float G = l == 0 ? 34.0 : l == 1 ? 58.0 : 104.0;
+    float sp = l == 0 ? 15.0 : l == 1 ? 25.0 : 42.0;          // nearer flakes cross the view faster
+    float R = l == 0 ? 0.85 : l == 1 ? 1.3 : 2.2;
+    float hg = l == 0 ? 5.0 : l == 1 ? 12.0 : 26.0;           // how far the shadow falls: height above the ice
+    vec2 pp = p - (WIND + vec2(0.0, 0.35)) * uTime * sp + fl * 37.0;
+    for (int k = 0; k < 2; k++) {
+      vec2 ps = k == 0 ? pp : pp - SHDIR * hg;
+      vec2 c = floor(ps / G);
+      float h = hash2(c + fl * 17.3);
+      if (h > uSnow * 0.9) continue;
+      vec2 ctr = (c + 0.25 + 0.5 * vec2(hash2(c + 1.3), hash2(c + 7.9))) * G;
+      ctr += vec2(sin(uTime * (0.7 + h) + h * 50.0), cos(uTime * (0.6 + h * 0.7) + h * 31.0)) * G * 0.07;
+      float d = length(ps - ctr);
+      if (k == 0) flake = max(flake, ss(R + 0.8, R - 0.7, d) * (l == 2 ? 0.62 : 0.9));
+      else shadow = max(shadow, ss(R + 1.6 + fl, R - 1.0, d) * (0.34 - 0.07 * fl));
+    }
+  }
+  col = mix(col, col * SHADE, shadow * calm);
+  return mix(col, vec3(1.0), flake * calm);
+}
+
+void main() {
+  vec2 p = vec2(gl_FragCoord.x, uRes.y * uScale - gl_FragCoord.y) / uScale;
+  vec2 uv = p / uRes;
+  float t = uTime;
+  float sd = sdist(field(p));
+  vec4 n1 = N(p, 1500.0), n2 = N(p + 311.0, 420.0), n3 = N(p + 71.0, 110.0);
+  float jag = (n3.b - 0.5) * 8.0 + (n3.a - 0.5) * 3.0;
+  float e = sd + jag;                                          // ragged ice edge (<0: open water)
+  vec3 col = vec3(0.0);
+
+  if (e > -3.0) {
+    // ---------- ice: washes of frosted ice with windows of clear dark ice ----------
+    float wash = n1.b * 0.6 + n2.r * 0.4;                                              // soft washes inside a sheet
+    float frost = clamp(0.57 + (wash - 0.5) * 1.5 + (n1.r - 0.5) * 0.5, 0.0, 1.0);
+    float clearI = ss(0.36, 0.25, frost);
+    vec3 cClear = mix(vec3(0.16, 0.38, 0.53), vec3(0.25, 0.49, 0.63), n2.b);
+    vec3 ice = mix(mix(vec3(0.47, 0.69, 0.83), vec3(0.74, 0.87, 0.945), ss(0.25, 0.9, frost)), cClear, clearI);
+    ice *= 1.0 - 0.05 * (1.0 - ss(0.0, 0.02, abs(frost - 0.32)));                      // pooled pigment where the washes meet
+    ice *= 0.975 + 0.05 * n3.r;
+    // inside the ice: cracks seen as white sheets with depth, feathered planes, trapped bubbles; old scratches on top
+    vec4 det = texture(uDet, uv), det2 = texture(uDet, uv - vec2(1.6, 2.4) / uRes);
+    ice = mix(ice, vec3(0.74, 0.90, 0.96), det2.r * 0.34 * (0.25 + 0.75 * clearI));
+    ice = mix(ice, vec3(0.80, 0.93, 0.97), det.g * (0.12 + 0.68 * clearI));
+    ice = mix(ice, vec3(0.95, 0.99, 1.00), det.r * (0.42 + 0.5 * clearI));
+    ice = mix(ice, mix(vec3(0.80, 0.91, 0.97), vec3(0.86, 0.95, 0.99), clearI), det.b * 0.5);
+    // new ice where a pool froze over a moment ago: dark and glassy, frosting over in patches as it ages
+    float sc = texture(uScar, (p / uStep + 0.5) / uGrid).r;
+    float newIce = ss(0.10, 0.50, sc - 0.18 * n3.r * (1.0 - sc) + (n3.a - 0.5) * 0.08);
+    if (newIce > 0.0) {
+      vec3 cNew = mix(vec3(0.13, 0.34, 0.45), vec3(0.20, 0.44, 0.54), n2.b);
+      cNew += 0.05 * ss(0.5, 0.8, N(p * vec2(0.5, 1.2) + 13.0, 300.0).g);                    // a soft sheen
+      ice = mix(ice, cNew, newIce * 0.92);
+      // hoarfrost creeping in from the older ice around it
+      float front = 1.0 - ss(0.0, 0.5, abs(newIce - 0.42));
+      ice = mix(ice, vec3(0.86, 0.95, 0.99), front * (0.18 + 0.55 * ss(0.35, 0.8, n3.a * 0.6 + N(p + 7.0, 34.0).a * 0.4)));
+    }
+    // meltwater on the ice around a pool, glossy streaks, fracture rings
+    float wet = ss(50.0, 6.0, sd + (n3.g - 0.5) * 18.0);
+    ice = mix(ice, ice * vec3(0.66, 0.80, 0.88), wet * 0.6);
+    ice = mix(ice, vec3(0.93, 0.98, 1.0), ss(0.60, 0.85, N(p * vec2(1.0, 2.4) + 91.0, 150.0).r) * wet * 0.2);
+    float ring = (1.0 - ss(0.0, 1.1, abs(e - 13.0 - 6.0 * (n2.a - 0.5)))) * step(0.42, n3.r)
+               + (1.0 - ss(0.0, 0.9, abs(e - 27.0 - 10.0 * (n2.g - 0.5)))) * step(0.55, n3.g) * 0.7;
+    ice = mix(ice, vec3(0.16, 0.36, 0.47), min(ring, 1.0) * 0.16);
+    // wind-blown snow: packed drifts with a thin streaky dusting around them; lit on the sunny slope, blue in the lee;
+    // none on the wet ice near a pool
+    vec2 pw = vec2(dot(p, WIND), dot(p, WINDP));
+    const vec2 SHW = vec2(0.710, 0.699);                        // SHDIR in wind coordinates
+    float th = mix(0.66, 0.40, uCover);
+    float h0 = snowH(pw);
+    float streak = N(pw * vec2(0.06, 1.0) + 97.0, 140.0).a - 0.5;
+    float melt = ss(14.0, 74.0, sd + (n3.g - 0.5) * 26.0) * (1.0 - newIce);
+    float core = ss(th, th + 0.014, h0 + streak * 0.035);
+    float snow = max(core, ss(th - 0.085, th - 0.01, h0 + streak * 0.13) * 0.42) * melt;
+    ice = mix(ice, ice * SHADE, ss(th, th + 0.014, snowH(pw - SHW * 4.5) + streak * 0.035) * melt * (1.0 - core) * 0.42);   // the drift's shadow
+    if (snow > 0.0) {
+      float slope = clamp((snowH(pw + SHW * 7.0) - h0) * 26.0, -1.0, 1.0);        // >0: the slope faces the sun
+      vec3 sc2 = mix(vec3(0.905, 0.945, 0.985), vec3(0.985, 0.992, 1.0), ss(-0.3, 0.8, slope));
+      sc2 = mix(sc2, vec3(0.77, 0.86, 0.955), ss(0.0, -0.9, slope) * 0.7);
+      sc2 *= 0.985 + 0.05 * streak;                                               // wind ripples
+      ice = mix(ice, sc2, snow);
+    }
+    // thin, see-through ice right at the edge
+    ice = mix(ice, vec3(0.18, 0.41, 0.50), ss(11.0, 0.0, e) * 0.62);
+    // cracks that shot out of the pool: a dark wet line with a frosty fringe; skate traces
+    vec2 mk = texture(uMark, uv).rg;
+    float dc = ss(0.22, 0.62, mk.g) * (1.0 - 0.8 * snow);
+    ice = mix(ice, vec3(0.93, 0.98, 1.0), ss(0.02, 0.30, mk.g) * (0.34 - 0.2 * snow));   // frost along the crack
+    ice = mix(ice, vec3(0.96, 0.99, 1.0), dc * 0.6);
+    ice = mix(ice, vec3(0.30, 0.50, 0.62), ss(0.70, 0.95, mk.g) * (1.0 - 0.8 * snow) * 0.45);   // a hairline of meltwater in the widest part
+    float tr = ss(0.10, 0.50, mk.r) * ss(1.0, 7.0, e);
+    vec3 trc = mix(mix(vec3(0.84, 0.93, 0.98), vec3(0.93, 0.98, 1.0), clearI), vec3(0.64, 0.77, 0.90), snow);
+    ice = mix(ice, trc, tr * (0.62 + 0.14 * snow));
+    col = ice;
+  }
+  if (e < 3.0) {
+    // ---------- open water: dark and calm in the middle (the icons sit there), alive only near the edge ----------
+    float d = max(-e, 0.0);
+    float rimK = ss(uRim, 0.0, d);
+    vec3 w = mix(vec3(0.050, 0.165, 0.225), vec3(0.078, 0.240, 0.300), rimK);
+    w *= 0.94 + 0.12 * n2.b;
+    w = mix(w, vec3(0.30, 0.64, 0.68), ss(uRim * 0.5, 0.0, d) * 0.6);              // the ice shelf continues under water
+    vec2 drift = vec2(7.0, 3.0) * t;
+    float rp = N(p * vec2(1.0, 1.5) + drift, 90.0).r + N(p * vec2(1.5, 1.0) - drift.yx + 300.0, 130.0).g - 1.0;
+    w *= 1.0 + 0.16 * rp * rimK;
+    w = mix(w, vec3(0.62, 0.84, 0.90), ss(0.22, 0.42, rp) * 0.10 * rimK);
+    // thick ice: its edge shades the water on the sunny side and shows a lit wall on the far side
+    float eS = sdist(field(p - SHDIR * 5.0)) + jag, eL = sdist(field(p + SHDIR * 4.0)) + jag;
+    w = mix(w, w * vec3(0.55, 0.62, 0.70), ss(-1.0, 2.5, eS) * 0.6);
+    w = mix(w, vec3(0.72, 0.93, 0.95), ss(-1.5, 2.0, eL) * 0.55);
+    if (d < uRim + 14.0) {
+      float skirt;
+      vec4 fz = floes(p, skirt);
+      w = mix(w, vec3(0.34, 0.66, 0.70), skirt * 0.5);
+      w = mix(w, fz.rgb, fz.a);
+      // brash: crumbs of ice huddled against the edge
+      vec2 bc = floor(p / 7.0);
+      float bh = hash2(bc + 13.7);
+      vec2 bq = p - (bc + 0.3 + 0.4 * vec2(hash2(bc + 1.1), hash2(bc + 4.3))) * 7.0;
+      float br = (0.8 + 2.0 * hash2(bc + 6.6)) * ss(13.0, 2.0, d + (n3.r - 0.5) * 8.0);
+      w = mix(w, mix(vec3(0.88, 0.95, 0.99), vec3(0.62, 0.80, 0.90), bh), ss(0.5, -0.5, max(abs(bq.x) + abs(bq.y) * 0.6, abs(bq.y)) - br) * step(bh, 0.45) * (1.0 - fz.a));
+    }
+    col = e > -3.0 ? mix(w, col, ss(-1.0, 1.0, e)) : w;
+  }
+  // the lip of the ice: a thin bright line
+  col = mix(col, vec3(0.97, 0.995, 1.0), (1.0 - ss(0.0, 1.4, abs(e - 1.2))) * 0.6);
+
+  // ---------- snowman ----------
+  if (uProp[0].w > 0.0) {
+    vec2 q = (p - uProp[0].xy) / 1.25;
+    vec2 qc = q - SHDIR * 22.0;
+    if (dot(qc, qc) < 2500.0) {
+      float md = length(q * vec2(1.0, 1.12)) - 17.0 - 3.0 * sin(atan(q.y, q.x) * 3.0 + 1.3);
+      col = mix(col, vec3(0.94, 0.965, 0.995), ss(6.0, -7.0, md) * 0.92 * uProp[0].w);            // a low mound of snow at its foot
+      col = mix(col, col * SHADOW, ss(1.0, -0.8, snowmanShadow(q, uProp[0].z, SHK / 48.0)) * 0.6 * uProp[0].w);
+      vec4 sm = snowman(q, uProp[0].z, 0.6 / (uScale * 1.25));
+      col = mix(col, sm.rgb, sm.a * uProp[0].w);
+    }
+  }
+  // ---------- ice fisherman ----------
+  if (uProp[1].w > 0.0) {
+    vec2 dv = (p - uProp[1].xy) / 1.2;
+    if (dot(dv, dv) < 3400.0) {
+      mat2 r = rot(-uProp[1].z);
+      vec2 q = r * dv;
+      col = mix(col, col * SHADOW, ss(1.0, -0.8, fisherShadow(q, r * SHDIR * (SHK / 48.0))) * 0.6 * uProp[1].w);
+      vec4 fm = fisher(q, t, r * -SHDIR, 0.6 / (uScale * 1.2));
+      col = mix(col, fm.rgb, fm.a * uProp[1].w);
+    }
+  }
+  // ---------- skaters: the long shadows first, then the figures ----------
+  float shA = 0.0;
+  for (int i = 0; i < 10; i++) {
+    vec4 b = uSkB[i];
+    if (b.x <= 0.0) continue;
+    vec2 dv = p - uSk[i].xy;
+    vec2 dc = dv - SHDIR * 26.0 * b.x;
+    if (dot(dc, dc) > 1700.0 * b.x * b.x) continue;
+    mat2 r = rot(-uSk[i].z);
+    float dsh = skaterShadow(r * dv / b.x, r * SHDIR * (SHK / 48.0), uSk[i].w, floor(b.y)) * b.x;
+    shA = max(shA, ss(1.0, -0.8, dsh) * b.w);
+  }
+  col = mix(col, col * SHADOW, shA * 0.62);
+  for (int i = 0; i < 10; i++) {
+    vec4 b = uSkB[i];
+    if (b.x <= 0.0) continue;
+    vec2 dv = p - uSk[i].xy;
+    if (dot(dv, dv) > 200.0 * b.x * b.x) continue;
+    mat2 r = rot(-uSk[i].z);
+    vec4 sk = skater(r * dv / b.x, uSk[i].w, floor(b.y), fract(b.y), r * -SHDIR, 0.6 / (uScale * b.x));
+    col = mix(col, sk.rgb, sk.a * b.w);
+  }
+
+  for (int i = 0; i < 2; i++) col = drawFall(col, p, uFall[i]);
+
+  // ---------- steam over the open water, drifting off with the wind ----------
+  float stM = ss(-uRim - 12.0, -5.0, sd) * ss(44.0, 4.0, sd);
+  if (stM > 0.01) {
+    vec2 sp = p - WIND * t * 13.0;
+    float sa = N(sp, 270.0).r, sb = N(sp * 1.7 + vec2(t * 9.0, -t * 6.0), 160.0).g;
+    col = mix(col, vec3(0.96, 0.98, 1.0), ss(0.48, 0.84, sa * 0.6 + sb * 0.4 + 0.10 * sin(t * 0.4 + sa * 6.0)) * stM * 0.36);
+  }
+
+  // ---------- falling snow (melts over the warm pools) ----------
+  if (uSnow > 0.0) col = snowfall(col, p, mix(0.12, 1.0, ss(-uRim - 10.0, -uRim + 16.0, sd)));
+
+  // paper grain and a soft light from the upper left
+  col *= 1.0 + (hash2(floor(p * max(uScale, 1.0))) - 0.5) * 0.03;
+  col *= 1.0 + 0.07 * (0.5 - (p.x + p.y) / (uRes.x + uRes.y));
+  o = vec4(col, 1.0);
+}`;
+
+/* ======================================================================
+   WebGL
+   ====================================================================== */
+const cv = document.getElementById('art');
+const gl = cv.getContext('webgl2', { antialias: false });
+if (!gl) document.getElementById('nogl').style.display = 'grid';
+function program(fs) {
+  const mk = (type, src) => {
+    const s = gl.createShader(type);
+    gl.shaderSource(s, src); gl.compileShader(s);
+    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) { console.error(gl.getShaderInfoLog(s)); throw new Error('shader: ' + gl.getShaderInfoLog(s)); }
+    return s;
+  };
+  const p = gl.createProgram();
+  gl.attachShader(p, mk(gl.VERTEX_SHADER, VS));
+  gl.attachShader(p, mk(gl.FRAGMENT_SHADER, fs));
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) console.error(gl.getProgramInfoLog(p));
+  const U = {};
+  const n = gl.getProgramParameter(p, gl.ACTIVE_UNIFORMS);
+  for (let i = 0; i < n; i++) { const nm = gl.getActiveUniform(p, i).name.replace(/\[0\]$/, ''); U[nm] = gl.getUniformLocation(p, nm); }
+  return { p, U };
+}
+const PR = program(FS);
+gl.bindVertexArray(gl.createVertexArray());
+
+let noiseTex = null;
+function buildNoiseTex() {
+  const { S, d } = makeNoiseImage();
+  noiseTex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, noiseTex);
+  gl.pixelStorei(gl.UNPACK_ALIGNMENT, 4);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, S, S, 0, gl.RGBA, gl.UNSIGNED_BYTE, d);
+  gl.generateMipmap(gl.TEXTURE_2D);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.REPEAT);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.REPEAT);
+}
+function clampTex(filterMin) {
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, filterMin || gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+}
+const f32 = new Float32Array(1), u32 = new Uint32Array(f32.buffer);
+function toHalf(v) {
+  f32[0] = v; const x = u32[0];
+  const sign = (x >>> 16) & 0x8000, e = ((x >>> 23) & 0xff) - 112, m = x & 0x7fffff;
+  if (e <= 0) return sign;
+  if (e >= 31) return sign | 0x7c00;
+  return sign | (e << 10) | (m >>> 13);
+}
+// two field textures (RG16F: s clamped near the edge, s as distance); the shader blends from -> to
+const ftex = [null, null];
+let fromI = 0, toI = 0, FA = null, FB = null;
+let morphT0 = -1e9, morphDur = MORPH_MS, curMix = 1;
+function allocField() {
+  for (let i = 0; i < 2; i++) {
+    if (ftex[i]) gl.deleteTexture(ftex[i]);
+    ftex[i] = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, ftex[i]);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RG16F, Gw, Gh, 0, gl.RG, gl.HALF_FLOAT, null);
+    clampTex();
+  }
+}
+function uploadField(i, Fd) {
+  const n = Gw * Gh, d = new Uint16Array(n * 2);
+  for (let k = 0; k < n; k++) { const v = Fd.s[k]; d[k * 2] = toHalf(Math.min(v, S_CLAMP)); d[k * 2 + 1] = toHalf(v); }
+  gl.bindTexture(gl.TEXTURE_2D, ftex[i]);
+  gl.pixelStorei(gl.UNPACK_ALIGNMENT, 2);
+  gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, Gw, Gh, gl.RG, gl.HALF_FLOAT, d);
+}
+
+/* ======================================================================
+   Detail textures (once per seed and size): what is frozen into the ice and scratched onto it
+   uDet   R: cracks, G: feathered fracture planes and trapped bubbles, B: old scratches left by skates
+   ====================================================================== */
+let detTex = null;
+function buildDetail() {
+  const DS = PREVIEW ? 1 : Math.min(2, Math.max(1, Math.sqrt(4.2e6 / (W * H))));
+  const c = document.createElement('canvas');
+  c.width = Math.max(2, Math.round(W * DS)); c.height = Math.max(2, Math.round(H * DS));
+  const x = c.getContext('2d');
+  x.fillStyle = '#000'; x.fillRect(0, 0, c.width, c.height);
+  x.globalCompositeOperation = 'lighter';
+  x.lineCap = 'round'; x.lineJoin = 'round';
+  x.scale(c.width / W, c.height / H);
+  const R = rng32(seed * 7 + 13), A = W * H / (1512 * 982);
+  // cracks: a few long, slightly wandering lines; width and strength vary along them and die away at the ends;
+  // now and then one forks at a shallow angle. Each has a faint halo of frost.
+  const crack = (x0, y0, a, len, w, alpha, depth) => {
+    const pts = [[x0, y0]], kids = [];
+    let px = x0, py = y0, left = len, drift = (R() - 0.5) * 0.012;
+    while (left > 0) {
+      const st = 10 + R() * 10;
+      a += drift * st + (R() - 0.5) * 0.09;
+      if (R() < 0.04) { a += (R() < 0.5 ? -1 : 1) * (0.12 + R() * 0.25); drift = (R() - 0.5) * 0.012; }
+      px += Math.cos(a) * st; py += Math.sin(a) * st; left -= st;
+      pts.push([px, py]);
+      if (depth < 1 && left > 120 && R() < 0.035) kids.push([px, py, a + (R() < 0.5 ? -1 : 1) * (0.2 + R() * 0.3), left * (0.25 + R() * 0.35)]);
+    }
+    const n = pts.length - 1, ph = R() * 6.283;
+    for (let i = 0; i < n; i++) {
+      const t = (i + 0.5) / n;
+      const fade = Math.min(1, t * (depth ? 30 : 5), (1 - t) * 4);                    // a fork starts at full strength
+      const k = fade * (0.6 + 0.4 * Math.sin(t * 9 + ph));
+      x.beginPath(); x.moveTo(pts[i][0], pts[i][1]); x.lineTo(pts[i + 1][0], pts[i + 1][1]);
+      x.strokeStyle = `rgba(0,255,0,${0.10 * k})`; x.lineWidth = w * 6; x.stroke();     // frost halo
+      x.strokeStyle = `rgba(255,0,0,${alpha * k})`; x.lineWidth = w * (0.55 + 0.6 * k); x.stroke();
+    }
+    for (const k of kids) crack(k[0], k[1], k[2], k[3], w * 0.75, alpha * 0.8, depth + 1);
+  };
+  for (let i = 0, n = Math.round(P.cracks * 9 * A); i < n; i++) crack(R() * W, R() * H, R() * 6.283, 320 + R() * 700, 1.25, 0.85, 0);
+  for (let i = 0, n = Math.round(P.cracks * 22 * A); i < n; i++) crack(R() * W, R() * H, R() * 6.283, 60 + R() * 140, 0.8, 0.3 + R() * 0.25, 1);
+  // trapped bubbles: clusters of white discs and rings
+  for (let i = 0, n = Math.round(46 * A); i < n; i++) {
+    const cx = R() * W, cy = R() * H, spread = 10 + R() * 38, cnt = 6 + Math.floor(R() * 40);
+    for (let k = 0; k < cnt; k++) {
+      const bx = cx + (R() + R() + R() - 1.5) * spread, by = cy + (R() + R() + R() - 1.5) * spread;
+      const r = 0.7 + R() * R() * 3.2, al = 0.35 + R() * 0.55;
+      x.beginPath(); x.arc(bx, by, r, 0, 6.2832);
+      if (r > 1.6 && R() < 0.4) { x.strokeStyle = `rgba(0,255,0,${al})`; x.lineWidth = 0.6; x.stroke(); }
+      else { x.fillStyle = `rgba(0,255,0,${al})`; x.fill(); }
+    }
+  }
+  // old scratches: long arcs, a few loops
+  for (let i = 0, n = Math.round(110 * A); i < n; i++) {
+    const r = 60 + R() * R() * 640, sweep = Math.min(0.3 + R() * 1.1, 520 / r), a0 = R() * 6.283;
+    const mx = R() * W, my = R() * H;                          // a point the arc passes through
+    x.beginPath(); x.arc(mx - Math.cos(a0) * r, my - Math.sin(a0) * r, r, a0 - sweep / 2, a0 + sweep / 2);
+    x.strokeStyle = `rgba(0,0,255,${0.18 + R() * 0.32})`; x.lineWidth = 0.8 + R() * 0.3; x.stroke();
+  }
+  for (let i = 0, n = Math.round(14 * A); i < n; i++) {
+    x.beginPath(); x.arc(R() * W, R() * H, 14 + R() * 26, 0, 6.2832);
+    x.strokeStyle = `rgba(0,0,255,${0.16 + R() * 0.2})`; x.lineWidth = 0.9; x.stroke();
+  }
+  if (!detTex) detTex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, detTex);
+  gl.pixelStorei(gl.UNPACK_ALIGNMENT, 4);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, c);
+  gl.generateMipmap(gl.TEXTURE_2D);
+  clampTex(gl.LINEAR_MIPMAP_LINEAR);
+}
+
+/* ======================================================================
+   Memory of the ice (CPU, CSS pixels): R = skate traces, G = cracks around the pools; both fade slowly.
+   Small changes go up as little rectangles; a band of rows that rolls down the buffer does the fading.
+   ====================================================================== */
+let MW = 2, MH = 2, mk = null, markTex = null, dirty = [], bulk = false, sweepRow = 0, sweepAcc = 0, scratch = new Uint8Array(4096);
+let cellFlag = null;                       // per field cell: 1 = has traces, 2 = has cracks
+function allocMarks() {
+  MW = Math.max(2, Math.round(W)); MH = Math.max(2, Math.round(H));
+  mk = new Uint8Array(MW * MH * 2);
+  cellFlag = new Uint8Array(Gw * Gh);
+  dirty = []; sweepRow = 0; sweepAcc = 0;
+  if (markTex) gl.deleteTexture(markTex);
+  markTex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, markTex);
+  gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RG8, MW, MH, 0, gl.RG, gl.UNSIGNED_BYTE, mk);
+  clampTex();
+}
+function uploadAllMarks() {
+  gl.bindTexture(gl.TEXTURE_2D, markTex);
+  gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+  gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, MW, MH, gl.RG, gl.UNSIGNED_BYTE, mk);
+  dirty = [];
+}
+// a soft line about 1.5 px wide, kept as the maximum of what is already there (ch: 0 traces, 1 cracks; v: 0..255)
+function stroke(ch, x0, y0, x1, y1, v) {
+  const len = Math.hypot(x1 - x0, y1 - y0), n = Math.max(1, Math.ceil(len / 0.6));
+  for (let i = 0; i <= n; i++) {
+    const t = i / n, x = x0 + (x1 - x0) * t - 0.5, y = y0 + (y1 - y0) * t - 0.5;
+    const ix = Math.round(x), iy = Math.round(y);
+    if (ix < 1 || iy < 1 || ix >= MW - 1 || iy >= MH - 1) continue;
+    for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+      const c = Math.min(1, Math.max(0, 1.15 - Math.hypot(ix + dx - x, iy + dy - y))) * v;
+      const o = ((iy + dy) * MW + ix + dx) * 2 + ch;
+      if (c > mk[o]) mk[o] = c;
+    }
+    cellFlag[Math.min(Gh - 1, Math.round((y + 0.5) / STEP)) * Gw + Math.min(Gw - 1, Math.round((x + 0.5) / STEP))] |= ch + 1;
+  }
+  if (!bulk) dirty.push([Math.min(x0, x1) - 3, Math.min(y0, y1) - 3, Math.max(x0, x1) + 3, Math.max(y0, y1) + 3]);
+}
+function flushMarks() {
+  if (!dirty.length) return;
+  gl.bindTexture(gl.TEXTURE_2D, markTex);
+  gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+  for (const r of dirty) {
+    const x0 = Math.max(0, Math.floor(r[0])), y0 = Math.max(0, Math.floor(r[1])), x1 = Math.min(MW, Math.ceil(r[2]) + 1), y1 = Math.min(MH, Math.ceil(r[3]) + 1);
+    const w = x1 - x0, h = y1 - y0;
+    if (w <= 0 || h <= 0) continue;
+    if (scratch.length < w * h * 2) scratch = new Uint8Array(w * h * 2);
+    for (let y = 0; y < h; y++) scratch.set(mk.subarray(((y0 + y) * MW + x0) * 2, ((y0 + y) * MW + x1) * 2), y * w * 2);
+    gl.texSubImage2D(gl.TEXTURE_2D, 0, x0, y0, w, h, gl.RG, gl.UNSIGNED_BYTE, scratch, 0);
+  }
+  dirty = [];
+}
+const TRACE_FADE = 5;                      // per pass over the buffer (2 s): a fresh trace lasts about a minute and a half
+function fadeRows(r0, r1) {
+  for (let i = r0 * MW * 2, e = r1 * MW * 2; i < e; i += 2) { const a = mk[i]; if (a) mk[i] = a > TRACE_FADE ? a - TRACE_FADE : 0; }
+}
+function sweepMarks(dt) {
+  sweepAcc += MH * dt / 2.0;
+  let rows = Math.min(Math.floor(sweepAcc), MH);
+  if (rows < 1) return;
+  sweepAcc -= rows;
+  gl.bindTexture(gl.TEXTURE_2D, markTex);
+  gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+  while (rows > 0) {
+    const r0 = sweepRow, r1 = Math.min(MH, r0 + rows);
+    fadeRows(r0, r1);
+    gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, r0, MW, r1 - r0, gl.RG, gl.UNSIGNED_BYTE, mk, r0 * MW * 2);
+    rows -= r1 - r0; sweepRow = r1 >= MH ? 0 : r1;
+  }
+}
+// the pixels around one field cell
+function cellBlock(i, f) {
+  const gx = i % Gw, gy = (i / Gw) | 0;
+  const x0 = Math.max(0, gx * STEP - 3), x1 = Math.min(MW, gx * STEP + 3), y0 = Math.max(0, gy * STEP - 3), y1 = Math.min(MH, gy * STEP + 3);
+  for (let y = y0; y < y1; y++) for (let x = x0; x < x1; x++) f((y * MW + x) * 2);
+}
+
+// "new ice": 255 under open water (soft at its edge), fading once the water is gone (field grid, R8)
+let scar = null, scarF = null, scarD = null, scarTex = null, scarAcc = 0;
+function allocScar() {
+  scar = new Uint8Array(Gw * Gh); scarF = new Float32Array(Gw * Gh); scarD = new Float32Array(Gw * Gh);
+  if (scarTex) gl.deleteTexture(scarTex);
+  scarTex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, scarTex);
+  gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.R8, Gw, Gh, 0, gl.RED, gl.UNSIGNED_BYTE, scar);
+  clampTex();
+}
+function scarTick() {
+  if (!FB || !scar) return;
+  const n = Gw * Gh, m = curMix, A = FA.s, B = FB.s;
+  for (let i = 0; i < n; i++) {
+    const a = A[i], b = B[i];
+    const r = (a < S_CLAMP ? a : S_CLAMP) * (1 - m) + (b < S_CLAMP ? b : S_CLAMP) * m;     // the edge channel, as the shader blends it
+    if (r < 1) {
+      scarF[i] = 255;
+      if (-r > scarD[i]) scarD[i] = -r;                                      // how deep in the pool this spot has been
+      if (cellFlag[i]) { cellBlock(i, o => { mk[o] = 0; mk[o + 1] = 0; }); cellFlag[i] = 0; }   // water washes the marks away
+    } else {
+      let v = scarF[i];
+      if (v > 0) { v -= 102 / (14 + 0.34 * scarD[i]); if (v <= 0) { v = 0; scarD[i] = 0; } }   // 14 s at the old edge, 40 s in the middle
+      if (r < 14) v = Math.max(v, 255 * (1 - (r - 1) / 13));                // a soft edge: thin ice next to the water
+      scarF[i] = v;
+      if ((cellFlag[i] & 2) && b > 150 && a > 150) {                                         // cracks far from any pool heal
+        let any = 0;
+        cellBlock(i, o => { const c = mk[o + 1]; if (c) { mk[o + 1] = c - 1; any = 1; } });
+        if (!any) cellFlag[i] &= 1;
+      }
+    }
+  }
+  for (let i = 0; i < n; i++) scar[i] = scarF[i];
+  gl.bindTexture(gl.TEXTURE_2D, scarTex);
+  gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+  gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, Gw, Gh, gl.RED, gl.UNSIGNED_BYTE, scar);
+}
+
+let icons = [];
+const iconRects = () => icons.map(ic => ({ cx: ic.x + ic.w / 2, cy: ic.y + ic.h / 2, hw: ic.w / 2 - 4, hh: ic.h / 2 - 2 }));
+// Field currently on screen (from -> to blended by curMix): a new transition must start from it, not from the
+// previous target, or the scenery jumps when icons move again while a transition is still running.
+function blendFields(A, B, m) {
+  const out = {};
+  for (const k in B) {
+    const a = A && A[k], b = B[k];
+    if (!(b instanceof Float32Array) || !(a instanceof Float32Array) || a.length !== b.length) return null;
+    const r = new Float32Array(b.length);
+    for (let i = 0; i < b.length; i++) r[i] = a[i] + (b[i] - a[i]) * m;
+    out[k] = r;
+  }
+  return out;
+}
+function commit(fromEmpty = false) {
+  const nf = computeField(iconRects());
+  const target = 1 - toI;
+  if (fromEmpty) { FA = computeField([]); uploadField(toI, FA); }
+  else if (FA && FB && curMix < 0.999 && (FA = blendFields(FA, FB, Math.max(0, curMix)))) uploadField(toI, FA);
+  else FA = FB || nf;
+  FB = nf;
+  uploadField(target, FB);
+  fromI = toI; toI = target;
+  morphT0 = performance.now();
+  morphDur = fromEmpty ? 2800 : MORPH_MS;
+  curMix = 0;
+  seedCracks(FB, FA, morphDur / 1000);
+  if (!fromEmpty) doomSkaters();
+}
+function refresh() {
+  FA = FB = computeField(iconRects());
+  uploadField(toI, FB);
+  fromI = toI; morphT0 = -1e9; curMix = 1;
+  tips = [];
+  seedCracks(FB, null, 0);
+  scarTick();
+}
+// current (blended) distance to the open water at a point: <0 in a pool
+// (mirrors the shader: the edge channel is clamped, and sdist() blends it with the unclamped channel)
+function curS(x, y) {
+  if (!FB) return 999;
+  const a = sampleArr(FA.s, x, y), b = sampleArr(FB.s, x, y);
+  const r = Math.min(a, S_CLAMP) * (1 - curMix) + Math.min(b, S_CLAMP) * curMix, g = a * (1 - curMix) + b * curMix;
+  return Math.min(g, r + sstep(40, 59, r) * Math.max(g - r, 0));
+}
+const tgtS = (x, y) => FB ? sampleArr(FB.s, x, y) : 999;      // where the edge is heading
+
+/* ======================================================================
+   Cracks: when a pool thaws somewhere new, cracks shoot out of its edge into the ice
+   ====================================================================== */
+let tips = [];
+function seedCracks(Fn, Fo, dur) {
+  const L = 24;
+  for (let y = L / 2; y < H; y += L) for (let x = L / 2; x < W; x += L) {
+    const jx = x + (Math.random() - 0.5) * L, jy = y + (Math.random() - 0.5) * L;
+    const v = sampleArr(Fn.s, jx, jy);
+    if (Math.abs(v - 4) > L * 0.75) continue;
+    const gx = sampleArr(Fn.s, jx + 4, jy) - sampleArr(Fn.s, jx - 4, jy), gy = sampleArr(Fn.s, jx, jy + 4) - sampleArr(Fn.s, jx, jy - 4);
+    const gl2 = Math.hypot(gx, gy);
+    if (gl2 < 1e-3) continue;
+    const nx = gx / gl2, ny = gy / gl2;
+    const px = jx - nx * (v - 3), py = jy - ny * (v - 3);       // step onto the edge
+    if (Fo && Math.abs(sampleArr(Fo.s, px, py) - 3) < 8) continue;   // the edge was here already, with its cracks
+    if (Math.random() > 0.025 + 0.15 * P.cracks) continue;                 // two to four around a small pool
+    const len = 18 + 120 * Math.pow(Math.random(), 2.4);
+    tips.push({ x: px, y: py, a: Math.atan2(ny, nx) + (Math.random() - 0.5) * 0.8, left: len, w: 0.55 + 0.45 * Math.min(1, len / 80),
+      delay: dur * (0.5 + 0.45 * Math.random()), depth: 0 });
+  }
+  if (dur <= 0) { bulk = true; stepCracks(10); bulk = false; if (mk) uploadAllMarks(); }
+}
+function stepCracks(dt) {
+  if (!tips.length) return;
+  for (let i = tips.length - 1; i >= 0; i--) {
+    const c = tips[i];
+    if (c.delay > 0) { c.delay -= dt; continue; }
+    let adv = 260 * dt;
+    while (adv > 0 && c.left > 0) {
+      const st = Math.min(1.5, adv, c.left);
+      const nx = c.x + Math.cos(c.a) * st, ny = c.y + Math.sin(c.a) * st;
+      if (tgtS(nx, ny) < 1 || nx < 2 || ny < 2 || nx > W - 2 || ny > H - 2) { c.left = 0; break; }
+      stroke(1, c.x, c.y, nx, ny, 255 * c.w * (0.3 + 0.7 * Math.min(1, c.left / 28)));
+      c.x = nx; c.y = ny; c.left -= st; adv -= st;
+      c.a += (Math.random() - 0.5) * 0.07;
+      if (Math.random() < 0.035) c.a += (Math.random() < 0.5 ? -1 : 1) * (0.2 + Math.random() * 0.5);
+      if (c.depth < 1 && c.left > 30 && Math.random() < 0.004)
+        tips.push({ x: c.x, y: c.y, a: c.a + (Math.random() < 0.5 ? -1 : 1) * (0.22 + Math.random() * 0.3), left: c.left * (0.3 + Math.random() * 0.4), w: c.w * 0.75, delay: 0, depth: c.depth + 1 });
+    }
+    if (c.left <= 0) tips.splice(i, 1);
+  }
+}
+
+/* ======================================================================
+   Life: the snowman and the fisherman keep away from the icons; skaters steer around the pools
+   ====================================================================== */
+const SK_MAX = 10, ROSTER = [0, 0, 1, 2, 3, 0, 0, 1, 2, 3];     // 0 adult, 1 kid, 2 + 3: a pair holding hands
+const skU = new Float32Array(SK_MAX * 4), skB = new Float32Array(SK_MAX * 4), propU = new Float32Array(8);
+const props = [{ x: 0, y: 0, a: 0, alpha: 0, on: false, r: 36, retry: 0 },      // snowman
+               { x: 0, y: 0, a: 0, alpha: 0, on: false, r: 42, retry: 0 }];     // fisherman (the circle also covers his hole)
+let skaters = new Array(SK_MAX).fill(null), simT = 0;
+
+function placeProp(k) {
+  const pr = props[k], other = props[1 - k];
+  for (let i = 0; i < 80; i++) {
+    const x = W * (0.07 + 0.86 * hash2(i, k * 31 + 5, 71)), y = H * (0.12 + 0.76 * hash2(i, k * 31 + 9, 72));
+    if (tgtS(x, y) < 150) continue;
+    if (other.on && Math.hypot(x - other.x, y - other.y) < 240) continue;
+    pr.x = x; pr.y = y; pr.a = hash2(i, k * 31 + 3, 73) * 6.283; pr.on = true;
+    return true;
+  }
+  return false;
+}
+// centre of the circle the skaters keep out of
+const propC = (pr, k) => k === 1 ? [pr.x + Math.cos(pr.a) * 12, pr.y + Math.sin(pr.a) * 12] : [pr.x + 8, pr.y + 10];
+function stepProps(dt, now) {
+  props.forEach((pr, k) => {
+    if (pr.on && (P.extras < 0.5 || tgtS(pr.x, pr.y) < 85)) pr.on = false;          // the icons came too close: move elsewhere
+    if (!pr.on && pr.alpha <= 0 && P.extras >= 0.5) {
+      pr.retry -= dt;
+      if (pr.retry <= 0) { pr.retry = 2; if (placeProp(k) && now) pr.alpha = 1; }
+    }
+    pr.alpha = Math.min(1, Math.max(0, pr.alpha + (pr.on ? dt / 1.1 : -dt / 0.7)));
+    propU.set([pr.x, pr.y, pr.a, sstep(0, 1, pr.alpha)], k * 4);
+  });
+}
+
+// free ice around a point for a skater, px (negative = keep out)
+function clearance(x, y, s) {
+  let c = Math.min(curS(x, y), tgtS(x, y)) - 38;               // off the thin ice, and off ice that is about to melt
+  if (!s.entering && !s.exiting) c = Math.min(c, x - 26, y - 26, W - 26 - x, H - 26 - y);
+  for (let k = 0; k < 2; k++) {
+    const pr = props[k];
+    if (!pr.on) continue;
+    const pc = propC(pr, k);
+    c = Math.min(c, Math.hypot(x - pc[0], y - pc[1]) - pr.r);
+  }
+  return c;
+}
+function spawn(i, inside) {
+  const kind = ROSTER[i];
+  const s = { kind, hue: Math.random(), size: kind === 1 ? 0.80 + Math.random() * 0.08 : 1.14 + Math.random() * 0.18,
+    x: 0, y: 0, a: 0, v: 0, vT: 0, k: 0, kT: 0, kNext: 0, fig: 0, ph: Math.random() * 6.283, glide: 0, alpha: 0, turnDir: 0,
+    entering: false, leaving: false, wait: 0, pair: false, pf: null, age: 0 };
+  s.vT = kind === 1 ? 30 + Math.random() * 14 : kind === 2 ? 52 + Math.random() * 14 : 62 + Math.random() * 46;
+  if (inside) {
+    for (let k = 0; k < 60; k++) {
+      const x = 50 + Math.random() * (W - 100), y = 50 + Math.random() * (H - 100);
+      if (clearance(x, y, s) < 26) continue;
+      if (skaters.some(o => o && Math.hypot(o.x - x, o.y - y) < 90)) continue;
+      s.x = x; s.y = y; s.a = Math.random() * 6.283; s.v = s.vT * 0.8;
+      return s;
+    }
+    return null;
+  }
+  for (let k = 0; k < 24; k++) {                               // glide in from a screen edge, over solid ice
+    const side = Math.floor(Math.random() * 4);
+    const x = side === 0 ? -34 : side === 1 ? W + 34 : Math.random() * W, y = side === 2 ? -34 : side === 3 ? H + 34 : Math.random() * H;
+    const a = Math.atan2(H / 2 - y + (Math.random() - 0.5) * H * 0.6, W / 2 - x + (Math.random() - 0.5) * W * 0.6);
+    let ok = true;
+    for (let d = 30; d <= 210 && ok; d += 30) if (Math.min(curS(x + Math.cos(a) * d, y + Math.sin(a) * d), tgtS(x + Math.cos(a) * d, y + Math.sin(a) * d)) < 46) ok = false;
+    if (!ok) continue;
+    s.x = x; s.y = y; s.a = a; s.v = s.vT; s.alpha = 1; s.entering = true;
+    return s;
+  }
+  return null;
+}
+function nextPlan(s) {
+  const r = Math.random(), sg = Math.random() < 0.5 ? -1 : 1;
+  s.glide = Math.random() < 0.35 ? 0.8 + Math.random() * 1.6 : 0;
+  if (s.fig) { s.kT = -s.kT; s.kNext = s.fig; s.fig = 0; return; }             // the other half of a figure eight
+  if (s.kind === 1) { s.kT = sg / (70 + 160 * Math.random()); s.kNext = 1.5 + Math.random() * 3; return; }
+  if (r < 0.52 || s.looped) { s.kT = sg / (110 + 260 * Math.random()); s.kNext = 2 + Math.random() * 4; s.looped = false; }
+  else if (r < 0.76) { s.kT = sg / 900; s.kNext = 1.5 + Math.random() * 3; }
+  else {
+    const R = (s.pair ? 62 : 38) + 40 * Math.random();
+    s.kT = sg / R;
+    s.kNext = 6.283 * R / Math.max(s.v * 0.7, 30) * (0.7 + 0.4 * Math.random());   // about one full circle
+    if (r > 0.88) s.fig = s.kNext;
+    s.looped = true;                                                           // then off somewhere else
+  }
+}
+// where the two skates touch the ice (same pose as the shader)
+function feet(x, y, a, ph, size, kid) {
+  const sw = Math.sin(ph), st = kid ? 2.4 : 4.2, c = Math.cos(a), sn = Math.sin(a);
+  const lx = st * sw - 0.5, ly = 3.0 + 1.6 * Math.max(-sw, 0), rx = -st * sw - 0.5, ry = -3.0 - 1.6 * Math.max(sw, 0);
+  return [x + (lx * c - ly * sn) * size, y + (lx * sn + ly * c) * size, x + (rx * c - ry * sn) * size, y + (rx * sn + ry * c) * size, sw];
+}
+function trace(pf, f) {
+  if (!pf) return;
+  // the gliding skate leaves a clean line, the pushing one a fainter scrape going out to the side
+  if (Math.min(curS(f[0], f[1]), curS(f[2], f[3])) < 5) return;
+  stroke(0, pf[0], pf[1], f[0], f[1], f[4] > -0.15 ? 215 : 80);
+  stroke(0, pf[2], pf[3], f[2], f[3], f[4] < 0.15 ? 215 : 80);
+}
+// ---- falling through the ice ----
+const fallU = new Float32Array(8).fill(-1);
+let falls = [], fallTestAt = FALLTEST ? 0 : -1;
+function startFall(x, y, hue) {
+  // slide a little further, into the open water at the rim
+  for (let k = 0; k < 14 && curS(x, y) > -7; k++) {
+    const gx = curS(x + 3, y) - curS(x - 3, y), gy = curS(x, y + 3) - curS(x, y - 3), g = Math.hypot(gx, gy) || 1;
+    x -= gx / g * 2.5; y -= gy / g * 2.5;
+  }
+  const gx = tgtS(x + 4, y) - tgtS(x - 4, y), gy = tgtS(x, y + 4) - tgtS(x, y - 4), a = Math.atan2(gy, gx);
+  for (let k = 0; k < 3; k++)                                    // the ice gives way with a crack
+    tips.push({ x: x + Math.cos(a) * 12, y: y + Math.sin(a) * 12, a: a + (k - 1) * 0.9 + (Math.random() - 0.5) * 0.4, left: 14 + Math.random() * 26, w: 0.8, delay: 0, depth: 1 });
+  falls.push({ x, y, t: 0, hue });
+  if (falls.length > 2) falls.shift();
+}
+function stepFalls(dt) {
+  for (const f of falls) f.t += dt;
+  falls = falls.filter(f => f.t < 11.5 && curS(f.x, f.y) < 6);     // (if the pool froze over meanwhile, that is that)
+  fallU.fill(-1);
+  falls.forEach((f, i) => fallU.set([f.x, f.y, f.t, f.hue], i * 4));
+}
+// a pool is about to open under or right in front of some skaters: the unlucky ones cannot stop in time
+function doomSkaters() {
+  for (const s of skaters) {
+    if (!s || s.wait > 0 || s.entering || s.doomed) continue;
+    const c = Math.cos(s.a), sn = Math.sin(s.a);
+    const under = tgtS(s.x, s.y) < 2, ahead = tgtS(s.x, s.y) < 34 && tgtS(s.x + c * 34, s.y + sn * 34) < -4;
+    if ((under && Math.random() < 0.75) || (ahead && Math.random() < 0.6)) s.doomed = 0.001;
+  }
+}
+let skInside = true;                       // the first skaters are simply there; later ones glide in from the edges
+function stepSkaters(dt) {
+  if (dt <= 0 || !FB) return;
+  simT += dt;
+  const n = Math.round(P.skaters);
+  for (let i = 0; i < SK_MAX; i++) {
+    let s = skaters[i];
+    const want = i < n && ROSTER[i] !== 3;
+    if (!s) {
+      if (want) { s = spawn(i, skInside); if (s) { skaters[i] = s; if (LIFETEST && skInside) s.alpha = 1; } }
+      continue;
+    }
+    if (s.wait > 0) {
+      s.wait -= dt;
+      if (s.wait <= 0) { const ns = want ? spawn(i, false) : null; if (ns) skaters[i] = ns; else if (want) s.wait = 2; else skaters[i] = null; }
+      continue;
+    }
+    s.age += dt;
+    s.pair = s.kind === 2 && i + 1 < n;
+    let c = Math.cos(s.a), sn = Math.sin(s.a);
+    const off = 16.5 * s.size;
+    // fading: leaving for good, or the ice is melting away under the skates
+    let here = curS(s.x, s.y);
+    if (s.pair) here = Math.min(here, curS(s.x - sn * off, s.y + c * off));
+    if (FALLTEST && fallTestAt === 0 && !bulk && curMix >= 1 && !s.pair && s.kind === 0 && simT > 1) {      // debug: send this one into a pool
+      for (let k = 0; k < 400 && fallTestAt === 0; k++) {
+        const x = W * (0.2 + 0.5 * Math.random()), y = H * (0.2 + 0.6 * Math.random()), v = curS(x, y);
+        if (v < 36 || v > 44) continue;
+        const gx = curS(x + 4, y) - curS(x - 4, y), gy = curS(x, y + 4) - curS(x, y - 4);
+        s.x = x; s.y = y; s.a = Math.atan2(-gy, -gx); s.v = 70; s.alpha = 1; s.pf = null; s.doomed = 0.001; fallTestAt = 1; here = v;
+        c = Math.cos(s.a); sn = Math.sin(s.a);
+      }
+    }
+    if (here < 7 && !s.entering) {
+      // the ice gives way. Of a pair, the one over the water goes in; the other lets go and skates off the lake.
+      let fx = s.x, fy = s.y, fh = s.hue;
+      if (s.pair) {
+        const bx = s.x - sn * off, by = s.y + c * off;
+        if (curS(bx, by) < curS(s.x, s.y)) { fx = bx; fy = by; fh = (s.hue * 7.77) % 1; }
+        else { s.x = bx; s.y = by; s.hue = (s.hue * 7.77) % 1; }
+        startFall(fx, fy, fh);
+        s.kind = 0; s.pair = false; s.exiting = true; s.doomed = 0; s.pf = s.pf2 = null;
+        s.a = Math.atan2(s.y - fy, s.x - fx); s.kT = 0; s.k = 0;
+        const ex = s.x < W / 2 ? -80 : W + 80;
+        s.dest = [ex, s.y]; s.destT = 1e9;
+      } else {
+        startFall(fx, fy, fh);
+        s.alpha = 0; s.wait = 5 + Math.random() * 4; s.doomed = 0; s.pf = s.pf2 = null;
+        continue;
+      }
+    }
+    if (!want) {
+      s.alpha -= dt * 1.2;
+      if (s.alpha <= 0) { skaters[i] = null; continue; }
+    } else if (s.alpha < 1) s.alpha = Math.min(1, s.alpha + dt * 1.2);
+    if (s.doomed) {
+      // too late to turn: braking, arms flailing, sliding on towards the water
+      s.doomed += dt;
+      s.v = Math.max(16, s.v * Math.exp(-1.3 * dt));
+      s.ph += dt * 9;
+      s.a += Math.sin(simT * 13 + s.hue * 30) * 0.5 * dt;
+      s.x += Math.cos(s.a) * s.v * dt; s.y += Math.sin(s.a) * s.v * dt;
+      if (s.doomed > 7 && Math.min(curS(s.x, s.y), tgtS(s.x, s.y)) > 20) s.doomed = 0;      // got away with it after all
+      const f = feet(s.x, s.y, s.a, 1.57, s.size, false);
+      if (s.alpha > 0.6) trace(s.pf, f);                                                   // two long skid marks
+      s.pf = f; s.pf2 = null;
+      continue;
+    }
+    // plan: arcs, straights, loops and figure eights
+    s.kNext -= dt;
+    if (s.kNext <= 0) nextPlan(s);
+    s.k += (s.kT - s.k) * Math.min(1, dt * 2.4);
+    // look ahead and to both sides: away from thin ice, the pools, the screen edges, the snowman, the fisherman
+    const clr = (x, y) => { const v = clearance(x, y, s); return s.pair ? Math.min(v, clearance(x - sn * off, y + c * off, s)) : v; };
+    const la = 44 + s.v * 0.45;
+    const cF = Math.min(clr(s.x + c * la * 0.5, s.y + sn * la * 0.5), clr(s.x + c * la, s.y + sn * la) + 14);
+    const cP = clr(s.x + Math.cos(s.a + 0.7) * la * 0.8, s.y + Math.sin(s.a + 0.7) * la * 0.8);
+    const cM = clr(s.x + Math.cos(s.a - 0.7) * la * 0.8, s.y + Math.sin(s.a - 0.7) * la * 0.8);
+    const tight = Math.min(cF, cP + 16, cM + 16);
+    let steer = 0;
+    if (tight < 26) {
+      if (!s.turnDir || Math.abs(cP - cM) > 30) s.turnDir = cP > cM ? 1 : -1;
+      steer = s.turnDir * (0.8 + 2.6 * sstep(26, -20, tight));
+      s.kT = s.turnDir * Math.max(Math.abs(s.kT), 0.004); s.fig = 0;        // keep curving the same way afterwards
+    } else s.turnDir = 0;
+    for (const o of skaters) {                                               // give each other room
+      if (!o || o === s || o.wait > 0) continue;
+      const dx = o.x - s.x, dy = o.y - s.y, d = Math.hypot(dx, dy);
+      if (d > 72 || d < 1e-3 || (c * dx + sn * dy) / d < -0.3) continue;
+      steer += (c * dy - sn * dx > 0 ? -1 : 1) * 1.6 * (1 - d / 72);
+    }
+    // now and then head for another part of the lake, so nobody scribbles in one corner
+    s.destT = (s.destT || 0) - dt;
+    if (s.exiting) { /* heading off the lake */ }
+    else if (!s.dest || s.destT <= 0 || Math.hypot(s.dest[0] - s.x, s.dest[1] - s.y) < 90) {
+      s.destT = 14 + Math.random() * 16; s.dest = null;
+      for (let k = 0; k < 12 && !s.dest; k++) {
+        const x = 60 + Math.random() * (W - 120), y = 60 + Math.random() * (H - 120);
+        if (clearance(x, y, s) > 40 && Math.hypot(x - s.x, y - s.y) > 280) s.dest = [x, y];
+      }
+    }
+    if (s.dest && !s.turnDir) {
+      const da = Math.atan2(s.dest[1] - s.y, s.dest[0] - s.x) - s.a;
+      steer += Math.max(-0.45, Math.min(0.45, Math.atan2(Math.sin(da), Math.cos(da)) * 0.5));
+    }
+    s.a += (s.k * s.v + steer) * dt;
+    if (s.kind === 1) s.a += Math.sin(simT * 4.3 + s.hue * 40) * 0.9 * dt;   // the kid wobbles
+    const vt = s.vT * (1 - 0.35 * Math.min(1, Math.abs(s.k) * 45)) * (tight < 0 ? 0.75 : 1);
+    if (s.glide > 0) {                                                       // coasting: feet together
+      s.glide -= dt;
+      s.ph += (Math.round(s.ph / Math.PI) * Math.PI - s.ph) * Math.min(1, dt * 4);
+      s.v *= Math.exp(-0.10 * dt);
+    } else {
+      s.v += (vt - s.v) * Math.min(1, dt * 1.2);
+      s.ph += dt * 6.283 * (0.5 + s.v / 150) * (s.kind === 1 ? 1.6 : 1);
+    }
+    c = Math.cos(s.a); sn = Math.sin(s.a);
+    s.x += c * s.v * dt; s.y += sn * s.v * dt;
+    if (s.entering) {
+      if (s.x > 44 && s.y > 44 && s.x < W - 44 && s.y < H - 44) s.entering = false;
+      else if (s.age > 14) { s.wait = 1; continue; }
+    } else if (s.x < -50 || s.y < -50 || s.x > W + 50 || s.y > H + 50) { s.wait = 1; continue; }
+    // traces
+    const f = feet(s.x, s.y, s.a, s.ph, s.size, s.kind === 1);
+    if (s.alpha > 0.6) trace(s.pf, f);
+    s.pf = f;
+    if (s.pair) {
+      const f2 = feet(s.x - sn * off, s.y + c * off, s.a, s.ph + Math.PI, s.size, false);
+      if (s.alpha > 0.6) trace(s.pf2, f2);
+      s.pf2 = f2;
+    } else s.pf2 = null;
+  }
+  // pack for the shader (the partner of a pair takes the next slot)
+  skU.fill(0); skB.fill(0);
+  for (let i = 0; i < SK_MAX; i++) {
+    const s = skaters[i];
+    if (!s || s.wait > 0 || s.alpha <= 0) continue;
+    const al = sstep(0, 1, s.alpha);
+    skU.set([s.x, s.y, s.a, s.ph], i * 4);
+    skB.set([s.size, (s.doomed ? 4 : s.pair ? 2 : s.kind === 1 ? 1 : 0) + s.hue * 0.999, 0, al], i * 4);
+    if (s.pair) {
+      const off = 16.5 * s.size;
+      skU.set([s.x - Math.sin(s.a) * off, s.y + Math.cos(s.a) * off, s.a, s.ph + Math.PI], (i + 1) * 4);
+      skB.set([s.size * 0.95, (s.doomed ? 4 : 3) + ((s.hue * 7.77) % 1) * 0.999, 0, al], (i + 1) * 4);
+    }
+  }
+}
+// let the lake live for a while before the first frame, so the ice already carries traces
+function presim(sec) {
+  if (!mk || !FB) return;
+  const m = curMix;
+  curMix = 1; bulk = true; skInside = true;
+  stepProps(1, true);
+  for (let t = 0, k = 0; t < sec; t += 1 / 30, k++) {
+    stepSkaters(1 / 30);
+    if (k % 60 === 59) fadeRows(0, MH);
+  }
+  curMix = m; bulk = false; skInside = false;
+  uploadAllMarks();
+}
+function stepLife(sdt, dt) {
+  stepProps(dt, false);
+  if (iconsSeen) stepSkaters(sdt);
+  stepFalls(sdt);
+  stepCracks(dt);
+  scarAcc += dt;
+  if (scarAcc >= 0.4) { scarAcc = 0; scarTick(); }
+  sweepMarks(sdt);
+}
+
+/* ======================================================================
+   Frame loop
+   ====================================================================== */
+function resize() {
+  W = innerWidth; H = innerHeight;
+  const scale = PREVIEW ? 0.45 : Math.min(devicePixelRatio || 1, P.quality);
+  const box = cv.getBoundingClientRect();
+  cv.width = Math.round((box.width || W) * scale); cv.height = Math.round((box.height || H) * scale); cv._scale = scale;
+  Gw = Math.ceil(W / STEP) + 2; Gh = Math.ceil(H / STEP) + 2;
+  buildNoise();
+  allocField();
+  allocMarks();
+  allocScar();
+  buildDetail();
+  tips = []; skaters.fill(null); skInside = true;
+  props.forEach(pr => { pr.on = false; pr.alpha = 0; pr.retry = 0; });
+}
+
+const T0 = performance.now();
+let lastT = 0, fpsEMA = 0, frameN = 0, frameMs = 0, lifeT = 0;
+let paused = false;
+function frame(now) {
+  requestAnimationFrame(frame);
+  if (paused) { lastT = 0; return; }
+  if (P.cap30 && now - lastT < 31) return;
+  const dt = lastT ? Math.min((now - lastT) / 1000, 0.1) : 0.03;
+  if (lastT) fpsEMA = fpsEMA ? fpsEMA * 0.9 + (1 / dt) * 0.1 : 1 / dt;
+  lastT = now;
+  lifeT += dt * P.speed;
+  stepLife(dt * P.speed, dt);
+  draw(now);
+  frameN++;
+}
+function draw(now) {
+  const t0 = performance.now();
+  const e = Math.min(Math.max((now - morphT0) / morphDur, 0), 1);
+  curMix = e < 0.5 ? 2 * e * e : 1 - Math.pow(-2 * e + 2, 2) / 2;
+  flushMarks();
+  const { p, U } = PR;
+  gl.useProgram(p);
+  gl.viewport(0, 0, cv.width, cv.height);
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, noiseTex);
+  gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, ftex[fromI]);
+  gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D, ftex[toI]);
+  gl.activeTexture(gl.TEXTURE3); gl.bindTexture(gl.TEXTURE_2D, detTex);
+  gl.activeTexture(gl.TEXTURE4); gl.bindTexture(gl.TEXTURE_2D, markTex);
+  gl.activeTexture(gl.TEXTURE5); gl.bindTexture(gl.TEXTURE_2D, scarTex);
+  gl.activeTexture(gl.TEXTURE0);
+  gl.uniform1i(U.uNoise, 0); gl.uniform1i(U.uFA, 1); gl.uniform1i(U.uFB, 2); gl.uniform1i(U.uDet, 3); gl.uniform1i(U.uMark, 4); gl.uniform1i(U.uScar, 5);
+  gl.uniform2f(U.uRes, cv.width / cv._scale, cv.height / cv._scale);
+  gl.uniform2f(U.uGrid, Gw, Gh);
+  gl.uniform1f(U.uScale, cv._scale);
+  gl.uniform1f(U.uSeed, (seed % 997) * 0.37);
+  gl.uniform1f(U.uStep, STEP);
+  gl.uniform1f(U.uMix, curMix);
+  gl.uniform1f(U.uTime, lifeT % 3600);
+  gl.uniform1f(U.uCover, P.cover);
+  gl.uniform1f(U.uSnow, P.snowfall);
+  gl.uniform1f(U.uRim, Math.min(Math.max(1.02 * P.sigma - 28, 12), 40));      // the lively band of a pool stops short of the icons
+  gl.uniform4fv(U.uSk, skU); gl.uniform4fv(U.uSkB, skB);
+  gl.uniform4fv(U.uProp, propU);
+  gl.uniform4fv(U.uFall, fallU);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+  frameMs = performance.now() - t0;
+}
+
+/* ======================================================================
+   Settings / hosted mode
+   ====================================================================== */
+let iconsSeen = !(WALL || PREVIEW);
+function reseed(v) {
+  seed = v; buildNoise(); buildDetail();
+  props.forEach(pr => { pr.on = false; pr.retry = 0; });
+  if (!iconsSeen) { refresh(); return; }
+  commit(true);
+}
+function applySettings(v) {
+  if (typeof v.seed === 'number' && v.seed !== seed) reseed(v.seed);
+  let field = false;
+  for (const k in v) {
+    if (!KEYS[k] || typeof v[k] !== 'number' || !isFinite(v[k]) || P[k] === v[k]) continue;
+    const [lo, hi] = KEYS[k];
+    let x = Math.min(Math.max(v[k], lo), hi);
+    if (k === 'skaters' || k === 'extras') x = Math.round(x);
+    P[k] = x;
+    if (k === 'sigma') field = true;
+    if (k === 'cracks') buildDetail();
+  }
+  if (field && FB) commit();                      // pool size: smooth transition too
+}
+function drawGhosts() {
+  const box = document.getElementById('ghosts');
+  if (box) box.innerHTML = icons.map(ic => `<div class="ghost" style="left:${ic.x}px;top:${ic.y}px;width:${ic.w}px;height:${ic.h}px"><i></i><b></b></div>`).join('');
+}
+function startHostedMode() {
+  if (PREVIEW) {
+    document.body.classList.add('preview');
+    const g = document.createElement('div'); g.id = 'ghosts'; document.body.appendChild(g);
+  }
+  icons = [];
+  refresh();                                     // a solid sheet of ice until we know where the icons are
+  let first = true;
+  const handle = m => {
+    if (!m || typeof m !== 'object') return;
+    if (m.t === 'pause') { paused = PREVIEW ? false : !!m.v; return; }
+    if (m.t === 'settings') { applySettings(m.v || {}); return; }
+    if (m.t === 'reset') { applySettings(Object.assign({}, DEFAULTS, m.v || {})); return; }
+    if (m.t !== 'icons') return;
+    const k = window.devicePixelRatio || 1;       // physical -> CSS pixels
+    icons = m.vis && Array.isArray(m.r) ? m.r.map(([l, t, r, b]) => ({ x: l / k, y: t / k, w: (r - l) / k, h: (b - t) / k })) : [];
+    if (PREVIEW) drawGhosts();
+    iconsSeen = true;
+    commit(first);                                // first time: the pools thaw; later: smooth transition
+    if (first) presim(LIFETEST ? 70 : 25);
+    first = false;
+  };
+  if (PREVIEW) {
+    addEventListener('message', ev => { if (ev.source === parent) { try { handle(typeof ev.data === 'string' ? JSON.parse(ev.data) : ev.data); } catch (e) {} } });
+    parent.postMessage(JSON.stringify({ t: 'ready' }), '*');
+    return;
+  }
+  const host = window.chrome && window.chrome.webview;
+  if (!host) return;
+  host.addEventListener('message', ev => { try { handle(JSON.parse(ev.data)); } catch (e) { console.error(e); } });
+  host.postMessage('ready');
+}
+function startDemo() {
+  // plain browser: a column of icons on the right and a few scattered ones
+  const list = [];
+  for (let r = 0; r < 6; r++) list.push({ x: W - 90, y: 10 + r * 100, w: 76, h: 92 });
+  list.push({ x: W * 0.22, y: H * 0.3, w: 76, h: 92 }, { x: W * 0.45, y: H * 0.62, w: 76, h: 92 }, { x: W * 0.52, y: H * 0.18, w: 76, h: 92 });
+  icons = list;
+  commit(true);
+  presim(LIFETEST ? 70 : 25);
+}
+
+let resizeT = 0;
+addEventListener('resize', () => {
+  clearTimeout(resizeT);
+  resizeT = setTimeout(() => { resize(); refresh(); if (iconsSeen) presim(25); }, 100);
+});
+
+window.__dbg = { P, stats: () => ({ fieldMs, frameMs, fps: fpsEMA, skaters: skaters.filter(Boolean).length, tips: tips.length }) };
+resize();
+buildNoiseTex();
+if (WALL || PREVIEW) startHostedMode();
+else startDemo();
+requestAnimationFrame(frame);
+</script>
+<script src="share.js"></script>
+</body>
+</html>
